@@ -89,7 +89,7 @@ etagere = "0.2"
 futures.workspace = true
 gpui_macros.workspace = true
 http_client = { optional = true, workspace = true }
-image.workspace = true
+image = { workspace = true, features = ["png"] }
 inventory.workspace = true
 itertools.workspace = true
 log.workspace = true
@@ -292,3 +292,7 @@ path = "examples/window_shadow.rs"
 [[example]]
 name = "on_window_close_quit"
 path = "examples/on_window_close_quit.rs"
+
+[[example]]
+name = "render_to_texture"
+path = "examples/render_to_texture.rs"

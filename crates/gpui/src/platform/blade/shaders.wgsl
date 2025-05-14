@@ -1223,3 +1223,19 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 
     return ycbcr_to_RGB * y_cb_cr;
 }
+
+// --- render target --- //
+
+var t_render_target: texture_2d<f32>;
+var s_render_target: sampler;
+
+@fragment
+fn fs_render_target(input: SurfaceVarying) -> @location(0) vec4<f32> {
+    // Alpha clip after using the derivatives.
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    let color = textureSample(t_render_target, s_render_target, input.texture_position);
+    return blend_color(color, 1.0);
+}

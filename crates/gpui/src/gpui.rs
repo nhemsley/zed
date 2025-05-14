@@ -96,6 +96,7 @@ mod taffy;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 mod text_system;
+mod texture_renderer;
 mod util;
 mod view;
 mod window;
@@ -151,6 +152,7 @@ pub use taffy::{AvailableSpace, LayoutId};
 #[cfg(any(test, feature = "test-support"))]
 pub use test::*;
 pub use text_system::*;
+pub use texture_renderer::*;
 pub use util::arc_cow::ArcCow;
 pub use view::*;
 pub use window::*;
@@ -347,4 +349,37 @@ pub struct GpuSpecs {
     pub driver_name: String,
     /// Further information about the driver, as reported by Vulkan.
     pub driver_info: String,
+}
+
+/// Unique identifier for a render target texture
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct RenderTargetId(pub u32);
+
+/// A texture that can be used as a render target
+pub struct RenderTargetTexture {
+    /// The underlying GPU texture
+    pub texture: blade_graphics::Texture,
+    /// View into the texture
+    pub view: blade_graphics::TextureView,
+    /// Sampler for the texture
+    pub sampler: blade_graphics::Sampler,
+    /// Size of the texture in device pixels
+    pub size: Size<DevicePixels>,
+}
+
+/// Trait for render target functionality
+pub trait RenderTarget {
+    /// Creates a new render target with the specified size
+    fn create_render_target(&mut self, size: Size<DevicePixels>) -> Result<RenderTargetId>;
+    
+    /// Renders a scene to the specified render target
+    fn render_to_texture(&mut self, target_id: RenderTargetId, scene: &Scene) -> Result<()>;
+    
+    /// Draws a render target to the screen at the specified bounds
+    fn draw_render_target(
+        &mut self, 
+        target_id: RenderTargetId, 
+        bounds: Bounds<ScaledPixels>,
+        content_mask: window::ContentMask<ScaledPixels>
+    ) -> Result<()>;
 }
