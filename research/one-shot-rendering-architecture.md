@@ -1025,13 +1025,63 @@ layout_engine.compute_layout(layout_id, available_space, window, cx);
 
 ---
 
-## Existing Test Infrastructure: A Key Discovery
+## Existing Infrastructure: Multiple Key Discoveries
+
+GPUI already has multiple pieces of infrastructure that solve the Window/App coupling problem:
+
+### Discovery 1: Application::headless() - Already Available!
+
+```rust
+// From gpui/src/app.rs - This is PUBLIC API!
+
+impl Application {
+    /// Build an app in headless mode. This prevents opening windows,
+    /// but makes it possible to run an application in an context like
+    /// SSH, where GUI applications are not allowed.
+    pub fn headless() -> Self {
+        Self(App::new_app(
+            current_platform(true),  // <- passes headless=true
+            Arc::new(()),
+            Arc::new(NullHttpClient),
+        ))
+    }
+}
+```
+
+On Linux, `current_platform(true)` returns `HeadlessClient`:
+
+```rust
+// From gpui/src/platform/linux/headless/client.rs
+
+pub(crate) struct HeadlessClient(Rc<RefCell<HeadlessClientState>>);
+
+impl LinuxClient for HeadlessClient {
+    fn displays(&self) -> Vec<Rc<dyn PlatformDisplay>> {
+        vec![]  // No displays
+    }
+    
+    fn open_window(...) -> anyhow::Result<Box<dyn PlatformWindow>> {
+        anyhow::bail!("neither DISPLAY nor WAYLAND_DISPLAY is set. You can run in headless mode");
+    }
+    
+    fn compositor_name(&self) -> &'static str {
+        "headless"
+    }
+    // ... other no-op implementations
+}
+```
+
+**This means `Application::headless()` already exists and is PUBLIC API!**
+
+The problem is it currently bails when trying to open windows. But it provides the foundation we need.
+
+### Discovery 2: TestAppContext - Test Infrastructure
 
 > **Important**: The test infrastructure is gated behind the `test-support` feature flag in GPUI's `Cargo.toml`. To use it for one-shot rendering, you would need to either:
 > 1. Enable `test-support` feature (includes `TestAppContext`, `TestPlatform`, etc.)
 > 2. Propose upstreaming a separate `headless` feature that exposes similar functionality
 
-GPUI already has test infrastructure that solves many of these problems:
+GPUI already has test infrastructure that also solves many of these problems:
 
 ### TestAppContext and VisualTestContext
 
@@ -1361,9 +1411,90 @@ The headless module would contain properly integrated versions that share code w
 
 ## Recommended Approach
 
-**For MVP: Leverage Existing Test Infrastructure**
+**For MVP: Extend Application::headless() for Window Support**
 
-The discovery of `TestAppContext` and `TestPlatform` changes the recommendation significantly:
+The discovery of **`Application::headless()`** as existing public API changes everything. The path forward is:
+
+### Approach A: Extend Headless to Support Windowless Windows (Recommended)
+
+```rust
+// Proposal: Add to HeadlessClient (Linux) or equivalent platforms
+
+impl LinuxClient for HeadlessClient {
+    fn open_window(
+        &self,
+        handle: AnyWindowHandle,
+        params: WindowParams,
+    ) -> anyhow::Result<Box<dyn PlatformWindow>> {
+        // Instead of bailing, create a headless window!
+        Ok(Box::new(HeadlessWindow::new(handle, params)))
+    }
+}
+
+// New: HeadlessWindow similar to TestWindow
+pub struct HeadlessWindow {
+    handle: AnyWindowHandle,
+    bounds: Bounds<Pixels>,
+    // ... minimal fields
+}
+
+impl PlatformWindow for HeadlessWindow {
+    fn draw(&self, _scene: &Scene) {}  // No-op, we'll extract scene ourselves
+    // ... other minimal implementations
+}
+```
+
+Then one-shot rendering becomes:
+
+```rust
+pub struct OneShotRenderer {
+    app: Application,
+}
+
+impl OneShotRenderer {
+    pub fn new(asset_source: impl AssetSource) -> Result<Self> {
+        let app = Application::headless()
+            .with_assets(asset_source);
+        Ok(Self { app })
+    }
+    
+    pub fn render_to_pixels<V: Render>(
+        &mut self,
+        size: Size<DevicePixels>,
+        build_view: impl FnOnce(&mut Window, &mut Context<V>) -> V,
+    ) -> Result<Vec<u8>> {
+        self.app.run(|cx| {
+            // Open a headless window
+            let window = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |window, cx| cx.new(|cx| build_view(window, cx))
+            )?;
+            
+            // Update window to trigger draw
+            window.update(cx, |window, cx| {
+                window.draw(cx);
+                let scene = std::mem::take(&mut window.rendered_frame.scene);
+                
+                // Render scene with HeadlessBladeRenderer
+                self.render_scene_to_pixels(&scene, size)
+            })
+        })
+    }
+}
+```
+
+**Advantages:**
+- Uses existing public `Application::headless()` API
+- Only requires adding window support to headless platforms
+- No `test-support` feature needed
+- Clean separation of concerns
+
+### Approach B: Leverage Existing Test Infrastructure
+
+Alternatively, use `TestAppContext` if `test-support` feature is acceptable:
 
 ```rust
 pub struct OneShotRenderer {
@@ -1417,24 +1548,15 @@ impl OneShotRenderer {
 2. Create `HeadlessBladeRenderer` that renders `Scene` to texture (no window surface)
 3. Wire up the one-shot API to extract scenes and render them
 
-**For Long-Term: New `headless` Feature Flag**
+**For Long-Term: Complete Headless Support**
 
-Once the MVP works, consider upstreaming a proper `headless` feature to GPUI that:
-- Makes test infrastructure available without the `test-support` feature (which pulls in test dependencies)
-- Adds explicit `render_to_texture()` API
-- Documents headless rendering as a supported use case
-- Separates concerns: `test-support` for testing, `headless` for rendering
+Once the MVP works, consider upstreaming proper headless window support:
 
-**Cargo.toml addition would look like:**
-```toml
-[features]
-headless = [
-    # Minimal dependencies for headless rendering
-    "blade-graphics",
-    "blade-macros",
-    # ... other GPU deps
-]
-```
+1. **Add `HeadlessWindow` to all platforms** (Linux, macOS, Windows)
+2. **Document headless rendering** as a supported use case
+3. **Add `render_to_texture()` API** to GPUI proper
+
+The infrastructure is mostly there - we just need to make headless mode support opening windows (even if they don't display anything).
 
 ### Workarounds
 
@@ -1499,25 +1621,40 @@ GPUI's element system is tightly coupled to concrete `Window` and `App` types - 
 fn paint(&mut self, window: &mut Window, cx: &mut App);
 ```
 
-### The Solution
-GPUI already has test infrastructure (`TestAppContext`, `TestPlatform`, `TestWindow`) that provides real `Window` and `App` instances without requiring a display. This infrastructure:
+### The Solutions
+GPUI already has **multiple** pieces of infrastructure that solve this:
+
+#### Solution 1: Application::headless() (Public API)
+`Application::headless()` already exists and creates a headless `App`. On Linux it uses `HeadlessClient`. The only missing piece is that it currently bails when opening windows. Adding `HeadlessWindow` support would enable one-shot rendering with zero feature flags.
+
+#### Solution 2: Test Infrastructure  
+`TestAppContext`, `TestPlatform`, `TestWindow` provide real `Window` and `App` instances without requiring a display. This infrastructure:
 
 1. Uses a `TestPlatform` that works without windowing system
 2. Creates `TestWindow` instances with no-op `draw()` methods  
 3. Provides full text system, layout engine, and entity support
 4. Is battle-tested across the entire GPUI test suite
 
-### Implementation Path
+### Recommended Implementation Path
 
-1. **Enable `test-support` feature** (or create new `headless` feature)
-2. **Use `TestAppContext`** to get real `App` and `Window`
-3. **Create `HeadlessBladeRenderer`** that renders `Scene` to texture without window surface
-4. **Extract scene after `window.draw()`** and render to pixels
+**Option A: Extend Application::headless() (Preferred)**
+1. Add `HeadlessWindow` struct for each platform (similar to `TestWindow`)
+2. Make `HeadlessClient::open_window()` return `HeadlessWindow` instead of bailing
+3. Create `HeadlessBladeRenderer` that renders `Scene` to texture
+4. Use existing public `Application::headless()` API
+
+**Option B: Use Test Infrastructure**
+1. Enable `test-support` feature (or create new `headless` feature)
+2. Use `TestAppContext` to get real `App` and `Window`
+3. Create `HeadlessBladeRenderer` that renders `Scene` to texture without window surface
+4. Extract scene after `window.draw()` and render to pixels
 
 ### Key Files to Reference
+- `gpui/src/app.rs` - **`Application::headless()` - PUBLIC API!**
+- `gpui/src/platform/linux/headless/client.rs` - `HeadlessClient` (Linux)
 - `gpui/src/app/test_context.rs` - `TestAppContext`, `VisualTestContext`
 - `gpui/src/platform/test/platform.rs` - `TestPlatform`
-- `gpui/src/platform/test/window.rs` - `TestWindow`
+- `gpui/src/platform/test/window.rs` - `TestWindow` (example to follow)
 - `gpui/src/platform/blade/blade_renderer.rs` - Rendering to GPU
 
 ---
