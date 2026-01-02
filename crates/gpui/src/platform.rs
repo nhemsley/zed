@@ -123,6 +123,18 @@ pub(crate) fn current_platform(headless: bool) -> Rc<dyn Platform> {
     }
 }
 
+/// Creates a platform client that renders to GPU textures instead of display surfaces.
+///
+/// This is useful for:
+/// - One-shot rendering to PNG/images
+/// - Generating thumbnails
+/// - Embedding GPUI in 3D environments
+/// - Visual testing
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub(crate) fn textured_platform() -> Rc<dyn Platform> {
+    Rc::new(TexturedSurfaceClient::new())
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) fn current_platform(_headless: bool) -> Rc<dyn Platform> {
     Rc::new(
@@ -516,6 +528,14 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn draw(&self, scene: &Scene);
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
+
+    /// Read the rendered pixels from the window.
+    /// This is primarily useful for textured surface rendering where the content
+    /// is rendered to a GPU texture instead of a display surface.
+    /// Returns None for windows that don't support pixel readback.
+    fn read_pixels(&self) -> Option<Vec<u8>> {
+        None
+    }
 
     // macOS specific methods
     fn get_title(&self) -> String {

@@ -4605,6 +4605,36 @@ impl Window {
         self.platform_window.gpu_specs()
     }
 
+    /// Read the rendered pixels from the window.
+    ///
+    /// This is primarily useful for textured surface rendering where the content
+    /// is rendered to a GPU texture instead of a display surface. The pixels are
+    /// returned in BGRA format.
+    ///
+    /// Returns `None` for windows that don't support pixel readback (most normal windows).
+    /// Currently only supported by `TexturedSurfaceWindow` on Linux.
+    pub fn read_pixels(&self) -> Option<Vec<u8>> {
+        self.platform_window.read_pixels()
+    }
+
+    /// Force a complete draw and present cycle.
+    ///
+    /// This draws the current view hierarchy and submits it to the GPU.
+    /// Useful for textured surface rendering where you need to ensure the
+    /// scene is fully rendered before reading pixels.
+    ///
+    /// Returns `true` if the draw was successful, `false` if the window
+    /// is not in a valid state for drawing.
+    pub fn draw_and_present(&mut self, cx: &mut App) -> bool {
+        if self.removed {
+            return false;
+        }
+        self.refresh();
+        self.draw(cx).clear();
+        self.present();
+        true
+    }
+
     /// Perform titlebar double-click action.
     /// This is macOS specific.
     pub fn titlebar_double_click(&self) {

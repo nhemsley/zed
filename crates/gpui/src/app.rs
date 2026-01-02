@@ -47,6 +47,9 @@ use crate::{
     current_platform, hash, init_app_menus,
 };
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use crate::textured_platform;
+
 mod async_context;
 mod context;
 mod entity_map;
@@ -147,6 +150,25 @@ impl Application {
     pub fn headless() -> Self {
         Self(App::new_app(
             current_platform(true),
+            Arc::new(()),
+            Arc::new(NullHttpClient),
+        ))
+    }
+
+    /// Build an app that renders to textures instead of display surfaces.
+    ///
+    /// This mode supports opening windows and full GPUI rendering, but
+    /// renders to GPU textures that can be read back as pixels.
+    ///
+    /// Use this for:
+    /// - One-shot rendering to PNG/images
+    /// - Generating thumbnails
+    /// - Embedding GPUI in 3D environments
+    /// - Visual testing
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn textured() -> Self {
+        Self(App::new_app(
+            textured_platform(),
             Arc::new(()),
             Arc::new(NullHttpClient),
         ))
