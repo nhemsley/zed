@@ -123,7 +123,7 @@ struct PathRasterizationVertex {
     bounds: Bounds<ScaledPixels>,
 }
 
-struct BladePipelines {
+pub(super) struct BladePipelines {
     quads: gpu::RenderPipeline,
     shadows: gpu::RenderPipeline,
     path_rasterization: gpu::RenderPipeline,
@@ -135,7 +135,11 @@ struct BladePipelines {
 }
 
 impl BladePipelines {
-    fn new(gpu: &gpu::Context, surface_info: gpu::SurfaceInfo, path_sample_count: u32) -> Self {
+    pub(super) fn new(
+        gpu: &gpu::Context,
+        surface_info: gpu::SurfaceInfo,
+        path_sample_count: u32,
+    ) -> Self {
         use gpu::ShaderData as _;
 
         log::info!(
@@ -304,7 +308,7 @@ impl BladePipelines {
         }
     }
 
-    fn destroy(&mut self, gpu: &gpu::Context) {
+    pub(super) fn destroy(&mut self, gpu: &gpu::Context) {
         gpu.destroy_render_pipeline(&mut self.quads);
         gpu.destroy_render_pipeline(&mut self.shadows);
         gpu.destroy_render_pipeline(&mut self.path_rasterization);
@@ -340,7 +344,7 @@ pub(super) struct RenderContext<'a> {
 #[allow(private_interfaces)]
 pub(super) struct SharedRenderResources {
     pub(super) gpu: Arc<gpu::Context>,
-    pub(super) pipelines: BladePipelines,
+    pub(super) pipelines: Arc<BladePipelines>,
     pub(super) atlas: Arc<BladeAtlas>,
     pub(super) atlas_sampler: gpu::Sampler,
     pub(super) rendering_parameters: RenderingParameters,
@@ -352,8 +356,11 @@ impl SharedRenderResources {
         surface_info: gpu::SurfaceInfo,
         rendering_parameters: RenderingParameters,
     ) -> Self {
-        let pipelines =
-            BladePipelines::new(&gpu, surface_info, rendering_parameters.path_sample_count);
+        let pipelines = Arc::new(BladePipelines::new(
+            &gpu,
+            surface_info,
+            rendering_parameters.path_sample_count,
+        ));
         let atlas = Arc::new(BladeAtlas::new(&gpu));
         let atlas_sampler = gpu.create_sampler(gpu::SamplerDesc {
             name: "shared sampler",
@@ -374,7 +381,10 @@ impl SharedRenderResources {
     fn destroy(&mut self) {
         self.atlas.destroy();
         self.gpu.destroy_sampler(self.atlas_sampler);
-        self.pipelines.destroy(&self.gpu);
+        // Only destroy pipelines if we have the only reference
+        if let Some(pipelines) = Arc::get_mut(&mut self.pipelines) {
+            pipelines.destroy(&self.gpu);
+        }
     }
 }
 
@@ -450,7 +460,7 @@ fn draw_paths_to_intermediate(
 /// Note: Surfaces (macOS video) are NOT handled here as they require platform-specific
 /// resources (CVMetalTextureCache). The caller must handle those separately.
 #[profiling::function]
-fn render_batches(
+pub(super) fn render_batches(
     scene: &Scene,
     target_view: gpu::TextureView,
     viewport_size: [f32; 2],
@@ -808,12 +818,14 @@ impl BladeRenderer {
             self.shared
                 .gpu
                 .reconfigure_surface(&mut self.surface, self.surface_config);
-            self.shared.pipelines.destroy(&self.shared.gpu);
-            self.shared.pipelines = BladePipelines::new(
+            if let Some(pipelines) = Arc::get_mut(&mut self.shared.pipelines) {
+                pipelines.destroy(&self.shared.gpu);
+            }
+            self.shared.pipelines = Arc::new(BladePipelines::new(
                 &self.shared.gpu,
                 self.surface.info(),
                 self.shared.rendering_parameters.path_sample_count,
-            );
+            ));
         }
     }
 
@@ -827,6 +839,42 @@ impl BladeRenderer {
 
     pub fn sprite_atlas(&self) -> &Arc<BladeAtlas> {
         &self.shared.atlas
+    }
+
+    /// Returns the surface format used by this renderer.
+    #[cfg(feature = "render-to-texture")]
+    pub fn surface_format(&self) -> gpu::TextureFormat {
+        self.surface.info().format
+    }
+
+    /// Creates a new offscreen renderer that shares resources with this renderer.
+    ///
+    /// The offscreen renderer can be used for render-to-texture operations without
+    /// interfering with the main rendering pipeline.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_texture_size` - Maximum size of textures the offscreen renderer will create
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let offscreen = renderer.create_offscreen_renderer(gpu::Extent {
+    ///     width: 1024,
+    ///     height: 1024,
+    ///     depth: 1,
+    /// });
+    /// ```
+    #[cfg(feature = "render-to-texture")]
+    pub fn create_offscreen_renderer(
+        &self,
+        max_texture_size: gpu::Extent,
+    ) -> super::BladeOffscreenRenderer {
+        super::BladeOffscreenRenderer::new(
+            &self.shared,
+            max_texture_size,
+            self.surface.info().format,
+        )
     }
 
     #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -1037,7 +1085,7 @@ impl BladeRenderer {
     }
 }
 
-fn create_path_intermediate_texture(
+pub(super) fn create_path_intermediate_texture(
     gpu: &gpu::Context,
     format: gpu::TextureFormat,
     width: u32,
@@ -1070,7 +1118,7 @@ fn create_path_intermediate_texture(
     (texture, texture_view)
 }
 
-fn create_msaa_texture_if_needed(
+pub(super) fn create_msaa_texture_if_needed(
     gpu: &gpu::Context,
     format: gpu::TextureFormat,
     width: u32,
@@ -1109,10 +1157,11 @@ fn create_msaa_texture_if_needed(
 }
 
 /// A set of parameters that can be set using a corresponding environment variable.
-struct RenderingParameters {
+#[derive(Clone)]
+pub(super) struct RenderingParameters {
     // Env var: ZED_PATH_SAMPLE_COUNT
     // workaround for https://github.com/zed-industries/zed/issues/26143
-    path_sample_count: u32,
+    pub(super) path_sample_count: u32,
 
     // Env var: ZED_FONTS_GAMMA
     // Allowed range [1.0, 2.2], other values are clipped
