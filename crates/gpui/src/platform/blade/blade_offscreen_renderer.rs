@@ -4,16 +4,18 @@
 //! expensive GPU resources with the main `BladeRenderer` while maintaining its own
 //! per-instance state for safe concurrent/reentrant rendering.
 
-use super::blade_renderer::{
-    create_msaa_texture_if_needed, create_path_intermediate_texture, render_batches,
-    RenderContext, SharedRenderResources,
-};
 use super::BladeAtlas;
+use super::blade_renderer::{
+    RenderContext, SharedRenderResources, create_msaa_texture_if_needed,
+    create_path_intermediate_texture, render_batches,
+};
 use blade_graphics as gpu;
 use blade_util::{BufferBelt, BufferBeltDescriptor};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::{Scene, Size};
+use crate::platform::{OffscreenTextureId, OffscreenTextureInfo, PlatformOffscreenRenderer};
+use crate::{DevicePixels, Scene, Size};
 
 /// A lightweight offscreen renderer that can render scenes to textures.
 ///
@@ -52,6 +54,10 @@ pub struct BladeOffscreenRenderer {
     path_intermediate_texture_view: gpu::TextureView,
     path_intermediate_msaa_texture: Option<gpu::Texture>,
     path_intermediate_msaa_texture_view: Option<gpu::TextureView>,
+
+    // Texture management
+    textures: HashMap<u64, OffscreenTexture>,
+    next_texture_id: u64,
 
     // Configuration
     max_texture_size: gpu::Extent,
@@ -140,6 +146,8 @@ impl BladeOffscreenRenderer {
             path_intermediate_texture_view,
             path_intermediate_msaa_texture,
             path_intermediate_msaa_texture_view,
+            textures: HashMap::new(),
+            next_texture_id: 1,
             max_texture_size,
             surface_format,
         }
@@ -155,7 +163,7 @@ impl BladeOffscreenRenderer {
     /// # Panics
     ///
     /// Panics if the requested size exceeds `max_texture_size`.
-    pub fn create_texture(&self, width: u32, height: u32) -> OffscreenTexture {
+    pub fn create_texture_raw(&self, width: u32, height: u32) -> OffscreenTexture {
         assert!(
             width <= self.max_texture_size.width && height <= self.max_texture_size.height,
             "Requested texture size {}x{} exceeds max size {}x{}",
@@ -177,7 +185,9 @@ impl BladeOffscreenRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: gpu::TextureDimension::D2,
-            usage: gpu::TextureUsage::COPY | gpu::TextureUsage::RESOURCE | gpu::TextureUsage::TARGET,
+            usage: gpu::TextureUsage::COPY
+                | gpu::TextureUsage::RESOURCE
+                | gpu::TextureUsage::TARGET,
             external: None,
         });
 
@@ -194,10 +204,7 @@ impl BladeOffscreenRenderer {
         OffscreenTexture {
             texture,
             view,
-            size: Size {
-                width,
-                height,
-            },
+            size: Size { width, height },
         }
     }
 
@@ -291,6 +298,12 @@ impl BladeOffscreenRenderer {
         // Note: We don't have a last_sync_point like BladeRenderer, but the
         // wait in draw_to_texture should have completed any pending work.
 
+        // Destroy all managed textures
+        for (_, texture) in self.textures.drain() {
+            self.gpu.destroy_texture_view(texture.view);
+            self.gpu.destroy_texture(texture.texture);
+        }
+
         self.instance_belt.destroy(&self.gpu);
         self.gpu.destroy_command_encoder(&mut self.command_encoder);
         self.gpu.destroy_texture(self.path_intermediate_texture);
@@ -308,3 +321,109 @@ impl BladeOffscreenRenderer {
         // as they are owned by the main BladeRenderer
     }
 }
+
+// Implement PlatformOffscreenRenderer trait
+impl PlatformOffscreenRenderer for BladeOffscreenRenderer {
+    fn create_texture(&mut self, size: Size<DevicePixels>) -> OffscreenTextureInfo {
+        let width = size.width.0 as u32;
+        let height = size.height.0 as u32;
+
+        let texture = self.create_texture_raw(width, height);
+        let id = self.next_texture_id;
+        self.next_texture_id += 1;
+
+        let info = OffscreenTextureInfo {
+            id: OffscreenTextureId(id),
+            size,
+        };
+
+        self.textures.insert(id, texture);
+        info
+    }
+
+    fn draw_to_texture(&mut self, scene: &Scene, texture_id: OffscreenTextureId) {
+        let Some(texture) = self.textures.get(&texture_id.0) else {
+            log::error!(
+                "Attempted to draw to non-existent texture: {:?}",
+                texture_id
+            );
+            return;
+        };
+
+        self.command_encoder.start();
+        self.atlas.before_frame(&mut self.command_encoder);
+        self.command_encoder.init_texture(texture.texture);
+
+        let viewport_size = [texture.size.width as f32, texture.size.height as f32];
+
+        // Create render context for this frame
+        let mut ctx = RenderContext {
+            command_encoder: &mut self.command_encoder,
+            instance_belt: &mut self.instance_belt,
+            path_intermediate_texture: self.path_intermediate_texture,
+            path_intermediate_texture_view: self.path_intermediate_texture_view,
+            path_intermediate_msaa_texture: self.path_intermediate_msaa_texture,
+            path_intermediate_msaa_texture_view: self.path_intermediate_msaa_texture_view,
+        };
+
+        // Create a temporary SharedRenderResources view for render_batches
+        let shared = SharedRenderResources {
+            gpu: Arc::clone(&self.gpu),
+            pipelines: Arc::clone(&self.pipelines),
+            atlas: Arc::clone(&self.atlas),
+            atlas_sampler: self.atlas_sampler,
+            rendering_parameters: self.rendering_parameters.clone(),
+        };
+
+        // Render all batches using shared logic
+        // Offscreen textures use premultiplied alpha
+        render_batches(
+            scene,
+            texture.view,
+            viewport_size,
+            true, // premultiplied_alpha
+            &mut ctx,
+            &shared,
+        );
+
+        let sync_point = self.gpu.submit(&mut self.command_encoder);
+
+        self.instance_belt.flush(&sync_point);
+        self.atlas.after_frame(&sync_point);
+
+        // Wait for GPU to complete
+        self.gpu.wait_for(&sync_point, 10000);
+    }
+
+    fn destroy_texture(&mut self, texture_id: OffscreenTextureId) {
+        if let Some(texture) = self.textures.remove(&texture_id.0) {
+            self.gpu.destroy_texture_view(texture.view);
+            self.gpu.destroy_texture(texture.texture);
+        } else {
+            log::warn!(
+                "Attempted to destroy non-existent texture: {:?}",
+                texture_id
+            );
+        }
+    }
+
+    fn max_texture_size(&self) -> Size<DevicePixels> {
+        Size {
+            width: DevicePixels(self.max_texture_size.width as i32),
+            height: DevicePixels(self.max_texture_size.height as i32),
+        }
+    }
+
+    fn destroy(&mut self) {
+        // Delegate to the inherent method
+        BladeOffscreenRenderer::destroy(self);
+    }
+}
+
+// Safety: BladeOffscreenRenderer can be sent between threads because:
+// - Arc<gpu::Context> is Send + Sync
+// - Arc<BladePipelines> is Send + Sync
+// - Arc<BladeAtlas> is Send + Sync
+// - gpu::Sampler is Copy and thread-safe
+// - Other fields are owned and don't have thread-local state
+unsafe impl Send for BladeOffscreenRenderer {}

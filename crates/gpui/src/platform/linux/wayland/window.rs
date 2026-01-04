@@ -1388,6 +1388,21 @@ impl PlatformWindow for WaylandWindow {
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.borrow().renderer.gpu_specs().into()
     }
+
+    #[cfg(feature = "render-to-texture")]
+    fn create_offscreen_renderer(
+        &self,
+        max_texture_size: crate::Size<crate::DevicePixels>,
+    ) -> Option<Box<dyn crate::platform::PlatformOffscreenRenderer>> {
+        let state = self.borrow();
+        let max_size = blade_graphics::Extent {
+            width: max_texture_size.width.0 as u32,
+            height: max_texture_size.height.0 as u32,
+            depth: 1,
+        };
+        let offscreen = state.renderer.create_offscreen_renderer(max_size);
+        Some(Box::new(offscreen))
+    }
 }
 
 fn update_window(mut state: RefMut<WaylandWindowState>) {

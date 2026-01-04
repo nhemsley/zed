@@ -2,6 +2,9 @@ mod app_menu;
 mod keyboard;
 mod keystroke;
 
+#[cfg(feature = "render-to-texture")]
+mod offscreen_rendering;
+
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod linux;
 
@@ -34,6 +37,11 @@ mod windows;
     )
 ))]
 pub(crate) mod scap_screen_capture;
+
+#[cfg(feature = "render-to-texture")]
+pub(crate) use offscreen_rendering::PlatformOffscreenRenderer;
+#[cfg(feature = "render-to-texture")]
+pub use offscreen_rendering::{OffscreenTextureId, OffscreenTextureInfo};
 
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
@@ -563,6 +571,27 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     fn set_client_inset(&self, _inset: Pixels) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
+
+    /// Creates an offscreen renderer for render-to-texture operations.
+    ///
+    /// The offscreen renderer shares GPU resources with the main window renderer
+    /// but maintains its own command buffers for isolated rendering.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_texture_size` - Maximum size of textures the renderer will create
+    ///
+    /// # Returns
+    ///
+    /// An offscreen renderer, or `None` if the platform doesn't support it.
+    #[cfg(feature = "render-to-texture")]
+    fn create_offscreen_renderer(
+        &self,
+        max_texture_size: Size<DevicePixels>,
+    ) -> Option<Box<dyn PlatformOffscreenRenderer>> {
+        let _ = max_texture_size;
+        None
+    }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 

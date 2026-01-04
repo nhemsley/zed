@@ -1,5 +1,7 @@
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
+#[cfg(feature = "render-to-texture")]
+use crate::platform::{OffscreenTextureId, OffscreenTextureInfo, PlatformOffscreenRenderer};
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
@@ -4605,6 +4607,37 @@ impl Window {
         self.platform_window.gpu_specs()
     }
 
+    /// Creates an offscreen renderer for render-to-texture operations.
+    ///
+    /// The offscreen renderer shares GPU resources with the main window renderer
+    /// but maintains its own command buffers for isolated rendering. This enables
+    /// rendering scenes to textures without interfering with the main window.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_texture_size` - Maximum size of textures the renderer will create
+    ///
+    /// # Returns
+    ///
+    /// An offscreen renderer, or `None` if the platform doesn't support it.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut offscreen = window.create_offscreen_renderer(size(DevicePixels(1024), DevicePixels(1024)))?;
+    /// let texture = offscreen.create_texture(size(DevicePixels(512), DevicePixels(512)));
+    /// offscreen.draw_to_texture(&scene, texture.id);
+    /// ```
+    #[cfg(feature = "render-to-texture")]
+    pub fn create_offscreen_renderer(
+        &self,
+        max_texture_size: Size<DevicePixels>,
+    ) -> Option<OffscreenRenderer> {
+        self.platform_window
+            .create_offscreen_renderer(max_texture_size)
+            .map(OffscreenRenderer::new)
+    }
+
     /// Perform titlebar double-click action.
     /// This is macOS specific.
     pub fn titlebar_double_click(&self) {
@@ -4855,6 +4888,85 @@ impl Window {
 slotmap::new_key_type! {
     /// A unique identifier for a window.
     pub struct WindowId;
+}
+
+/// An offscreen renderer for render-to-texture operations.
+///
+/// This renderer shares GPU resources with the main window renderer but maintains
+/// its own command buffers for isolated rendering. Use this to render GPUI scenes
+/// to textures without interfering with the main window rendering.
+///
+/// # Example
+///
+/// ```ignore
+/// // Create an offscreen renderer
+/// let mut offscreen = window.create_offscreen_renderer(size(DevicePixels(1024), DevicePixels(1024)))?;
+///
+/// // Create a texture to render to
+/// let texture_info = offscreen.create_texture(size(DevicePixels(512), DevicePixels(512)));
+///
+/// // Render a scene to the texture
+/// offscreen.draw_scene_to_texture(&scene, texture_info.id);
+///
+/// // Clean up
+/// offscreen.destroy_texture(texture_info.id);
+/// offscreen.destroy();
+/// ```
+#[cfg(feature = "render-to-texture")]
+pub struct OffscreenRenderer {
+    inner: Box<dyn PlatformOffscreenRenderer>,
+}
+
+#[cfg(feature = "render-to-texture")]
+impl OffscreenRenderer {
+    fn new(inner: Box<dyn PlatformOffscreenRenderer>) -> Self {
+        Self { inner }
+    }
+
+    /// Creates a new texture that can be rendered to.
+    ///
+    /// # Arguments
+    ///
+    /// * `size` - The size of the texture in device pixels
+    ///
+    /// # Returns
+    ///
+    /// Information about the created texture, including its ID for use with
+    /// `draw_scene_to_texture` and `destroy_texture`.
+    pub fn create_texture(&mut self, size: Size<DevicePixels>) -> OffscreenTextureInfo {
+        self.inner.create_texture(size)
+    }
+
+    /// Renders a scene to the specified texture.
+    ///
+    /// # Arguments
+    ///
+    /// * `scene` - The scene to render (obtained from a Frame)
+    /// * `texture_id` - The ID of the texture to render to
+    pub(crate) fn draw_scene_to_texture(&mut self, scene: &Scene, texture_id: OffscreenTextureId) {
+        self.inner.draw_to_texture(scene, texture_id)
+    }
+
+    /// Destroys a texture, freeing its GPU resources.
+    ///
+    /// # Arguments
+    ///
+    /// * `texture_id` - The ID of the texture to destroy
+    pub fn destroy_texture(&mut self, texture_id: OffscreenTextureId) {
+        self.inner.destroy_texture(texture_id)
+    }
+
+    /// Returns the maximum texture size supported by this renderer.
+    pub fn max_texture_size(&self) -> Size<DevicePixels> {
+        self.inner.max_texture_size()
+    }
+
+    /// Destroys the offscreen renderer and releases all its resources.
+    ///
+    /// This should be called when the renderer is no longer needed.
+    pub fn destroy(&mut self) {
+        self.inner.destroy()
+    }
 }
 
 impl WindowId {
