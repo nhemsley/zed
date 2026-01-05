@@ -14,7 +14,9 @@ use blade_util::{BufferBelt, BufferBeltDescriptor};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::platform::{OffscreenTextureId, OffscreenTextureInfo, PlatformOffscreenRenderer};
+use crate::platform::{
+    OffscreenTextureId, OffscreenTextureInfo, PlatformOffscreenRenderer, TextureData,
+};
 use crate::{DevicePixels, Scene, Size};
 
 /// A lightweight offscreen renderer that can render scenes to textures.
@@ -290,6 +292,106 @@ impl BladeOffscreenRenderer {
         &self.atlas
     }
 
+    /// Reads a texture's contents back from the GPU as RGBA data.
+    ///
+    /// This method copies the texture data from GPU memory to CPU memory,
+    /// converting from the internal BGRA format to standard RGBA.
+    ///
+    /// # Arguments
+    ///
+    /// * `texture_id` - The ID of the texture to read
+    ///
+    /// # Returns
+    ///
+    /// The texture data as RGBA bytes, or an error if the texture doesn't exist
+    /// or the read operation fails.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let texture_data = offscreen_renderer.read_texture(texture_id)?;
+    /// // Save to PNG using the image crate:
+    /// image::save_buffer(
+    ///     "output.png",
+    ///     texture_data.as_bytes(),
+    ///     texture_data.width,
+    ///     texture_data.height,
+    ///     image::ColorType::Rgba8,
+    /// )?;
+    /// ```
+    pub fn read_texture(&mut self, texture_id: OffscreenTextureId) -> anyhow::Result<TextureData> {
+        let Some(texture) = self.textures.get(&texture_id.0) else {
+            anyhow::bail!("Texture {:?} not found", texture_id);
+        };
+
+        let width = texture.size.width;
+        let height = texture.size.height;
+        let bytes_per_pixel = 4u32; // BGRA8
+        let bytes_per_row = width * bytes_per_pixel;
+        // Align to 256 bytes as required by some GPU APIs
+        let aligned_bytes_per_row = (bytes_per_row + 255) & !255;
+        let buffer_size = (aligned_bytes_per_row * height) as u64;
+
+        // Create a buffer to hold the texture data
+        let readback_buffer = self.gpu.create_buffer(gpu::BufferDesc {
+            name: "texture readback",
+            size: buffer_size,
+            memory: gpu::Memory::Shared,
+        });
+
+        // Copy texture to buffer using transfer encoder
+        self.command_encoder.start();
+        {
+            let mut transfers = self.command_encoder.transfer("texture readback");
+            transfers.copy_texture_to_buffer(
+                gpu::TexturePiece {
+                    texture: texture.texture,
+                    mip_level: 0,
+                    array_layer: 0,
+                    origin: [0, 0, 0],
+                },
+                gpu::BufferPiece {
+                    buffer: readback_buffer,
+                    offset: 0,
+                },
+                aligned_bytes_per_row,
+                gpu::Extent {
+                    width,
+                    height,
+                    depth: 1,
+                },
+            );
+        }
+
+        let sync_point = self.gpu.submit(&mut self.command_encoder);
+        self.gpu.wait_for(&sync_point, 10000);
+
+        // Read the buffer data - for Shared memory buffers, data() returns the mapped pointer
+        let buffer_data = unsafe {
+            let ptr = readback_buffer.data();
+            std::slice::from_raw_parts(ptr as *const u8, buffer_size as usize)
+        };
+
+        // Convert from BGRA to RGBA and handle row alignment
+        let mut rgba_data = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            let row_start = (y * aligned_bytes_per_row) as usize;
+            for x in 0..width {
+                let pixel_start = row_start + (x * 4) as usize;
+                // BGRA -> RGBA
+                rgba_data.push(buffer_data[pixel_start + 2]); // R
+                rgba_data.push(buffer_data[pixel_start + 1]); // G
+                rgba_data.push(buffer_data[pixel_start]); // B
+                rgba_data.push(buffer_data[pixel_start + 3]); // A
+            }
+        }
+
+        // Destroy the buffer (Shared memory doesn't need explicit unmap)
+        self.gpu.destroy_buffer(readback_buffer);
+
+        Ok(TextureData::new(rgba_data, width, height))
+    }
+
     /// Destroys this offscreen renderer and releases its resources.
     ///
     /// This should be called when the renderer is no longer needed.
@@ -412,6 +514,11 @@ impl PlatformOffscreenRenderer for BladeOffscreenRenderer {
             width: DevicePixels(self.max_texture_size.width as i32),
             height: DevicePixels(self.max_texture_size.height as i32),
         }
+    }
+
+    fn read_texture(&mut self, texture_id: OffscreenTextureId) -> anyhow::Result<TextureData> {
+        // Delegate to the inherent method
+        BladeOffscreenRenderer::read_texture(self, texture_id)
     }
 
     fn destroy(&mut self) {

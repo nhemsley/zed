@@ -1,7 +1,7 @@
 //! Render-to-Texture Example
 //!
-//! This example demonstrates how to use GPUI's render-to-texture functionality
-//! to render a scene to an offscreen texture and export it to a PNG file.
+//! This example demonstrates rendering primitives to an offscreen texture
+//! and saving the result to a PNG file.
 //!
 //! Run with: cargo run -p gpui --example render_to_texture --features render-to-texture
 
@@ -22,123 +22,111 @@ fn main() {
 #[cfg(feature = "render-to-texture")]
 mod render_to_texture_example {
     use gpui::{
-        App, Application, Bounds, Context, DevicePixels, Hsla, SharedString, Window, WindowBounds,
-        WindowOptions, div, hsla, prelude::*, px, rgb, size, white,
+        App, Application, Bounds, Context, DevicePixels, Window, WindowBounds, WindowOptions, fill,
+        point, prelude::*, px, rgb, size,
     };
 
-    struct RenderToTextureDemo {
-        text: SharedString,
-        exported: bool,
-    }
+    struct RenderToTextureTest;
 
-    impl Render for RenderToTextureDemo {
+    impl Render for RenderToTextureTest {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .bg(rgb(0x2d2d2d))
-                .size(px(400.0))
-                .justify_center()
-                .items_center()
-                .border_2()
-                .border_color(rgb(0x00aaff))
-                .rounded_lg()
-                .shadow_lg()
-                .child(
-                    div()
-                        .text_xl()
-                        .text_color(rgb(0xffffff))
-                        .child(format!("🎨 {}", &self.text)),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(colored_box(gpui::red()))
-                        .child(colored_box(gpui::green()))
-                        .child(colored_box(gpui::blue()))
-                        .child(colored_box(gpui::yellow()))
-                        .child(colored_box(hsla(0.75, 0.6, 0.5, 1.0))), // purple
-                )
-                .child(
-                    div()
-                        .mt_4()
-                        .text_sm()
-                        .text_color(rgb(0x888888))
-                        .child(if self.exported {
-                            "✅ Texture exported! Check console for path."
-                        } else {
-                            "Creating offscreen renderer..."
-                        }),
-                )
+            gpui::Empty
         }
-    }
-
-    fn colored_box(color: Hsla) -> impl IntoElement {
-        div()
-            .size_10()
-            .bg(color)
-            .border_1()
-            .border_color(white().opacity(0.3))
-            .rounded_md()
     }
 
     pub fn run() {
         Application::new().run(|cx: &mut App| {
-            let bounds = Bounds::centered(None, size(px(500.), px(500.0)), cx);
+            let bounds = Bounds::centered(None, size(px(100.), px(100.)), cx);
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    focus: false,
+                    show: false,
                     ..Default::default()
                 },
                 |window, cx| {
-                    // Try to create an offscreen renderer
-                    let max_size = size(DevicePixels(1024), DevicePixels(1024));
-
-                    match window.create_offscreen_renderer(max_size) {
-                        Some(mut offscreen) => {
-                            println!("✅ Offscreen renderer created successfully!");
-                            println!("   Max texture size: {:?}", offscreen.max_texture_size());
-
-                            // Create a texture
-                            let texture_size = size(DevicePixels(512), DevicePixels(512));
-                            let texture_info = offscreen.create_texture(texture_size);
-                            println!("✅ Texture created: {:?}", texture_info);
-
-                            // Note: To actually render to the texture, we would need to:
-                            // 1. Build a Scene from elements
-                            // 2. Call offscreen.draw_scene_to_texture(&scene, texture_info.id)
-                            //
-                            // The Scene type is internal to GPUI, so this would typically be done
-                            // through a higher-level API that GPUI would provide.
-                            //
-                            // For now, this example demonstrates the API availability.
-
-                            println!("ℹ️  Render-to-texture API is available!");
-                            println!("   Texture ID: {:?}", texture_info.id);
-                            println!("   Texture Size: {:?}", texture_info.size);
-
-                            // Clean up
-                            offscreen.destroy_texture(texture_info.id);
-                            offscreen.destroy();
-                            println!("✅ Resources cleaned up");
-                        }
-                        None => {
-                            eprintln!("❌ Failed to create offscreen renderer");
-                            eprintln!("   This platform may not support render-to-texture");
-                        }
-                    }
-
-                    cx.new(|_| RenderToTextureDemo {
-                        text: "Render to Texture".into(),
-                        exported: true,
-                    })
+                    render_to_png(window);
+                    cx.new(|_| RenderToTextureTest)
                 },
             )
             .unwrap();
 
-            cx.activate(true);
+            cx.quit();
         });
+    }
+
+    fn render_to_png(window: &mut Window) {
+        let max_size = size(DevicePixels(1024), DevicePixels(1024));
+
+        let Some(mut offscreen) = window.create_offscreen_renderer(max_size) else {
+            eprintln!("❌ Failed to create offscreen renderer");
+            return;
+        };
+
+        // Create a 256x256 texture
+        let texture_size = size(DevicePixels(256), DevicePixels(256));
+        let texture = offscreen.create_texture(texture_size);
+
+        // Build a scene with colored boxes
+        let mut ctx = window.create_offscreen_render_context(size(px(256.0), px(256.0)));
+
+        // Dark background
+        ctx.paint_quad(fill(
+            Bounds::new(point(px(0.0), px(0.0)), size(px(256.0), px(256.0))),
+            rgb(0x1a1a2e),
+        ));
+
+        // Red box (top-left)
+        ctx.paint_quad(
+            fill(
+                Bounds::new(point(px(20.0), px(20.0)), size(px(80.0), px(80.0))),
+                gpui::red(),
+            )
+            .corner_radii(px(8.0)),
+        );
+
+        // Green box (center)
+        ctx.paint_quad(
+            fill(
+                Bounds::new(point(px(88.0), px(88.0)), size(px(80.0), px(80.0))),
+                gpui::green(),
+            )
+            .corner_radii(px(8.0)),
+        );
+
+        // Blue box (bottom-right)
+        ctx.paint_quad(
+            fill(
+                Bounds::new(point(px(156.0), px(156.0)), size(px(80.0), px(80.0))),
+                gpui::blue(),
+            )
+            .corner_radii(px(8.0)),
+        );
+
+        // Render scene to texture
+        let scene = ctx.take_scene();
+        offscreen.draw_scene_to_texture(&scene, texture.id);
+
+        // Read back and save to PNG
+        match offscreen.read_texture(texture.id) {
+            Ok(data) => {
+                let path = "render_to_texture_output.png";
+                match image::save_buffer(
+                    path,
+                    data.as_bytes(),
+                    data.width,
+                    data.height,
+                    image::ColorType::Rgba8,
+                ) {
+                    Ok(()) => println!("✅ Saved: {}", path),
+                    Err(e) => eprintln!("❌ Failed to save PNG: {}", e),
+                }
+            }
+            Err(e) => eprintln!("❌ Failed to read texture: {}", e),
+        }
+
+        // Cleanup
+        offscreen.destroy_texture(texture.id);
+        offscreen.destroy();
     }
 }

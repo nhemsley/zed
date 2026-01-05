@@ -1,7 +1,7 @@
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
 #[cfg(feature = "render-to-texture")]
-use crate::platform::{OffscreenTextureId, OffscreenTextureInfo, PlatformOffscreenRenderer};
+use crate::platform::{OffscreenTextureId, OffscreenTextureInfo, PlatformOffscreenRenderer, TextureData};
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
@@ -1547,6 +1547,11 @@ impl Window {
     /// Accessor for the text system.
     pub fn text_system(&self) -> &Arc<WindowTextSystem> {
         &self.text_system
+    }
+
+    /// Accessor for the sprite atlas (used for caching glyphs and images).
+    pub fn sprite_atlas(&self) -> &Arc<dyn PlatformAtlas> {
+        &self.sprite_atlas
     }
 
     /// The current text style. Which is composed of all the style refinements provided to `with_text_style`.
@@ -4638,6 +4643,37 @@ impl Window {
             .map(OffscreenRenderer::new)
     }
 
+    /// Creates an offscreen render context for building scenes without the full Window overhead.
+    ///
+    /// This context shares the text system and sprite atlas with this window, allowing
+    /// you to render text and other primitives to a scene that can then be rendered
+    /// to a texture via `OffscreenRenderer::draw_scene_to_texture`.
+    ///
+    /// # Arguments
+    ///
+    /// * `viewport_size` - Size of the rendering viewport in logical pixels
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut ctx = window.create_offscreen_render_context(size(px(256.0), px(256.0)));
+    /// ctx.paint_quad(fill(bounds, color));
+    /// let scene = ctx.take_scene();
+    /// offscreen_renderer.draw_scene_to_texture(&scene, texture_id);
+    /// ```
+    #[cfg(feature = "render-to-texture")]
+    pub fn create_offscreen_render_context(
+        &self,
+        viewport_size: Size<Pixels>,
+    ) -> crate::OffscreenRenderContext {
+        crate::OffscreenRenderContext::new(
+            viewport_size,
+            self.scale_factor(),
+            self.text_system.clone(),
+            self.sprite_atlas.clone(),
+        )
+    }
+
     /// Perform titlebar double-click action.
     /// This is macOS specific.
     pub fn titlebar_double_click(&self) {
@@ -4939,11 +4975,20 @@ impl OffscreenRenderer {
 
     /// Renders a scene to the specified texture.
     ///
+    /// Use this with `OffscreenRenderContext` to render primitives to a texture:
+    ///
+    /// ```ignore
+    /// let mut ctx = OffscreenRenderContext::new(...);
+    /// ctx.paint_quad(...);
+    /// let scene = ctx.take_scene();
+    /// offscreen_renderer.draw_scene_to_texture(&scene, texture_id);
+    /// ```
+    ///
     /// # Arguments
     ///
-    /// * `scene` - The scene to render (obtained from a Frame)
+    /// * `scene` - The scene to render (built with `OffscreenRenderContext`)
     /// * `texture_id` - The ID of the texture to render to
-    pub(crate) fn draw_scene_to_texture(&mut self, scene: &Scene, texture_id: OffscreenTextureId) {
+    pub fn draw_scene_to_texture(&mut self, scene: &Scene, texture_id: OffscreenTextureId) {
         self.inner.draw_to_texture(scene, texture_id)
     }
 
@@ -4954,6 +4999,41 @@ impl OffscreenRenderer {
     /// * `texture_id` - The ID of the texture to destroy
     pub fn destroy_texture(&mut self, texture_id: OffscreenTextureId) {
         self.inner.destroy_texture(texture_id)
+    }
+
+    /// Reads a texture's contents back from the GPU as RGBA data.
+    ///
+    /// This method copies the texture data from GPU memory to CPU memory,
+    /// converting from the internal format to standard RGBA.
+    ///
+    /// # Arguments
+    ///
+    /// * `texture_id` - The ID of the texture to read
+    ///
+    /// # Returns
+    ///
+    /// The texture data as RGBA bytes, or an error if the texture doesn't exist
+    /// or the read operation fails.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// offscreen_renderer.draw_scene_to_texture(&scene, texture_id);
+    /// let texture_data = offscreen_renderer.read_texture(texture_id)?;
+    /// // Save to PNG using the image crate:
+    /// image::save_buffer(
+    ///     "output.png",
+    ///     texture_data.as_bytes(),
+    ///     texture_data.width,
+    ///     texture_data.height,
+    ///     image::ColorType::Rgba8,
+    /// )?;
+    /// ```
+    pub fn read_texture(
+        &mut self,
+        texture_id: OffscreenTextureId,
+    ) -> anyhow::Result<TextureData> {
+        self.inner.read_texture(texture_id)
     }
 
     /// Returns the maximum texture size supported by this renderer.

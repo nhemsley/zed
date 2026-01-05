@@ -27,6 +27,8 @@ mod inspector;
 mod interactive;
 mod key_dispatch;
 mod keymap;
+#[cfg(feature = "render-to-texture")]
+mod offscreen_render_context;
 mod path_builder;
 mod platform;
 pub mod prelude;
@@ -88,6 +90,8 @@ pub use inspector::*;
 pub use interactive::*;
 use key_dispatch::*;
 pub use keymap::*;
+#[cfg(feature = "render-to-texture")]
+pub use offscreen_render_context::OffscreenRenderContext;
 pub use path_builder::*;
 pub use platform::*;
 pub use profiler::*;

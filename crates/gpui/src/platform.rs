@@ -41,7 +41,7 @@ pub(crate) mod scap_screen_capture;
 #[cfg(feature = "render-to-texture")]
 pub(crate) use offscreen_rendering::PlatformOffscreenRenderer;
 #[cfg(feature = "render-to-texture")]
-pub use offscreen_rendering::{OffscreenTextureId, OffscreenTextureInfo};
+pub use offscreen_rendering::{OffscreenTextureId, OffscreenTextureInfo, TextureData};
 
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,

@@ -20,8 +20,12 @@ pub(crate) type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
 
 pub(crate) type DrawOrder = u32;
 
+/// A collection of rendering primitives that can be drawn to a GPU surface.
+///
+/// Scenes are built by calling paint methods (like `paint_quad`, `paint_glyph`, etc.)
+/// and then rendered to either a window surface or an offscreen texture.
 #[derive(Default)]
-pub(crate) struct Scene {
+pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
@@ -35,6 +39,7 @@ pub(crate) struct Scene {
 }
 
 impl Scene {
+    /// Clear all primitives from the scene.
     pub fn clear(&mut self) {
         self.paint_operations.clear();
         self.primitive_bounds.clear();
@@ -48,10 +53,12 @@ impl Scene {
         self.surfaces.clear();
     }
 
+    /// Returns the number of paint operations in the scene.
     pub fn len(&self) -> usize {
         self.paint_operations.len()
     }
 
+    /// Push a layer for z-ordering. Elements painted after this will be above previous elements.
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
         let order = self.primitive_bounds.insert(bounds);
         self.layer_stack.push(order);
@@ -59,12 +66,14 @@ impl Scene {
             .push(PaintOperation::StartLayer(bounds));
     }
 
+    /// Pop the current layer, returning to the previous z-order level.
     pub fn pop_layer(&mut self) {
         self.layer_stack.pop();
         self.paint_operations.push(PaintOperation::EndLayer);
     }
 
-    pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
+    /// Insert a primitive into the scene.
+    pub(crate) fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
         let clipped_bounds = primitive
             .bounds()
@@ -114,6 +123,7 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    /// Replay paint operations from a previous scene into this one.
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
@@ -124,6 +134,7 @@ impl Scene {
         }
     }
 
+    /// Finish building the scene by sorting primitives for correct rendering order.
     pub fn finish(&mut self) {
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
