@@ -251,8 +251,8 @@ impl PlatformWindow for TexturedSurfaceWindow {
         self.bounds().size
     }
 
-    fn resize(&mut self, _size: Size<Pixels>) {
-        // For textured surfaces, resize would require recreating textures
+    fn resize(&mut self, size: Size<Pixels>) {
+        self.0.borrow_mut().resize(size);
     }
 
     fn scale_factor(&self) -> f32 {
@@ -395,6 +395,88 @@ impl PlatformWindow for TexturedSurfaceWindow {
 }
 
 impl TexturedSurfaceWindowState {
+    /// Resize the window and recreate all GPU textures at the new size.
+    /// This is necessary for textured rendering when the content size
+    /// is determined after layout (e.g., FixedWidth mode where height is measured).
+    fn resize(&mut self, size: Size<Pixels>) {
+        // Skip if size hasn't changed
+        if self.bounds.size == size {
+            return;
+        }
+
+        self.bounds.size = size;
+
+        let device_width = (size.width.0 * self.scale_factor) as u32;
+        let device_height = (size.height.0 * self.scale_factor) as u32;
+
+        // Ensure minimum size of 1x1 to avoid GPU errors
+        let device_width = device_width.max(1);
+        let device_height = device_height.max(1);
+
+        let format = gpu::TextureFormat::Bgra8UnormSrgb;
+
+        // Destroy old textures
+        self.gpu.destroy_texture_view(self.render_target_view);
+        self.gpu.destroy_texture(self.render_target);
+        self.gpu
+            .destroy_texture_view(self.path_intermediate_texture_view);
+        self.gpu.destroy_texture(self.path_intermediate_texture);
+        if let Some(msaa_texture) = self.path_intermediate_msaa_texture.take() {
+            self.gpu.destroy_texture(msaa_texture);
+        }
+        if let Some(msaa_view) = self.path_intermediate_msaa_texture_view.take() {
+            self.gpu.destroy_texture_view(msaa_view);
+        }
+
+        // Create new render target
+        self.render_target = self.gpu.create_texture(gpu::TextureDesc {
+            name: "textured_surface_target",
+            format,
+            size: gpu::Extent {
+                width: device_width,
+                height: device_height,
+                depth: 1,
+            },
+            array_layer_count: 1,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: gpu::TextureDimension::D2,
+            usage: gpu::TextureUsage::TARGET | gpu::TextureUsage::COPY,
+            external: None,
+        });
+
+        self.render_target_view = self.gpu.create_texture_view(
+            self.render_target,
+            gpu::TextureViewDesc {
+                name: "textured_surface_target_view",
+                format,
+                dimension: gpu::ViewDimension::D2,
+                subresources: &Default::default(),
+            },
+        );
+
+        // Recreate path intermediate textures
+        let (path_intermediate_texture, path_intermediate_texture_view) =
+            create_path_intermediate_texture(&self.gpu, format, device_width, device_height);
+        self.path_intermediate_texture = path_intermediate_texture;
+        self.path_intermediate_texture_view = path_intermediate_texture_view;
+
+        // Recreate MSAA textures if needed
+        let (msaa_texture, msaa_view) = create_msaa_texture_if_needed(
+            &self.gpu,
+            format,
+            device_width,
+            device_height,
+            self.path_sample_count,
+        )
+        .unzip();
+        self.path_intermediate_msaa_texture = msaa_texture;
+        self.path_intermediate_msaa_texture_view = msaa_view;
+
+        // Clear any previously rendered pixels since they're now invalid
+        self.rendered_pixels = None;
+    }
+
     fn render_scene_to_texture(&mut self, scene: &Scene) {
         self.command_encoder.start();
         self.atlas.before_frame(&mut self.command_encoder);
@@ -978,7 +1060,7 @@ fn create_msaa_texture_if_needed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Bounds, Empty, Point, Size, WindowHandle, WindowKind, px};
+    use crate::{px, Bounds, Empty, Point, Size, WindowHandle, WindowKind};
 
     #[test]
     fn test_textured_surface_window_creation() {
@@ -1024,6 +1106,81 @@ mod tests {
             }
             Err(e) => {
                 // GPU initialization failure is expected in headless environments
+                eprintln!(
+                    "TexturedSurfaceWindow creation failed (expected in CI): {}",
+                    e
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_textured_surface_window_resize() {
+        // Test that resize properly recreates GPU textures at the new size
+
+        let window_id = crate::WindowId::from(1u64);
+        let handle: AnyWindowHandle = WindowHandle::<Empty>::new(window_id).into();
+        let params = crate::WindowParams {
+            bounds: Bounds {
+                origin: Point {
+                    x: px(0.0),
+                    y: px(0.0),
+                },
+                size: Size {
+                    width: px(400.0),
+                    height: px(300.0),
+                },
+            },
+            titlebar: None,
+            kind: WindowKind::Normal,
+            is_movable: true,
+            is_resizable: true,
+            is_minimizable: true,
+            focus: true,
+            show: true,
+            display_id: None,
+            window_min_size: None,
+            #[cfg(target_os = "macos")]
+            tabbing_identifier: None,
+        };
+
+        let result = TexturedSurfaceWindow::new(handle, params);
+
+        match result {
+            Ok(mut window) => {
+                // Verify initial size
+                assert_eq!(window.bounds().size.width, px(400.0));
+                assert_eq!(window.bounds().size.height, px(300.0));
+
+                // Resize to new dimensions
+                window.resize(Size {
+                    width: px(800.0),
+                    height: px(600.0),
+                });
+
+                // Verify new size
+                assert_eq!(window.bounds().size.width, px(800.0));
+                assert_eq!(window.bounds().size.height, px(600.0));
+
+                // Resize to smaller dimensions
+                window.resize(Size {
+                    width: px(200.0),
+                    height: px(150.0),
+                });
+
+                assert_eq!(window.bounds().size.width, px(200.0));
+                assert_eq!(window.bounds().size.height, px(150.0));
+
+                // Test resize to same size (should be a no-op)
+                window.resize(Size {
+                    width: px(200.0),
+                    height: px(150.0),
+                });
+
+                assert_eq!(window.bounds().size.width, px(200.0));
+                assert_eq!(window.bounds().size.height, px(150.0));
+            }
+            Err(e) => {
                 eprintln!(
                     "TexturedSurfaceWindow creation failed (expected in CI): {}",
                     e
