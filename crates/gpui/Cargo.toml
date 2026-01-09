@@ -334,3 +334,7 @@ path = "examples/grid_layout.rs"
 [[example]]
 name = "mouse_pressure"
 path = "examples/mouse_pressure.rs"
+
+[[example]]
+name = "multi_app_textured"
+path = "examples/multi_app_textured.rs"
