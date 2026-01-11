@@ -149,7 +149,7 @@ pub enum RenderMode {
 /// Frame data sent from background render thread.
 #[derive(Debug)]
 struct RenderedFrame {
-    /// Raw pixel data (RGBA format, converted from GPU's BGRA).
+    /// Raw pixel data in BGRA format (matching GPU and atlas expectations).
     pixels: Vec<u8>,
     /// Width in pixels.
     width: u32,
@@ -379,9 +379,11 @@ where
         })
     }
 
-    /// Process a received frame, converting pixels and creating texture.
+    /// Process a received frame and create texture.
     fn process_frame(&mut self, frame: RenderedFrame) {
-        // Pixels are already in RGBA format (converted on background thread)
+        // Pixels are in BGRA format from the GPU, which is what the atlas expects.
+        // We store them in RgbaImage (which is just a container for the bytes),
+        // and the atlas will interpret them correctly as BGRA.
         if let Some(buffer) = image::RgbaImage::from_raw(frame.width, frame.height, frame.pixels) {
             let image_frame = image::Frame::new(buffer);
             self.current_texture =
@@ -674,12 +676,11 @@ where
                                 let width: u32 = bounds.size.width.into();
                                 let height: u32 = bounds.size.height.into();
 
-                                // Convert BGRA to RGBA on background thread (not main thread!)
-                                let rgba = convert_bgra_to_rgba(pixels);
-
+                                // Pixels are already in BGRA format, which is what the atlas expects.
+                                // No conversion needed.
                                 sender
                                     .send(RenderedFrame {
-                                        pixels: rgba,
+                                        pixels,
                                         width,
                                         height,
                                     })
@@ -726,12 +727,11 @@ where
                                 let width: u32 = bounds.size.width.into();
                                 let height: u32 = bounds.size.height.into();
 
-                                // Convert BGRA to RGBA on background thread
-                                let rgba = convert_bgra_to_rgba(pixels);
-
+                                // Pixels are already in BGRA format, which is what the atlas expects.
+                                // No conversion needed.
                                 sender
                                     .send(RenderedFrame {
-                                        pixels: rgba,
+                                        pixels,
                                         width,
                                         height,
                                     })
@@ -770,14 +770,4 @@ where
             .overflow_hidden()
             .child((self.render_fn)())
     }
-}
-
-/// Convert BGRA pixel data to RGBA.
-/// This is done on the background thread to avoid blocking the main thread.
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-fn convert_bgra_to_rgba(mut pixels: Vec<u8>) -> Vec<u8> {
-    for chunk in pixels.chunks_exact_mut(4) {
-        chunk.swap(0, 2); // Swap B and R
-    }
-    pixels
 }
