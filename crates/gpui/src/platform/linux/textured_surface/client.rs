@@ -79,8 +79,9 @@ impl LinuxClient for TexturedSurfaceClient {
     #[cfg(feature = "screen-capture")]
     fn screen_capture_sources(
         &self,
-    ) -> oneshot::Receiver<anyhow::Result<Vec<Rc<dyn crate::ScreenCaptureSource>>>> {
-        let (mut tx, rx) = oneshot::channel();
+    ) -> futures::channel::oneshot::Receiver<anyhow::Result<Vec<Rc<dyn crate::ScreenCaptureSource>>>>
+    {
+        let (mut tx, rx) = futures::channel::oneshot::channel();
         tx.send(Err(anyhow::anyhow!(
             "Textured surface mode does not support screen capture."
         )))

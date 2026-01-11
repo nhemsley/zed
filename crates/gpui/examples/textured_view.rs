@@ -34,7 +34,7 @@ impl ExampleApp {
         }
     }
 
-    fn initialize(&mut self, cx: &mut Context<Self>) {
+    fn initialize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.initialized {
             return;
         }
@@ -44,17 +44,18 @@ impl ExampleApp {
         // Cast fn items to fn pointers
         let fixed_fn: fn() -> gpui::Div = render_fixed_content;
         self.fixed_view =
-            Some(cx.new(|cx| TexturedView::fixed(size(px(200.), px(150.)), cx, fixed_fn)));
+            Some(cx.new(|cx| TexturedView::fixed(size(px(200.), px(150.)), window, cx, fixed_fn)));
 
         // Measured height view - width 250, height determined by content
         let measured_fn: fn() -> gpui::Div = render_measured_content;
-        self.measured_view = Some(cx.new(|cx| TexturedView::measured(px(250.), cx, measured_fn)));
+        self.measured_view =
+            Some(cx.new(|cx| TexturedView::measured(px(250.), window, cx, measured_fn)));
 
         // Streaming view - continuously updates at 30 FPS with animation
         let streaming_fn: fn() -> gpui::Div = render_streaming_content;
-        self.streaming_view = Some(
-            cx.new(|cx| TexturedView::streaming(size(px(200.), px(150.)), 30, cx, streaming_fn)),
-        );
+        self.streaming_view = Some(cx.new(|cx| {
+            TexturedView::streaming(size(px(200.), px(150.)), 30, window, cx, streaming_fn)
+        }));
     }
 }
 
@@ -170,9 +171,9 @@ fn hue_to_rgb(hue: f32) -> (u8, u8, u8) {
 }
 
 impl Render for ExampleApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Initialize views once
-        self.initialize(cx);
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Initialize views once (now with window parameter)
+        self.initialize(window, cx);
 
         // Main UI layout
         div()

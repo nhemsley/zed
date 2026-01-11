@@ -18,6 +18,13 @@
 //! Currently only supported on Linux/FreeBSD where `Application::textured()` is available.
 //! On other platforms, attempting to create a TexturedView will show an error placeholder.
 //!
+//! # Wake Mechanism
+//!
+//! This implementation uses an async receiver task instead of timer polling.
+//! When the background thread sends a frame via flume, the async receiver wakes up
+//! (via the executor's wake mechanism which pings the event loop), processes the frame,
+//! and notifies the view to re-render.
+//!
 //! # Example
 //!
 //! ```ignore
@@ -25,21 +32,21 @@
 //!
 //! // Fixed size, render once
 //! let view = cx.new(|cx| {
-//!     TexturedView::fixed(size(px(300.), px(200.)), cx, || {
+//!     TexturedView::fixed(size(px(300.), px(200.)), window, cx, || {
 //!         div().bg(rgb(0x3498db)).child("Hello!")
 //!     })
 //! });
 //!
 //! // Fixed width, measured height
 //! let view = cx.new(|cx| {
-//!     TexturedView::measured(px(300.), cx, || {
+//!     TexturedView::measured(px(300.), window, cx, || {
 //!         div().p_4().child("Content determines height")
 //!     })
 //! });
 //!
 //! // Streaming mode (continuous updates)
 //! let view = cx.new(|cx| {
-//!     TexturedView::streaming(size(px(400.), px(300.)), 30, cx, || {
+//!     TexturedView::streaming(size(px(400.), px(300.)), 30, window, cx, || {
 //!         animated_content()
 //!     })
 //! });
@@ -53,14 +60,12 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-use crate::{AnyWindowHandle, Application, Bounds, Timer, WindowBounds, WindowOptions};
-
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-use std::time::Duration as StdDuration;
+use crate::{AnyWindowHandle, Application, Bounds, Task, Timer, WindowBounds, WindowOptions};
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::time::Duration;
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use flume::Receiver;
 
 /// How to determine texture dimensions.
@@ -104,7 +109,7 @@ impl Default for ItemSizing {
 }
 
 impl ItemSizing {
-    /// Get the initial size for the texture (before measurement).
+    /// Get the initial size for layout purposes.
     pub fn initial_size(&self) -> Size<Pixels> {
         match self {
             ItemSizing::Fixed { size } => *size,
@@ -119,24 +124,21 @@ impl ItemSizing {
         }
     }
 
-    /// Whether this sizing mode requires measurement.
+    /// Check if this sizing mode requires measurement.
     pub fn needs_measurement(&self) -> bool {
         matches!(self, ItemSizing::FixedWidth { .. })
     }
 }
 
-/// How often to re-render the texture.
+/// How frequently to render.
 #[derive(Clone, Debug, Default)]
 pub enum RenderMode {
-    /// Render once, cache result.
+    /// Render once and cache the result.
     #[default]
     Once,
-    /// Continuously stream frames at target FPS.
+    /// Continuously render at the target frame rate.
     ///
-    /// **⚠️ WARNING: Streaming mode is currently not working.**
-    /// This mode is implemented but has unresolved issues that prevent
-    /// continuous frame updates from functioning correctly.
-    /// This will be fixed in a future update (see roadmap Phase 4.4).
+    /// **Note**: Streaming mode is experimental.
     /// For now, use `RenderMode::Once` for static content.
     Streaming {
         /// Target frames per second.
@@ -147,7 +149,7 @@ pub enum RenderMode {
 /// Frame data sent from background render thread.
 #[derive(Debug)]
 struct RenderedFrame {
-    /// Raw pixel data (BGRA format from GPU).
+    /// Raw pixel data (RGBA format, converted from GPU's BGRA).
     pixels: Vec<u8>,
     /// Width in pixels.
     width: u32,
@@ -178,12 +180,15 @@ pub struct TexturedView<F> {
     /// How to determine the texture size.
     sizing: ItemSizing,
     /// Rendering mode (once or streaming).
+    #[allow(dead_code)]
     mode: RenderMode,
-    /// Channel to receive rendered frames.
-    frame_receiver: Option<Receiver<RenderedFrame>>,
     /// Handle to background render thread.
     #[allow(dead_code)]
     thread_handle: Option<JoinHandle<()>>,
+    /// Handle to the async frame receiver task.
+    #[allow(dead_code)]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    receiver_task: Option<Task<()>>,
     /// Current texture (latest frame).
     current_texture: Option<Arc<RenderImage>>,
     /// Measured size (updated when frame arrives for FixedWidth mode).
@@ -201,8 +206,19 @@ where
     ///
     /// The content will be rendered once at the specified size.
     #[allow(unused_variables)]
-    pub fn fixed(size: Size<Pixels>, cx: &mut Context<Self>, render_fn: F) -> Self {
-        Self::with_options(ItemSizing::Fixed { size }, RenderMode::Once, cx, render_fn)
+    pub fn fixed(
+        size: Size<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        render_fn: F,
+    ) -> Self {
+        Self::with_options(
+            ItemSizing::Fixed { size },
+            RenderMode::Once,
+            window,
+            cx,
+            render_fn,
+        )
     }
 
     /// Create a TexturedView with fixed width and measured height.
@@ -210,13 +226,19 @@ where
     /// The content will be laid out at the specified width, and the height
     /// will be determined by the content. Uses GPUI's layout system.
     #[allow(unused_variables)]
-    pub fn measured(width: Pixels, cx: &mut Context<Self>, render_fn: F) -> Self {
+    pub fn measured(
+        width: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        render_fn: F,
+    ) -> Self {
         Self::with_options(
             ItemSizing::FixedWidth {
                 width,
                 estimated_height: Pixels(200.0),
             },
             RenderMode::Once,
+            window,
             cx,
             render_fn,
         )
@@ -229,6 +251,7 @@ where
     pub fn measured_with_estimate(
         width: Pixels,
         estimated_height: Pixels,
+        window: &mut Window,
         cx: &mut Context<Self>,
         render_fn: F,
     ) -> Self {
@@ -238,6 +261,7 @@ where
                 estimated_height,
             },
             RenderMode::Once,
+            window,
             cx,
             render_fn,
         )
@@ -247,20 +271,20 @@ where
     ///
     /// Useful for animated content or content that updates frequently.
     ///
-    /// **⚠️ WARNING: Streaming mode is currently not working.**
-    /// This function is implemented but the streaming functionality has
-    /// unresolved issues. See roadmap Phase 4.4 for planned fixes.
-    /// For now, consider using `fixed()` or `measured()` for static content.
+    /// **Note**: Streaming mode is experimental and may have issues.
+    /// Consider using `fixed()` or `measured()` for static content.
     #[allow(unused_variables)]
     pub fn streaming(
         size: Size<Pixels>,
         target_fps: u32,
+        window: &mut Window,
         cx: &mut Context<Self>,
         render_fn: F,
     ) -> Self {
         Self::with_options(
             ItemSizing::Fixed { size },
             RenderMode::Streaming { target_fps },
+            window,
             cx,
             render_fn,
         )
@@ -271,6 +295,7 @@ where
     pub fn with_options(
         sizing: ItemSizing,
         mode: RenderMode,
+        window: &mut Window,
         cx: &mut Context<Self>,
         render_fn: F,
     ) -> Self {
@@ -280,12 +305,15 @@ where
             let thread_handle =
                 spawn_render_thread(sizing.clone(), mode.clone(), render_fn.clone(), sender);
 
+            // Spawn async task to receive frames - this properly wakes the event loop
+            let receiver_task = Self::spawn_frame_receiver(receiver, window, cx);
+
             Self {
                 render_fn,
                 sizing,
                 mode,
-                frame_receiver: Some(receiver),
                 thread_handle: Some(thread_handle),
+                receiver_task: Some(receiver_task),
                 current_texture: None,
                 measured_size: None,
                 error: None,
@@ -298,12 +326,70 @@ where
                 render_fn,
                 sizing,
                 mode,
-                frame_receiver: None,
                 thread_handle: None,
                 current_texture: None,
                 measured_size: None,
                 error: Some(TextureError::UnsupportedPlatform),
             }
+        }
+    }
+
+    /// Spawn the async task that receives frames from the background thread.
+    ///
+    /// This uses flume's async receiver, which properly integrates with the
+    /// executor's wake mechanism. When a frame is sent, the task wakes up
+    /// via the executor (which pings the calloop event loop on Linux),
+    /// processes the frame, and notifies the view.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn spawn_frame_receiver(
+        receiver: Receiver<RenderedFrame>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let entity = cx.weak_entity();
+
+        window.spawn(cx, async move |mut cx| {
+            // Loop receiving frames until the channel is closed
+            while let Ok(frame) = receiver.recv_async().await {
+                // Process the frame and update the entity
+                let result = cx.update(|window, cx| {
+                    entity.update(cx, |view, cx| {
+                        view.process_frame(frame);
+                        cx.notify();
+                        window.refresh();
+                    })
+                });
+
+                // Stop if the entity or window was dropped
+                if result.is_err() {
+                    break;
+                }
+            }
+
+            // Channel closed - check if it was due to an error
+            let _ = cx.update(|_window, cx| {
+                entity.update(cx, |view, cx| {
+                    // Only set error if we never got a frame (thread died early)
+                    if view.current_texture.is_none() && view.error.is_none() {
+                        view.error = Some(TextureError::ThreadDied);
+                        cx.notify();
+                    }
+                })
+            });
+        })
+    }
+
+    /// Process a received frame, converting pixels and creating texture.
+    fn process_frame(&mut self, frame: RenderedFrame) {
+        // Pixels are already in RGBA format (converted on background thread)
+        if let Some(buffer) = image::RgbaImage::from_raw(frame.width, frame.height, frame.pixels) {
+            let image_frame = image::Frame::new(buffer);
+            self.current_texture =
+                Some(Arc::new(RenderImage::new(smallvec::smallvec![image_frame])));
+            self.measured_size = Some(Size {
+                width: Pixels(frame.width as f32),
+                height: Pixels(frame.height as f32),
+            });
         }
     }
 
@@ -334,10 +420,13 @@ where
     ///
     /// This will restart the background render thread.
     #[allow(unused_variables)]
-    pub fn invalidate(&mut self, cx: &mut Context<Self>) {
-        // Drop existing thread (will be cleaned up)
+    pub fn invalidate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Drop existing thread and task (will be cleaned up)
         self.thread_handle = None;
-        self.frame_receiver = None;
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            self.receiver_task = None;
+        }
         self.current_texture = None;
         self.measured_size = None;
         self.error = None;
@@ -352,60 +441,11 @@ where
                 sender,
             );
 
-            self.frame_receiver = Some(receiver);
             self.thread_handle = Some(thread_handle);
+            self.receiver_task = Some(Self::spawn_frame_receiver(receiver, window, cx));
         }
 
         cx.notify();
-    }
-
-    /// Poll for new frames from background thread.
-    fn poll_frames(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(receiver) = &self.frame_receiver else {
-            return;
-        };
-
-        let mut received_frame = false;
-        while let Ok(frame) = receiver.try_recv() {
-            received_frame = true;
-            // Convert BGRA to RGBA
-            let mut rgba = frame.pixels;
-            for chunk in rgba.chunks_exact_mut(4) {
-                chunk.swap(0, 2); // Swap B and R
-            }
-
-            if let Some(buffer) = image::RgbaImage::from_raw(frame.width, frame.height, rgba) {
-                let image_frame = image::Frame::new(buffer);
-                self.current_texture =
-                    Some(Arc::new(RenderImage::new(smallvec::smallvec![image_frame])));
-                self.measured_size = Some(Size {
-                    width: Pixels(frame.width as f32),
-                    height: Pixels(frame.height as f32),
-                });
-            }
-        }
-
-        // Keep polling until we have a frame (for Once mode) or continuously (for Streaming)
-        let should_keep_polling = match &self.mode {
-            RenderMode::Once => !received_frame && self.current_texture.is_none(),
-            RenderMode::Streaming { .. } => true,
-        };
-
-        if should_keep_polling && self.error.is_none() {
-            // Schedule another poll
-            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            {
-                window
-                    .spawn(cx, async move |cx| {
-                        crate::Timer::after(StdDuration::from_millis(16)).await;
-                        cx.update(|window, _cx| {
-                            window.refresh();
-                        })
-                        .ok();
-                    })
-                    .detach();
-            }
-        }
     }
 }
 
@@ -414,10 +454,7 @@ where
     F: Fn() -> E + Send + Clone + 'static,
     E: IntoElement + 'static,
 {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Poll for new frames
-        self.poll_frames(window, cx);
-
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         // Determine size for layout
         let display_size = self
             .measured_size
@@ -440,15 +477,13 @@ where
 
 impl<F> Drop for TexturedView<F> {
     fn drop(&mut self) {
-        // Thread will stop when sender is dropped (which happens when
-        // frame_receiver is dropped). We don't need to explicitly join
-        // as the thread will clean itself up.
-        self.thread_handle = None;
-        self.frame_receiver = None;
+        // The receiver task and thread handle will be dropped automatically.
+        // Dropping the receiver will cause the channel to close, which will
+        // eventually cause the background thread to exit when it tries to send.
     }
 }
 
-/// Render a loading placeholder.
+/// Render a loading placeholder while waiting for the first frame.
 fn render_loading_placeholder(size: Size<Pixels>) -> AnyElement {
     div()
         .w(size.width)
@@ -464,7 +499,7 @@ fn render_loading_placeholder(size: Size<Pixels>) -> AnyElement {
 /// Render an error placeholder.
 fn render_error_placeholder(size: Size<Pixels>, error: &TextureError) -> AnyElement {
     let message = match error {
-        TextureError::UnsupportedPlatform => "Textured rendering not supported on this platform",
+        TextureError::UnsupportedPlatform => "TexturedView requires Linux/FreeBSD",
         TextureError::GpuInitFailed(msg) => msg.as_str(),
         TextureError::ThreadDied => "Render thread died unexpectedly",
         TextureError::RenderPanic => "Render function panicked",
@@ -473,14 +508,13 @@ fn render_error_placeholder(size: Size<Pixels>, error: &TextureError) -> AnyElem
     div()
         .w(size.width)
         .h(size.height)
-        .bg(crate::rgb(0x4a2a2a))
+        .bg(crate::rgb(0x3a1a1a))
         .flex()
         .items_center()
         .justify_center()
-        .p(Pixels(8.0))
         .child(
             div()
-                .text_color(crate::rgb(0xffaaaa))
+                .text_color(crate::rgb(0xff6666))
                 .child(message.to_string()),
         )
         .into_any_element()
@@ -533,7 +567,7 @@ fn run_textured_renderer<F, E>(
                     sender,
                     window_handle: None,
                     phase: RenderPhase::FirstRender,
-                    did_resize: false,
+                    did_resize: bool::default(),
                 })
             },
         );
@@ -640,9 +674,12 @@ where
                                 let width: u32 = bounds.size.width.into();
                                 let height: u32 = bounds.size.height.into();
 
+                                // Convert BGRA to RGBA on background thread (not main thread!)
+                                let rgba = convert_bgra_to_rgba(pixels);
+
                                 sender
                                     .send(RenderedFrame {
-                                        pixels,
+                                        pixels: rgba,
                                         width,
                                         height,
                                     })
@@ -689,9 +726,12 @@ where
                                 let width: u32 = bounds.size.width.into();
                                 let height: u32 = bounds.size.height.into();
 
+                                // Convert BGRA to RGBA on background thread
+                                let rgba = convert_bgra_to_rgba(pixels);
+
                                 sender
                                     .send(RenderedFrame {
-                                        pixels,
+                                        pixels: rgba,
                                         width,
                                         height,
                                     })
@@ -730,4 +770,14 @@ where
             .overflow_hidden()
             .child((self.render_fn)())
     }
+}
+
+/// Convert BGRA pixel data to RGBA.
+/// This is done on the background thread to avoid blocking the main thread.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn convert_bgra_to_rgba(mut pixels: Vec<u8>) -> Vec<u8> {
+    for chunk in pixels.chunks_exact_mut(4) {
+        chunk.swap(0, 2); // Swap B and R
+    }
+    pixels
 }
