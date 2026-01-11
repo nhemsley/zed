@@ -412,16 +412,20 @@ where
     pub fn error(&self) -> Option<&TextureError> {
         self.error.as_ref()
     }
-
     /// Check if a texture is ready to display.
     pub fn is_ready(&self) -> bool {
         self.current_texture.is_some()
     }
 
-    /// Force re-render (invalidate cached texture).
+    /// Get the current texture, if ready.
     ///
-    /// This will restart the background render thread.
-    #[allow(unused_variables)]
+    /// This can be used to render the texture with custom sizing/transforms,
+    /// such as using `img().object_fit(ObjectFit::Fill)` for zoom support.
+    pub fn texture(&self) -> Option<Arc<RenderImage>> {
+        self.current_texture.clone()
+    }
+
+    /// Force re-render (invalidate cached texture).
     pub fn invalidate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Drop existing thread and task (will be cleaned up)
         self.thread_handle = None;
