@@ -7,6 +7,7 @@ use blade_util::{BufferBelt, BufferBeltDescriptor};
 use bytemuck::{Pod, Zeroable};
 use raw_window_handle as rwh;
 
+use super::acquire_gpu_lock;
 use crate::platform::blade::BladeAtlas;
 use crate::{
     AnyWindowHandle, Background, Bounds, Capslock, DevicePixels, GpuSpecs, Modifiers, Path, Pixels,
@@ -90,6 +91,9 @@ pub(crate) struct TexturedSurfaceWindow(Rc<RefCell<TexturedSurfaceWindowState>>)
 
 impl TexturedSurfaceWindow {
     pub fn new(handle: AnyWindowHandle, params: WindowParams) -> anyhow::Result<Self> {
+        // Acquire GPU lock to prevent concurrent Vulkan access which can crash NVIDIA drivers.
+        let _gpu_lock = acquire_gpu_lock();
+
         let gpu = Arc::new(
             unsafe {
                 gpu::Context::init(gpu::ContextDesc {
@@ -367,6 +371,9 @@ impl PlatformWindow for TexturedSurfaceWindow {
     }
 
     fn draw(&self, scene: &Scene) {
+        // Acquire GPU lock to prevent concurrent Vulkan access which can crash NVIDIA drivers.
+        let _gpu_lock = acquire_gpu_lock();
+
         let mut state = self.0.borrow_mut();
         state.render_scene_to_texture(scene);
         state.read_pixels_to_buffer();
@@ -1060,7 +1067,7 @@ fn create_msaa_texture_if_needed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{px, Bounds, Empty, Point, Size, WindowHandle, WindowKind};
+    use crate::{Bounds, Empty, Point, Size, WindowHandle, WindowKind, px};
 
     #[test]
     fn test_textured_surface_window_creation() {
