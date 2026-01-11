@@ -45,6 +45,7 @@ mod taffy;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 mod text_system;
+mod textured_view;
 mod util;
 mod view;
 mod window;
@@ -114,6 +115,9 @@ pub use util::smol_timeout;
 pub use util::{FutureExt, Timeout, arc_cow::ArcCow};
 pub use view::*;
 pub use window::*;
+
+// Textured rendering (Linux/FreeBSD only)
+pub use textured_view::{ItemSizing, RenderMode, TextureError, TexturedView};
 
 /// The context trait, allows the different contexts in GPUI to be used
 /// interchangeably for certain operations.
