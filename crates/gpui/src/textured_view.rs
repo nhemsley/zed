@@ -569,7 +569,8 @@ fn run_textured_renderer<F, E>(
                     sender,
                     window_handle: None,
                     phase: RenderPhase::FirstRender,
-                    did_resize: bool::default(),
+                    did_resize: false,
+                    streaming_started: false,
                 })
             },
         );
@@ -584,12 +585,11 @@ fn run_textured_renderer<F, E>(
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[derive(Debug, Clone, PartialEq)]
 enum RenderPhase {
-    /// First render - measure and resize if needed.
+    /// First render - measure and resize if needed, then capture.
     FirstRender,
-    /// Ready to paint and capture pixels.
-    ReadyToPaint,
-    /// Painted, done (for Once mode) or cycling back (for Streaming).
-    Painted,
+    /// Done with initial render (for Once mode).
+    /// Streaming mode uses a continuous loop and doesn't use this phase.
+    Done,
 }
 
 /// The view that runs in the background textured window.
@@ -602,6 +602,8 @@ struct BackgroundRenderer<F> {
     window_handle: Option<AnyWindowHandle>,
     phase: RenderPhase,
     did_resize: bool,
+    /// Whether we've started the streaming loop (to avoid spawning multiple loops)
+    streaming_started: bool,
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -657,7 +659,7 @@ where
                     self.did_resize = true;
                 }
 
-                self.phase = RenderPhase::ReadyToPaint;
+                self.phase = RenderPhase::Done;
 
                 // Schedule the actual paint and capture
                 let sender = self.sender.clone();
@@ -695,70 +697,53 @@ where
                                 let _ = cx.update(|_, cx| cx.quit());
                             }
                             RenderMode::Streaming { target_fps } => {
+                                // For streaming mode, we loop continuously instead of relying
+                                // on compositor frame callbacks (which don't exist for TexturedSurface).
                                 let frame_duration =
                                     Duration::from_millis(1000 / target_fps.max(1) as u64);
-                                Timer::after(frame_duration).await;
-                                let _ = cx.update_window(
-                                    window_handle,
-                                    |_, window: &mut Window, _cx| {
-                                        window.refresh();
-                                    },
-                                );
+
+                                // Continuous render loop
+                                loop {
+                                    Timer::after(frame_duration).await;
+
+                                    let result = cx.update_window(
+                                        window_handle,
+                                        |_, window: &mut Window, cx| {
+                                            window.draw_and_present(cx);
+
+                                            if let Some(pixels) = window.read_pixels() {
+                                                let bounds = window.bounds();
+                                                let width: u32 = bounds.size.width.into();
+                                                let height: u32 = bounds.size.height.into();
+
+                                                sender
+                                                    .send(RenderedFrame {
+                                                        pixels,
+                                                        width,
+                                                        height,
+                                                    })
+                                                    .ok();
+                                            }
+                                        },
+                                    );
+
+                                    // Exit loop if window was closed or send failed
+                                    if result.is_err() || sender.is_disconnected() {
+                                        break;
+                                    }
+                                }
+
+                                // Loop ended, quit the background app
+                                let _ = cx.update(|_, cx| cx.quit());
                             }
                         }
                     })
                     .detach();
             }
 
-            RenderPhase::ReadyToPaint => {
-                // Subsequent renders (for streaming mode)
-                let sender = self.sender.clone();
-                let mode = self.mode.clone();
-
-                window
-                    .spawn(cx, async move |cx| {
-                        Timer::after(Duration::from_millis(10)).await;
-
-                        let _ = cx.update_window(window_handle, |_, window: &mut Window, cx| {
-                            window.draw_and_present(cx);
-
-                            if let Some(pixels) = window.read_pixels() {
-                                let bounds = window.bounds();
-                                let width: u32 = bounds.size.width.into();
-                                let height: u32 = bounds.size.height.into();
-
-                                // Pixels are already in BGRA format, which is what the atlas expects.
-                                // No conversion needed.
-                                sender
-                                    .send(RenderedFrame {
-                                        pixels,
-                                        width,
-                                        height,
-                                    })
-                                    .ok();
-                            }
-                        });
-
-                        if let RenderMode::Streaming { target_fps } = mode {
-                            let frame_duration =
-                                Duration::from_millis(1000 / target_fps.max(1) as u64);
-                            Timer::after(frame_duration).await;
-                            let _ =
-                                cx.update_window(window_handle, |_, window: &mut Window, _cx| {
-                                    window.refresh();
-                                });
-                        }
-                    })
-                    .detach();
-
-                self.phase = RenderPhase::Painted;
-            }
-
-            RenderPhase::Painted => {
-                // For streaming mode, cycle back to ReadyToPaint
-                if matches!(self.mode, RenderMode::Streaming { .. }) {
-                    self.phase = RenderPhase::ReadyToPaint;
-                }
+            RenderPhase::Done => {
+                // Once mode: we're done, nothing more to do.
+                // Streaming mode: the continuous loop is already running.
             }
         }
 
