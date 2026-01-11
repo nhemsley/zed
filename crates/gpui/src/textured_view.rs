@@ -667,8 +667,9 @@ where
 
                 window
                     .spawn(cx, async move |cx| {
-                        // Wait for render to complete
-                        Timer::after(Duration::from_millis(20)).await;
+                        // No delay needed - we explicitly call draw_and_present() which
+                        // does a full render cycle. The async task yields to let the
+                        // current render() call complete first.
 
                         let _ = cx.update_window(window_handle, |_, window: &mut Window, cx| {
                             window.draw_and_present(cx);
