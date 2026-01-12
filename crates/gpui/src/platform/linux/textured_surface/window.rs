@@ -256,7 +256,28 @@ impl PlatformWindow for TexturedSurfaceWindow {
     }
 
     fn resize(&mut self, size: Size<Pixels>) {
-        self.0.borrow_mut().resize(size);
+        // We need to be careful about borrow lifetimes here.
+        // The callback may try to access window state, so we must
+        // drop our borrow before invoking it.
+        let (_old_size, scale_factor, should_notify) = {
+            let mut state = self.0.borrow_mut();
+            let old_size = state.bounds.size;
+            let scale_factor = state.scale_factor;
+            state.resize(size);
+            let should_notify = old_size != size && state.callbacks.resize.is_some();
+            (old_size, scale_factor, should_notify)
+        };
+        // borrow_mut is now dropped
+
+        // Notify the Window of the size change so it updates viewport_size.
+        // This is critical for proper layout after resize - without this callback,
+        // Window::viewport_size remains stale and draw_roots() lays out content
+        // at the old size, causing content to not fill the resized texture.
+        if should_notify {
+            if let Some(callback) = self.0.borrow_mut().callbacks.resize.as_mut() {
+                callback(size, scale_factor);
+            }
+        }
     }
 
     fn scale_factor(&self) -> f32 {

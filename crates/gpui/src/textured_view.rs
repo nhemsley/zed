@@ -53,8 +53,8 @@
 //! ```
 
 use crate::{
-    AnyElement, App, AppContext as _, Context, IntoElement, ParentElement, Pixels, Render,
-    RenderImage, Size, Styled, Window, div, img,
+    AnyElement, App, AppContext as _, AvailableSpace, Context, IntoElement, ParentElement, Pixels,
+    Render, RenderImage, Size, Styled, Window, div, img,
 };
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -327,6 +327,7 @@ where
                 sizing,
                 mode,
                 thread_handle: None,
+                receiver_task: None,
                 current_texture: None,
                 measured_size: None,
                 error: Some(TextureError::UnsupportedPlatform),
@@ -381,6 +382,11 @@ where
 
     /// Process a received frame and create texture.
     fn process_frame(&mut self, frame: RenderedFrame) {
+        log::debug!(
+            "[TexturedView] process_frame: received frame {}x{}",
+            frame.width,
+            frame.height
+        );
         // Pixels are in BGRA format from the GPU, which is what the atlas expects.
         // We store them in RgbaImage (which is just a container for the bytes),
         // and the atlas will interpret them correctly as BGRA.
@@ -388,10 +394,22 @@ where
             let image_frame = image::Frame::new(buffer);
             self.current_texture =
                 Some(Arc::new(RenderImage::new(smallvec::smallvec![image_frame])));
-            self.measured_size = Some(Size {
+            let new_size = Size {
                 width: Pixels(frame.width as f32),
                 height: Pixels(frame.height as f32),
-            });
+            };
+            log::debug!(
+                "[TexturedView] process_frame: setting measured_size to {:?} (was {:?})",
+                new_size,
+                self.measured_size
+            );
+            self.measured_size = Some(new_size);
+        } else {
+            log::warn!(
+                "[TexturedView] process_frame: failed to create RgbaImage from frame {}x{}",
+                frame.width,
+                frame.height
+            );
         }
     }
 
@@ -405,6 +423,10 @@ where
     /// For `FixedWidth` mode, this returns the actual measured size after
     /// the first frame is rendered. Returns `None` if not yet measured.
     pub fn measured_size(&self) -> Option<Size<Pixels>> {
+        log::trace!(
+            "[TexturedView] measured_size() called, returning {:?}",
+            self.measured_size
+        );
         self.measured_size
     }
 
@@ -631,34 +653,48 @@ where
                 // Instead, we'll render once at estimated size, then resize and re-render.
 
                 if self.sizing.needs_measurement() && !self.did_resize {
-                    // Schedule resize based on current window content size after this render
-                    let sizing = self.sizing.clone();
+                    // For FixedWidth mode, we need to measure the content and resize the window
+                    if let ItemSizing::FixedWidth {
+                        width,
+                        estimated_height,
+                    } = &self.sizing
+                    {
+                        log::debug!(
+                            "[BackgroundRenderer] FixedWidth mode: width={:?}, estimated_height={:?}",
+                            width,
+                            estimated_height
+                        );
 
-                    window
-                        .spawn(cx, async move |cx| {
-                            // Let the first render complete
-                            Timer::after(Duration::from_millis(10)).await;
+                        // Measure the content using layout_as_root
+                        let mut element = (self.render_fn)().into_any_element();
+                        let measured_size = element.layout_as_root(
+                            gpui::Size {
+                                width: AvailableSpace::Definite(*width),
+                                height: AvailableSpace::MinContent,
+                            },
+                            window,
+                            cx,
+                        );
 
-                            let _ =
-                                cx.update_window(window_handle, |_, window: &mut Window, _cx| {
-                                    // For FixedWidth, we use the content size from the first render
-                                    // The window was created at estimated size, content rendered inside
-                                    // We trust the content fills appropriately for now
-                                    // TODO: Better measurement approach
-                                    if let ItemSizing::FixedWidth { width, .. } = sizing {
-                                        // Keep width fixed, use current bounds as the height
-                                        // (content should have laid out naturally)
-                                        let current_bounds = window.bounds();
-                                        let new_size = Size {
-                                            width,
-                                            height: current_bounds.size.height,
-                                        };
-                                        window.resize(new_size);
-                                    }
-                                    window.refresh();
-                                });
-                        })
-                        .detach();
+                        log::debug!(
+                            "[BackgroundRenderer] Measured content size: {:?}",
+                            measured_size
+                        );
+
+                        // Resize window to measured size
+                        let new_size = Size {
+                            width: *width,
+                            height: measured_size.height,
+                        };
+                        log::debug!("[BackgroundRenderer] Resizing window to: {:?}", new_size);
+                        window.resize(new_size);
+
+                        let after_bounds = window.bounds();
+                        log::debug!(
+                            "[BackgroundRenderer] Window bounds after resize: {:?}",
+                            after_bounds
+                        );
+                    }
 
                     self.did_resize = true;
                 }
@@ -671,10 +707,12 @@ where
 
                 window
                     .spawn(cx, async move |cx| {
-                        // No delay needed - we explicitly call draw_and_present() which
-                        // does a full render cycle. The async task yields to let the
-                        // current render() call complete first.
+                        // With the fix to Window::resize() that now synchronously updates
+                        // viewport_size, we no longer need multiple render passes or delays.
+                        // The resize takes effect immediately, so draw_and_present will use
+                        // the correct viewport_size for layout.
 
+                        // Capture the frame
                         let _ = cx.update_window(window_handle, |_, window: &mut Window, cx| {
                             window.draw_and_present(cx);
 
@@ -753,10 +791,20 @@ where
         }
 
         // Render the actual content
-        let size = self.sizing.initial_size();
+        // Use actual window bounds for sizing (important after resize for FixedWidth mode)
+        let window_bounds = window.bounds();
+        let render_size = if self.did_resize {
+            // After resize, use the actual window size
+            window_bounds.size
+        } else {
+            // Before resize, use initial size
+            self.sizing.initial_size()
+        };
+
+        // Always fill the full window size
         div()
-            .w(size.width)
-            .h(size.height)
+            .w(render_size.width)
+            .h(render_size.height)
             .overflow_hidden()
             .child((self.render_fn)())
     }

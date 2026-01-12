@@ -1823,8 +1823,21 @@ impl Window {
     }
 
     /// Set the content size of the window.
+    ///
+    /// For windows with a display server (normal windows), the actual resize may happen
+    /// asynchronously and viewport_size will be updated via the resize callback.
+    ///
+    /// For textured surface windows (offscreen rendering), the resize happens synchronously
+    /// and we also update viewport_size immediately to ensure draw_roots() uses the correct
+    /// size for layout.
     pub fn resize(&mut self, size: Size<Pixels>) {
         self.platform_window.resize(size);
+        // Synchronously update viewport_size to match the platform window's content size.
+        // This is critical for textured surface windows where we need the resize to take
+        // effect immediately before the next draw_and_present() call.
+        // For normal windows, the resize callback will also update this, but having it
+        // here ensures consistency.
+        self.viewport_size = self.platform_window.content_size();
     }
 
     /// Returns whether or not the window is currently fullscreen
