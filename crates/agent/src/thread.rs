@@ -589,6 +589,9 @@ enum CompletionError {
     Other(#[from] anyhow::Error),
 }
 
+/// Default token limit for beads mode (4096 tokens)
+const DEFAULT_BEADS_TOKEN_LIMIT: u32 = 4096;
+
 pub struct Thread {
     id: acp::SessionId,
     prompt_id: PromptId,
@@ -600,6 +603,10 @@ pub struct Thread {
     messages: Vec<Message>,
     user_store: Entity<UserStore>,
     completion_mode: CompletionMode,
+    /// When enabled, only sends recent messages up to beads_token_limit to the LLM
+    beads_mode: bool,
+    /// Maximum tokens to include when beads_mode is enabled
+    beads_token_limit: u32,
     /// Holds the task that handles agent interaction until the end of the turn.
     /// Survives across multiple requests as the model performs tool calls and
     /// we run tools, report their results.
@@ -659,6 +666,8 @@ impl Thread {
             messages: Vec::new(),
             user_store: project.read(cx).user_store(),
             completion_mode: AgentSettings::get_global(cx).preferred_completion_mode,
+            beads_mode: false,
+            beads_token_limit: DEFAULT_BEADS_TOKEN_LIMIT,
             running_turn: None,
             pending_message: None,
             tools: BTreeMap::default(),
@@ -860,6 +869,10 @@ impl Thread {
             messages: db_thread.messages,
             user_store: project.read(cx).user_store(),
             completion_mode: db_thread.completion_mode.unwrap_or_default(),
+            beads_mode: db_thread.beads_mode.unwrap_or(false),
+            beads_token_limit: db_thread
+                .beads_token_limit
+                .unwrap_or(DEFAULT_BEADS_TOKEN_LIMIT),
             running_turn: None,
             pending_message: None,
             tools: BTreeMap::default(),
@@ -900,6 +913,8 @@ impl Thread {
             completion_mode: Some(self.completion_mode),
             profile: Some(self.profile_id.clone()),
             imported: self.imported,
+            beads_mode: Some(self.beads_mode),
+            beads_token_limit: Some(self.beads_token_limit),
         };
 
         cx.background_spawn(async move {
@@ -972,6 +987,34 @@ impl Thread {
 
     pub fn completion_mode(&self) -> CompletionMode {
         self.completion_mode
+    }
+
+    /// Returns whether beads mode (sliding context window) is enabled
+    pub fn beads_mode(&self) -> bool {
+        self.beads_mode
+    }
+
+    /// Sets beads mode on or off
+    pub fn set_beads_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        log::info!(
+            "Beads mode {}: token_limit={}",
+            if enabled { "enabled" } else { "disabled" },
+            self.beads_token_limit
+        );
+        self.beads_mode = enabled;
+        cx.notify();
+    }
+
+    /// Returns the token limit for beads mode
+    pub fn beads_token_limit(&self) -> u32 {
+        self.beads_token_limit
+    }
+
+    /// Sets the token limit for beads mode
+    pub fn set_beads_token_limit(&mut self, limit: u32, cx: &mut Context<Self>) {
+        log::debug!("Beads mode token limit set to {}", limit);
+        self.beads_token_limit = limit;
+        cx.notify();
     }
 
     pub fn set_completion_mode(&mut self, mode: CompletionMode, cx: &mut Context<Self>) {

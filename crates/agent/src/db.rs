@@ -52,6 +52,10 @@ pub struct DbThread {
     pub profile: Option<AgentProfileId>,
     #[serde(default)]
     pub imported: bool,
+    #[serde(default)]
+    pub beads_mode: Option<bool>,
+    #[serde(default)]
+    pub beads_token_limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +97,8 @@ impl SharedThread {
             completion_mode: self.completion_mode,
             profile: None,
             imported: true,
+            beads_mode: None,
+            beads_token_limit: None,
         }
     }
 
@@ -267,6 +273,8 @@ impl DbThread {
             completion_mode: thread.completion_mode,
             profile: thread.profile,
             imported: false,
+            beads_mode: None,
+            beads_token_limit: None,
         })
     }
 }
