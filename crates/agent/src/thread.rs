@@ -2181,6 +2181,46 @@ impl Thread {
             .is_some_and(|turn| turn.tools.contains_key(name))
     }
 
+    /// Estimates the token count for a message.
+    /// Uses a rough approximation of ~4 characters per token.
+    fn estimate_tokens(message: &Message) -> u32 {
+        match message {
+            Message::User(user_msg) => user_msg
+                .content
+                .iter()
+                .map(|c| match c {
+                    UserMessageContent::Text(t) => t.len() as u32 / 4,
+                    UserMessageContent::Mention { content, .. } => content.len() as u32 / 4,
+                    UserMessageContent::Image(_) => 1000, // Images count as ~1000 tokens
+                })
+                .sum(),
+            Message::Agent(agent_msg) => {
+                let content_tokens: u32 = agent_msg
+                    .content
+                    .iter()
+                    .map(|c| match c {
+                        AgentMessageContent::Text(t) => t.len() as u32 / 4,
+                        AgentMessageContent::Thinking { text, .. } => text.len() as u32 / 4,
+                        AgentMessageContent::RedactedThinking(_) => 0,
+                        AgentMessageContent::ToolUse(_) => 500, // Rough estimate for tool calls
+                    })
+                    .sum();
+                let tool_result_tokens: u32 = agent_msg
+                    .tool_results
+                    .values()
+                    .map(|result| match &result.content {
+                        language_model::LanguageModelToolResultContent::Text(text) => {
+                            text.len() as u32 / 4
+                        }
+                        language_model::LanguageModelToolResultContent::Image(_) => 1000,
+                    })
+                    .sum();
+                content_tokens + tool_result_tokens
+            }
+            Message::Resume => 10, // "Continue where you left off" is ~10 tokens
+        }
+    }
+
     fn build_request_messages(
         &self,
         available_tools: Vec<SharedString>,
@@ -2205,8 +2245,46 @@ impl Thread {
             cache: false,
             reasoning_details: None,
         }];
-        for message in &self.messages {
-            messages.extend(message.to_request());
+
+        if self.beads_mode {
+            // Sliding window: only include recent messages up to token limit
+            let mut token_count: u32 = 0;
+            let mut windowed_messages: Vec<&Message> = Vec::new();
+
+            // Iterate in reverse to get most recent messages first
+            for message in self.messages.iter().rev() {
+                let message_tokens = Self::estimate_tokens(message);
+                if token_count + message_tokens > self.beads_token_limit {
+                    break;
+                }
+                token_count += message_tokens;
+                windowed_messages.push(message);
+            }
+
+            // Reverse to restore chronological order
+            windowed_messages.reverse();
+
+            let included_count = windowed_messages.len();
+            let total_count = self.messages.len();
+            let excluded_count = total_count - included_count;
+
+            log::info!(
+                "Beads mode: including {}/{} messages (~{} tokens, limit: {}), excluded: {}",
+                included_count,
+                total_count,
+                token_count,
+                self.beads_token_limit,
+                excluded_count
+            );
+
+            for message in windowed_messages {
+                messages.extend(message.to_request());
+            }
+        } else {
+            // Original behavior: include all messages
+            for message in &self.messages {
+                messages.extend(message.to_request());
+            }
         }
 
         if let Some(last_message) = messages.last_mut() {
