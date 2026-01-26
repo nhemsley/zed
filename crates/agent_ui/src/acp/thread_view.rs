@@ -5133,6 +5133,7 @@ impl AcpThreadView {
                             .gap_0p5()
                             .child(self.render_add_context_button(cx))
                             .child(self.render_follow_toggle(cx))
+                            .children(self.render_beads_mode_toggle(cx))
                             .children(self.render_burn_mode_toggle(cx)),
                     )
                     .child(
@@ -5302,6 +5303,44 @@ impl AcpThreadView {
         );
 
         Some(())
+    }
+
+    fn render_beads_mode_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let thread = self.as_native_thread(cx)?;
+        let beads_mode_enabled = thread.read(cx).beads_mode();
+
+        Some(
+            IconButton::new("beads-mode", IconName::ZedBeadsMode)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .toggle_state(beads_mode_enabled)
+                .selected_icon_color(Color::Accent)
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.toggle_beads_mode(cx);
+                }))
+                .tooltip(move |_window, cx| {
+                    Tooltip::with_meta(
+                        if beads_mode_enabled {
+                            "Beads Mode (On)"
+                        } else {
+                            "Beads Mode (Off)"
+                        },
+                        None,
+                        "Limits context to recent messages only",
+                        cx,
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn toggle_beads_mode(&mut self, cx: &mut Context<Self>) {
+        if let Some(thread) = self.as_native_thread(cx) {
+            thread.update(cx, |thread, cx| {
+                let current = thread.beads_mode();
+                thread.set_beads_mode(!current, cx);
+            });
+        }
     }
 
     fn render_burn_mode_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
