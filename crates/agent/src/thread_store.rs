@@ -144,6 +144,8 @@ mod tests {
             completion_mode: None,
             profile: None,
             imported: false,
+            beads_mode: None,
+            beads_message_char_limit: None,
         }
     }
 

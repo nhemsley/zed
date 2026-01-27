@@ -589,8 +589,8 @@ enum CompletionError {
     Other(#[from] anyhow::Error),
 }
 
-/// Default token limit for beads mode (4096 tokens)
-const DEFAULT_BEADS_TOKEN_LIMIT: u32 = 4096;
+/// Default character limit for beads mode
+const DEFAULT_BEADS_MESSAGE_CHAR_LIMIT: u32 = 65536;
 
 pub struct Thread {
     id: acp::SessionId,
@@ -603,10 +603,10 @@ pub struct Thread {
     messages: Vec<Message>,
     user_store: Entity<UserStore>,
     completion_mode: CompletionMode,
-    /// When enabled, only sends recent messages up to beads_token_limit to the LLM
+    /// When enabled, only sends recent messages up to beads_message_char_limit to the LLM
     beads_mode: bool,
-    /// Maximum tokens to include when beads_mode is enabled
-    beads_token_limit: u32,
+    /// Maximum characters to include when beads_mode is enabled
+    beads_message_char_limit: u32,
     /// Holds the task that handles agent interaction until the end of the turn.
     /// Survives across multiple requests as the model performs tool calls and
     /// we run tools, report their results.
@@ -667,7 +667,7 @@ impl Thread {
             user_store: project.read(cx).user_store(),
             completion_mode: AgentSettings::get_global(cx).preferred_completion_mode,
             beads_mode: false,
-            beads_token_limit: DEFAULT_BEADS_TOKEN_LIMIT,
+            beads_message_char_limit: DEFAULT_BEADS_MESSAGE_CHAR_LIMIT,
             running_turn: None,
             pending_message: None,
             tools: BTreeMap::default(),
@@ -870,9 +870,9 @@ impl Thread {
             user_store: project.read(cx).user_store(),
             completion_mode: db_thread.completion_mode.unwrap_or_default(),
             beads_mode: db_thread.beads_mode.unwrap_or(false),
-            beads_token_limit: db_thread
-                .beads_token_limit
-                .unwrap_or(DEFAULT_BEADS_TOKEN_LIMIT),
+            beads_message_char_limit: db_thread
+                .beads_message_char_limit
+                .unwrap_or(DEFAULT_BEADS_MESSAGE_CHAR_LIMIT),
             running_turn: None,
             pending_message: None,
             tools: BTreeMap::default(),
@@ -914,7 +914,7 @@ impl Thread {
             profile: Some(self.profile_id.clone()),
             imported: self.imported,
             beads_mode: Some(self.beads_mode),
-            beads_token_limit: Some(self.beads_token_limit),
+            beads_message_char_limit: Some(self.beads_message_char_limit),
         };
 
         cx.background_spawn(async move {
@@ -997,23 +997,23 @@ impl Thread {
     /// Sets beads mode on or off
     pub fn set_beads_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
         log::info!(
-            "Beads mode {}: token_limit={}",
+            "Beads mode {}: char_limit={}",
             if enabled { "enabled" } else { "disabled" },
-            self.beads_token_limit
+            self.beads_message_char_limit
         );
         self.beads_mode = enabled;
         cx.notify();
     }
 
-    /// Returns the token limit for beads mode
-    pub fn beads_token_limit(&self) -> u32 {
-        self.beads_token_limit
+    /// Returns the character limit for beads mode
+    pub fn beads_message_char_limit(&self) -> u32 {
+        self.beads_message_char_limit
     }
 
-    /// Sets the token limit for beads mode
-    pub fn set_beads_token_limit(&mut self, limit: u32, cx: &mut Context<Self>) {
-        log::debug!("Beads mode token limit set to {}", limit);
-        self.beads_token_limit = limit;
+    /// Sets the character limit for beads mode
+    pub fn set_beads_message_char_limit(&mut self, limit: u32, cx: &mut Context<Self>) {
+        log::debug!("Beads mode char limit set to {}", limit);
+        self.beads_message_char_limit = limit;
         cx.notify();
     }
 
@@ -2086,6 +2086,47 @@ impl Thread {
         let messages = self.build_request_messages(available_tools, cx);
         log::debug!("Request will include {} messages", messages.len());
 
+        // Detailed logging for debugging beads mode and context length
+        let mut total_char_count = 0usize;
+        let mut total_estimated_tokens = 0usize;
+        for (i, msg) in messages.iter().enumerate() {
+            let msg_chars: usize = msg
+                .content
+                .iter()
+                .map(|c| match c {
+                    language_model::MessageContent::Text(t) => t.len(),
+                    language_model::MessageContent::Image(img) => img.estimate_tokens(),
+                    language_model::MessageContent::ToolUse(tu) => tu.raw_input.len(),
+                    language_model::MessageContent::ToolResult(tr) => match &tr.content {
+                        language_model::LanguageModelToolResultContent::Text(t) => t.len(),
+                        language_model::LanguageModelToolResultContent::Image(img) => {
+                            img.estimate_tokens()
+                        }
+                    },
+                    language_model::MessageContent::Thinking { text, .. } => text.len(),
+                    language_model::MessageContent::RedactedThinking(_) => 0,
+                })
+                .sum();
+            let msg_tokens = msg_chars / 4;
+            total_char_count += msg_chars;
+            total_estimated_tokens += msg_tokens;
+            log::debug!(
+                "Message {}: role={:?}, chars={}, est_tokens={}",
+                i,
+                msg.role,
+                msg_chars,
+                msg_tokens
+            );
+        }
+        log::info!(
+            "LLM Request: {} messages, total_chars={}, est_tokens={}, beads_mode={}, beads_char_limit={}",
+            messages.len(),
+            total_char_count,
+            total_estimated_tokens,
+            self.beads_mode,
+            self.beads_message_char_limit
+        );
+
         let request = LanguageModelRequest {
             thread_id: Some(self.id.to_string()),
             prompt_id: Some(self.prompt_id.to_string()),
@@ -2181,43 +2222,42 @@ impl Thread {
             .is_some_and(|turn| turn.tools.contains_key(name))
     }
 
-    /// Estimates the token count for a message.
-    /// Uses a rough approximation of ~4 characters per token.
-    fn estimate_tokens(message: &Message) -> u32 {
+    /// Returns the character count for a message.
+    fn message_char_count(message: &Message) -> u32 {
         match message {
             Message::User(user_msg) => user_msg
                 .content
                 .iter()
                 .map(|c| match c {
-                    UserMessageContent::Text(t) => t.len() as u32 / 4,
-                    UserMessageContent::Mention { content, .. } => content.len() as u32 / 4,
-                    UserMessageContent::Image(_) => 1000, // Images count as ~1000 tokens
+                    UserMessageContent::Text(t) => t.len() as u32,
+                    UserMessageContent::Mention { content, .. } => content.len() as u32,
+                    UserMessageContent::Image(_) => 4000, // Images count as ~4000 chars
                 })
                 .sum(),
             Message::Agent(agent_msg) => {
-                let content_tokens: u32 = agent_msg
+                let content_chars: u32 = agent_msg
                     .content
                     .iter()
                     .map(|c| match c {
-                        AgentMessageContent::Text(t) => t.len() as u32 / 4,
-                        AgentMessageContent::Thinking { text, .. } => text.len() as u32 / 4,
+                        AgentMessageContent::Text(t) => t.len() as u32,
+                        AgentMessageContent::Thinking { text, .. } => text.len() as u32,
                         AgentMessageContent::RedactedThinking(_) => 0,
-                        AgentMessageContent::ToolUse(_) => 500, // Rough estimate for tool calls
+                        AgentMessageContent::ToolUse(_) => 2000, // Rough estimate for tool calls
                     })
                     .sum();
-                let tool_result_tokens: u32 = agent_msg
+                let tool_result_chars: u32 = agent_msg
                     .tool_results
                     .values()
                     .map(|result| match &result.content {
                         language_model::LanguageModelToolResultContent::Text(text) => {
-                            text.len() as u32 / 4
+                            text.len() as u32
                         }
-                        language_model::LanguageModelToolResultContent::Image(_) => 1000,
+                        language_model::LanguageModelToolResultContent::Image(_) => 4000,
                     })
                     .sum();
-                content_tokens + tool_result_tokens
+                content_chars + tool_result_chars
             }
-            Message::Resume => 10, // "Continue where you left off" is ~10 tokens
+            Message::Resume => 40, // "Continue where you left off" is ~40 chars
         }
     }
 
@@ -2247,17 +2287,17 @@ impl Thread {
         }];
 
         if self.beads_mode {
-            // Sliding window: only include recent messages up to token limit
-            let mut token_count: u32 = 0;
+            // Sliding window: only include recent messages up to char limit
+            let mut char_count: u32 = 0;
             let mut windowed_messages: Vec<&Message> = Vec::new();
 
             // Iterate in reverse to get most recent messages first
             for message in self.messages.iter().rev() {
-                let message_tokens = Self::estimate_tokens(message);
-                if token_count + message_tokens > self.beads_token_limit {
+                let message_chars = Self::message_char_count(message);
+                if char_count + message_chars > self.beads_message_char_limit {
                     break;
                 }
-                token_count += message_tokens;
+                char_count += message_chars;
                 windowed_messages.push(message);
             }
 
@@ -2269,11 +2309,11 @@ impl Thread {
             let excluded_count = total_count - included_count;
 
             log::info!(
-                "Beads mode: including {}/{} messages (~{} tokens, limit: {}), excluded: {}",
+                "Beads mode: including {}/{} messages (~{} chars, limit: {}), excluded: {}",
                 included_count,
                 total_count,
-                token_count,
-                self.beads_token_limit,
+                char_count,
+                self.beads_message_char_limit,
                 excluded_count
             );
 

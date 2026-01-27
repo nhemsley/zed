@@ -55,7 +55,7 @@ pub struct DbThread {
     #[serde(default)]
     pub beads_mode: Option<bool>,
     #[serde(default)]
-    pub beads_token_limit: Option<u32>,
+    pub beads_message_char_limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,7 +98,7 @@ impl SharedThread {
             profile: None,
             imported: true,
             beads_mode: None,
-            beads_token_limit: None,
+            beads_message_char_limit: None,
         }
     }
 
@@ -274,7 +274,7 @@ impl DbThread {
             profile: thread.profile,
             imported: false,
             beads_mode: None,
-            beads_token_limit: None,
+            beads_message_char_limit: None,
         })
     }
 }
@@ -569,6 +569,8 @@ mod tests {
             completion_mode: None,
             profile: None,
             imported: false,
+            beads_mode: None,
+            beads_message_char_limit: None,
         }
     }
 
