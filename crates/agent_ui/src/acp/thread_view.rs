@@ -5354,10 +5354,11 @@ impl AcpThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ctrl_held = event.modifiers.control && !event.modifiers.alt && !event.modifiers.shift;
+        let ctrl_alt_held =
+            event.modifiers.control && event.modifiers.alt && !event.modifiers.shift;
 
-        // When Ctrl is pressed (and only Ctrl), show the model selector
-        if ctrl_held {
+        // When Ctrl+Alt is pressed (and only Ctrl+Alt), show the model selector
+        if ctrl_alt_held {
             // Only open if we have a model selector and it's not already open
             if let Some(model_selector) = &self.model_selector {
                 let is_deployed = model_selector.read(cx).is_deployed();
@@ -5366,7 +5367,7 @@ impl AcpThreadView {
                         selector.toggle(window, cx);
                     });
                     self.model_selector_opened_by_ctrl = true;
-                    log::info!("MRU: Opened model selector with Ctrl hold");
+                    log::info!("MRU: Opened model selector with Ctrl+Alt hold");
                 }
             } else if let Some(config_options_view) = &self.config_options_view {
                 // Handle config_options_view path
@@ -5382,11 +5383,11 @@ impl AcpThreadView {
                         );
                     });
                     self.model_selector_opened_by_ctrl = true;
-                    log::info!("MRU: Opened config options model picker with Ctrl hold");
+                    log::info!("MRU: Opened config options model picker with Ctrl+Alt hold");
                 }
             }
         } else {
-            // When Ctrl is released, close the model selector if we opened it
+            // When Ctrl+Alt is released, close the model selector if we opened it
             if self.model_selector_opened_by_ctrl {
                 if let Some(model_selector) = &self.model_selector {
                     let is_deployed = model_selector.read(cx).is_deployed();
@@ -5394,7 +5395,7 @@ impl AcpThreadView {
                         model_selector.update(cx, |selector, cx| {
                             selector.toggle(window, cx);
                         });
-                        log::info!("MRU: Closed model selector on Ctrl release");
+                        log::info!("MRU: Closed model selector on Ctrl+Alt release");
                     }
                 } else if let Some(config_options_view) = &self.config_options_view {
                     let is_open = config_options_view
@@ -5408,7 +5409,7 @@ impl AcpThreadView {
                                 cx,
                             );
                         });
-                        log::info!("MRU: Closed config options model picker on Ctrl release");
+                        log::info!("MRU: Closed config options model picker on Ctrl+Alt release");
                     }
                 }
                 self.model_selector_opened_by_ctrl = false;
