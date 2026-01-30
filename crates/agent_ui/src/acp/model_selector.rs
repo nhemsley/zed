@@ -1,7 +1,6 @@
 use std::{cmp::Reverse, rc::Rc, sync::Arc};
 
 use acp_thread::{AgentModelIcon, AgentModelInfo, AgentModelList, AgentModelSelector};
-use agent::ThreadsDatabase;
 use agent_client_protocol::ModelId;
 use agent_servers::AgentServer;
 use agent_settings::AgentSettings;
@@ -281,10 +280,7 @@ impl PickerDelegate for AcpModelPickerDelegate {
         if let Some(AcpModelPickerEntry::Model(model_info, _)) =
             self.filtered_entries.get(self.selected_index)
         {
-            // Clone model_id early to avoid borrow checker issues
             let model_id = model_info.id.clone();
-            let model_id_str = model_id.to_string();
-            log::info!("MRU: Model selected in picker: {}", model_id_str);
 
             if window.modifiers().secondary() {
                 let default_model = self.agent_server.default_model(cx);
@@ -307,22 +303,6 @@ impl PickerDelegate for AcpModelPickerDelegate {
             self.selected_model = Some(model_info.clone());
             let current_index = self.selected_index;
             self.set_selected_index(current_index, window, cx);
-
-            // Track model usage in MRU
-            log::debug!("MRU: Connecting to database to track model usage");
-            let database_future = ThreadsDatabase::connect(cx);
-            cx.background_spawn(async move {
-                match database_future.await {
-                    Ok(db) => {
-                        log::debug!("MRU: Database connected, recording usage");
-                        db.record_model_usage(model_id_str).await.log_err();
-                    }
-                    Err(e) => {
-                        log::error!("MRU: Failed to connect to database: {:?}", e);
-                    }
-                }
-            })
-            .detach();
 
             cx.emit(DismissEvent);
         }

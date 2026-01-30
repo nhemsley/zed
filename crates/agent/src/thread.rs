@@ -3,7 +3,7 @@ use crate::{
     DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, GrepTool,
     ListDirectoryTool, MovePathTool, NowTool, OpenTool, ProjectSnapshot, ReadFileTool,
     RestoreFileFromDiskTool, SaveFileTool, SubagentTool, SystemPromptTemplate, Template, Templates,
-    TerminalTool, ThinkingTool, WebSearchTool,
+    TerminalTool, ThinkingTool, ThreadsDatabase, WebSearchTool,
 };
 use acp_thread::{MentionUri, UserMessageId};
 use action_log::ActionLog;
@@ -1219,6 +1219,22 @@ impl Thread {
         let model = self.model().context("No language model configured")?;
 
         log::info!("Thread::send called with model: {}", model.name().0);
+
+        // Record model usage in MRU
+        let model_id = model.id().0.to_string();
+        let database_future = ThreadsDatabase::connect(cx);
+        cx.background_spawn(async move {
+            match database_future.await {
+                Ok(db) => {
+                    db.record_model_usage(model_id).await.log_err();
+                }
+                Err(e) => {
+                    log::error!("MRU: Failed to connect to database: {:?}", e);
+                }
+            }
+        })
+        .detach();
+
         self.advance_prompt_id();
 
         log::debug!("Total messages in thread: {}", self.messages.len());

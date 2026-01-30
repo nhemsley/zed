@@ -5,7 +5,7 @@ use acp_thread::{
 };
 use acp_thread::{AgentConnection, Plan};
 use action_log::{ActionLog, ActionLogTelemetry};
-use agent::{DbThreadMetadata, NativeAgentServer, SharedThread, ThreadStore};
+use agent::{DbThreadMetadata, NativeAgentServer, SharedThread, ThreadStore, ThreadsDatabase};
 use agent_client_protocol::{self as acp, PromptCapabilities};
 use agent_servers::{AgentServer, AgentServerDelegate};
 use agent_settings::{AgentProfileId, AgentSettings, CompletionMode};
@@ -27,9 +27,10 @@ use futures::FutureExt as _;
 use gpui::{
     Action, Animation, AnimationExt, AnyView, App, BorderStyle, ClickEvent, ClipboardItem,
     CursorStyle, EdgesRefinement, ElementId, Empty, Entity, FocusHandle, Focusable, Hsla, Length,
-    ListOffset, ListState, ObjectFit, PlatformDisplay, SharedString, StyleRefinement, Subscription,
-    Task, TextStyle, TextStyleRefinement, UnderlineStyle, WeakEntity, Window, WindowHandle, div,
-    ease_in_out, img, linear_color_stop, linear_gradient, list, point, pulsating_between,
+    ListOffset, ListState, ModifiersChangedEvent, ObjectFit, PlatformDisplay, SharedString,
+    StyleRefinement, Subscription, Task, TextStyle, TextStyleRefinement, UnderlineStyle,
+    WeakEntity, Window, WindowHandle, div, ease_in_out, img, linear_color_stop, linear_gradient,
+    list, point, pulsating_between,
 };
 use language::Buffer;
 
@@ -5280,6 +5281,53 @@ impl AcpThreadView {
         self.authorize_pending_tool_call(acp::PermissionOptionKind::RejectOnce, window, cx);
     }
 
+    fn handle_modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        log::info!(
+            "MRU: Modifiers changed - ctrl:{} alt:{} shift:{} platform:{}",
+            event.modifiers.control,
+            event.modifiers.alt,
+            event.modifiers.shift,
+            event.modifiers.platform
+        );
+
+        if event.modifiers.control && !event.modifiers.alt && !event.modifiers.shift {
+            let database_future = ThreadsDatabase::connect(cx);
+            cx.background_spawn(async move {
+                match database_future.await {
+                    Ok(db) => match db.get_mru_models_with_stats(9).await {
+                        Ok(models) => {
+                            log::info!("MRU Models (Ctrl held):");
+                            for (i, model_info) in models.iter().enumerate() {
+                                log::info!(
+                                    "  Ctrl+{}: {} (used {} times, last: {})",
+                                    i + 1,
+                                    model_info.model_id,
+                                    model_info.use_count,
+                                    model_info.last_used_at
+                                );
+                            }
+                            if models.is_empty() {
+                                log::info!("  (no MRU models recorded yet)");
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed to fetch MRU models: {:?}", e);
+                        }
+                    },
+                    Err(e) => {
+                        log::error!("Failed to connect to database for MRU: {:?}", e);
+                    }
+                }
+            })
+            .detach();
+        }
+    }
+
     fn authorize_pending_tool_call(
         &mut self,
         kind: acp::PermissionOptionKind,
@@ -7036,6 +7084,7 @@ impl Render for AcpThreadView {
                 }
             }))
             .track_focus(&self.focus_handle)
+            .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
             .bg(cx.theme().colors().panel_background)
             .child(match &self.thread_state {
                 ThreadState::Unauthenticated {

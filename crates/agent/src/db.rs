@@ -19,6 +19,13 @@ use std::sync::Arc;
 use ui::{App, SharedString};
 use zed_env_vars::ZED_STATELESS;
 
+#[derive(Debug, Clone)]
+pub struct ModelMruInfo {
+    pub model_id: String,
+    pub last_used_at: String,
+    pub use_count: i64,
+}
+
 pub type DbMessage = crate::Message;
 pub type DbSummary = crate::legacy_thread::DetailedSummaryState;
 pub type DbLanguageModel = crate::legacy_thread::SerializedLanguageModel;
@@ -554,6 +561,41 @@ impl ThreadsDatabase {
 
             log::info!("MRU: Retrieved {} models: {:?}", model_ids.len(), model_ids);
             Ok(model_ids)
+        })
+    }
+
+    pub fn get_mru_models_with_stats(&self, limit: usize) -> Task<Result<Vec<ModelMruInfo>>> {
+        let connection = self.connection.clone();
+
+        self.executor.spawn(async move {
+            log::debug!("MRU: Fetching top {} MRU models with stats", limit);
+            let connection = connection.lock();
+
+            let mut select_all = connection.select_bound::<(), (String, String, i64)>(indoc! {"
+                SELECT model_id, last_used_at, use_count FROM model_mru
+                ORDER BY last_used_at DESC
+            "})?;
+
+            let rows = select_all(())?;
+            let model_infos: Vec<ModelMruInfo> = rows
+                .into_iter()
+                .take(limit)
+                .map(|(model_id, last_used_at, use_count)| ModelMruInfo {
+                    model_id,
+                    last_used_at,
+                    use_count,
+                })
+                .collect();
+
+            log::info!(
+                "MRU: Retrieved {} models with stats: {:?}",
+                model_infos.len(),
+                model_infos
+                    .iter()
+                    .map(|m| format!("{}({})", m.model_id, m.use_count))
+                    .collect::<Vec<_>>()
+            );
+            Ok(model_infos)
         })
     }
 }
