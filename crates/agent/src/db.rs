@@ -301,7 +301,7 @@ impl Column for DataType {
     }
 }
 
-pub(crate) struct ThreadsDatabase {
+pub struct ThreadsDatabase {
     executor: BackgroundExecutor,
     connection: Arc<Mutex<Connection>>,
 }
@@ -363,6 +363,15 @@ impl ThreadsDatabase {
             )
         "})?()
         .map_err(|e| anyhow!("Failed to create threads table: {}", e))?;
+
+        connection.exec(indoc! {"
+            CREATE TABLE IF NOT EXISTS model_mru (
+                model_id TEXT PRIMARY KEY,
+                last_used_at TEXT NOT NULL,
+                use_count INTEGER NOT NULL DEFAULT 1
+            )
+        "})?()
+        .map_err(|e| anyhow!("Failed to create model_mru table: {}", e))?;
 
         let db = Self {
             executor,
@@ -496,6 +505,55 @@ impl ThreadsDatabase {
             delete(())?;
 
             Ok(())
+        })
+    }
+
+    pub fn record_model_usage(&self, model_id: String) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+
+        self.executor.spawn(async move {
+            log::info!("MRU: Recording model usage: {}", model_id);
+            let connection = connection.lock();
+            let now = Utc::now().to_rfc3339();
+
+            let mut upsert = connection.exec_bound::<(String, String, String)>(indoc! {"
+                INSERT INTO model_mru (model_id, last_used_at, use_count)
+                VALUES (?, ?, 1)
+                ON CONFLICT(model_id) DO UPDATE SET
+                    last_used_at = ?,
+                    use_count = use_count + 1
+            "})?;
+
+            upsert((model_id.clone(), now.clone(), now))?;
+            log::info!("MRU: Successfully recorded model usage: {}", model_id);
+
+            Ok(())
+        })
+    }
+
+    pub fn get_mru_models(&self, limit: usize) -> Task<Result<Vec<String>>> {
+        let connection = self.connection.clone();
+
+        self.executor.spawn(async move {
+            log::debug!("MRU: Fetching top {} MRU models", limit);
+            let connection = connection.lock();
+
+            // Note: sqlez doesn't support binding the LIMIT directly in the query,
+            // so we'll select all and limit in Rust
+            let mut select_all = connection.select_bound::<(), (String, String, i64)>(indoc! {"
+                SELECT model_id, last_used_at, use_count FROM model_mru
+                ORDER BY last_used_at DESC
+            "})?;
+
+            let rows = select_all(())?;
+            let model_ids: Vec<String> = rows
+                .into_iter()
+                .take(limit)
+                .map(|(model_id, _, _)| model_id)
+                .collect();
+
+            log::info!("MRU: Retrieved {} models: {:?}", model_ids.len(), model_ids);
+            Ok(model_ids)
         })
     }
 }
