@@ -1627,7 +1627,15 @@ impl AcpThreadView {
             // Select the model
             let select_task =
                 this.update(cx, |_this, cx| model_selector.select_model(model_id, cx))?;
-            select_task.await?;
+
+            if let Err(e) = select_task.await {
+                log::error!(
+                    "MRU: Failed to select model '{}': {}. This may be an old MRU entry with invalid format.",
+                    mru_model.model_id,
+                    e
+                );
+                return Ok(());
+            }
 
             // Queue/send the message if there's content
             this.update_in(cx, |this, window, cx| {

@@ -134,18 +134,36 @@ impl AcpModelPickerDelegate {
                 ) -> Result<()> {
                     let db = database_future.await.map_err(|err| anyhow::anyhow!(err))?;
                     let mru_infos = db.get_mru_models_with_stats(9).await?;
-                    let mru_ids: Vec<ModelId> = mru_infos
-                        .into_iter()
-                        .map(|info| ModelId::new(info.model_id))
-                        .collect();
+
+                    // Filter out invalid model IDs (e.g., old entries without provider prefix)
+                    let mut valid_ids = Vec::new();
+                    let mut invalid_ids = Vec::new();
+
+                    for info in mru_infos {
+                        let model_id_str = &info.model_id;
+                        // Valid model IDs should have format: provider_id/model_id
+                        if model_id_str.contains('/') {
+                            valid_ids.push(ModelId::new(info.model_id));
+                        } else {
+                            invalid_ids.push(model_id_str.clone());
+                        }
+                    }
+
+                    if !invalid_ids.is_empty() {
+                        log::warn!(
+                            "MRU: Filtered out {} invalid model IDs (old format): {:?}",
+                            invalid_ids.len(),
+                            invalid_ids
+                        );
+                    }
 
                     log::info!(
-                        "MRU: Loaded {} MRU model IDs into picker: {:?}",
-                        mru_ids.len(),
-                        mru_ids
+                        "MRU: Loaded {} valid MRU model IDs into picker: {:?}",
+                        valid_ids.len(),
+                        valid_ids
                     );
                     this.update_in(cx, |picker, window, cx| {
-                        picker.delegate.mru_model_ids = mru_ids;
+                        picker.delegate.mru_model_ids = valid_ids;
                         picker.refresh(window, cx);
                     })
                 }
