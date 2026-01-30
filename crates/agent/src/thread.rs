@@ -1218,9 +1218,14 @@ impl Thread {
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
         let model = self.model().context("No language model configured")?;
 
-        log::info!("Thread::send called with model: {}", model.name().0);
+        log::info!(
+            "Thread::send called with model: name={}, id={}, provider_id={}",
+            model.name().0,
+            model.id().0,
+            model.provider_id().0
+        );
 
-        // Record model usage in MRU
+        // Record model usage in MRU - use just model.id() to match picker's model IDs
         let model_id = model.id().0.to_string();
         let database_future = ThreadsDatabase::connect(cx);
         cx.background_spawn(async move {
