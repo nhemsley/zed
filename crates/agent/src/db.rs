@@ -573,7 +573,7 @@ impl ThreadsDatabase {
 
             let mut select_all = connection.select_bound::<(), (String, String, i64)>(indoc! {"
                 SELECT model_id, last_used_at, use_count FROM model_mru
-                ORDER BY last_used_at DESC
+                ORDER BY use_count DESC, last_used_at DESC
             "})?;
 
             let rows = select_all(())?;
