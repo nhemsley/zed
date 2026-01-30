@@ -56,7 +56,7 @@ use ui::{
 use util::defer;
 use util::{ResultExt, size::format_file_size, time::duration_alt_display};
 use workspace::{CollaboratorId, NewTerminal, Toast, Workspace, notifications::NotificationId};
-use zed_actions::agent::{Chat, ToggleModelSelector};
+use zed_actions::agent::{Chat, SelectMruModel, ToggleModelSelector};
 use zed_actions::assistant::OpenRulesLibrary;
 
 use super::config_options::ConfigOptionsView;
@@ -1575,6 +1575,63 @@ impl AcpThreadView {
                 });
                 cx.notify();
             })?;
+            Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn select_mru_model(
+        &mut self,
+        action: &SelectMruModel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = action.index;
+        if index < 1 || index > 9 {
+            return;
+        }
+
+        let Some(thread) = self.thread().cloned() else {
+            return;
+        };
+
+        let Some(model_selector) = thread
+            .read(cx)
+            .connection()
+            .model_selector(thread.read(cx).session_id())
+        else {
+            log::info!("MRU: No model selector available");
+            return;
+        };
+
+        let database_future = ThreadsDatabase::connect(cx);
+
+        cx.spawn_in(window, async move |this, cx| {
+            let db = database_future.await.map_err(|err| anyhow::anyhow!(err))?;
+            let mru_models = db.get_mru_models_with_stats(9).await?;
+
+            let Some(mru_model) = mru_models.get(index - 1) else {
+                log::info!("MRU: No model at index {}", index);
+                return Ok::<(), anyhow::Error>(());
+            };
+
+            let model_id = acp::ModelId::new(mru_model.model_id.clone());
+            log::info!(
+                "MRU: Selecting model at index {}: {}",
+                index,
+                mru_model.model_id
+            );
+
+            // Select the model
+            let select_task =
+                this.update(cx, |_this, cx| model_selector.select_model(model_id, cx))?;
+            select_task.await?;
+
+            // Queue/send the message if there's content
+            this.update_in(cx, |this, window, cx| {
+                this.queue_message(window, cx);
+            })?;
+
             Ok(())
         })
         .detach_and_log_err(cx);
@@ -7083,6 +7140,7 @@ impl Render for AcpThreadView {
                     });
                 }
             }))
+            .on_action(cx.listener(Self::select_mru_model))
             .track_focus(&self.focus_handle)
             .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
             .bg(cx.theme().colors().panel_background)
