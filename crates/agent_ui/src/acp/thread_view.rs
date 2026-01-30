@@ -319,6 +319,7 @@ pub struct AcpThreadView {
     model_selector: Option<Entity<AcpModelSelectorPopover>>,
     config_options_view: Option<Entity<ConfigOptionsView>>,
     profile_selector: Option<Entity<ProfileSelector>>,
+    model_selector_opened_by_ctrl: bool,
     notifications: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
     thread_retry_status: Option<RetryStatus>,
@@ -494,6 +495,7 @@ impl AcpThreadView {
             model_selector: None,
             config_options_view: None,
             profile_selector: None,
+            model_selector_opened_by_ctrl: false,
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
             list_state: list_state,
@@ -5341,47 +5343,68 @@ impl AcpThreadView {
     fn handle_modifiers_changed(
         &mut self,
         event: &ModifiersChangedEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        log::info!(
-            "MRU: Modifiers changed - ctrl:{} alt:{} shift:{} platform:{}",
-            event.modifiers.control,
-            event.modifiers.alt,
-            event.modifiers.shift,
-            event.modifiers.platform
-        );
+        let ctrl_held = event.modifiers.control && !event.modifiers.alt && !event.modifiers.shift;
 
-        if event.modifiers.control && !event.modifiers.alt && !event.modifiers.shift {
-            let database_future = ThreadsDatabase::connect(cx);
-            cx.background_spawn(async move {
-                match database_future.await {
-                    Ok(db) => match db.get_mru_models_with_stats(9).await {
-                        Ok(models) => {
-                            log::info!("MRU Models (Ctrl held):");
-                            for (i, model_info) in models.iter().enumerate() {
-                                log::info!(
-                                    "  Ctrl+{}: {} (used {} times, last: {})",
-                                    i + 1,
-                                    model_info.model_id,
-                                    model_info.use_count,
-                                    model_info.last_used_at
-                                );
-                            }
-                            if models.is_empty() {
-                                log::info!("  (no MRU models recorded yet)");
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("Failed to fetch MRU models: {:?}", e);
-                        }
-                    },
-                    Err(e) => {
-                        log::error!("Failed to connect to database for MRU: {:?}", e);
+        // When Ctrl is pressed (and only Ctrl), show the model selector
+        if ctrl_held {
+            // Only open if we have a model selector and it's not already open
+            if let Some(model_selector) = &self.model_selector {
+                let is_deployed = model_selector.read(cx).is_deployed();
+                if !is_deployed {
+                    model_selector.update(cx, |selector, cx| {
+                        selector.toggle(window, cx);
+                    });
+                    self.model_selector_opened_by_ctrl = true;
+                    log::info!("MRU: Opened model selector with Ctrl hold");
+                }
+            } else if let Some(config_options_view) = &self.config_options_view {
+                // Handle config_options_view path
+                let is_open = config_options_view
+                    .read(cx)
+                    .is_category_picker_open(acp::SessionConfigOptionCategory::Model, cx);
+                if !is_open {
+                    config_options_view.update(cx, |view, cx| {
+                        view.toggle_category_picker(
+                            acp::SessionConfigOptionCategory::Model,
+                            window,
+                            cx,
+                        );
+                    });
+                    self.model_selector_opened_by_ctrl = true;
+                    log::info!("MRU: Opened config options model picker with Ctrl hold");
+                }
+            }
+        } else {
+            // When Ctrl is released, close the model selector if we opened it
+            if self.model_selector_opened_by_ctrl {
+                if let Some(model_selector) = &self.model_selector {
+                    let is_deployed = model_selector.read(cx).is_deployed();
+                    if is_deployed {
+                        model_selector.update(cx, |selector, cx| {
+                            selector.toggle(window, cx);
+                        });
+                        log::info!("MRU: Closed model selector on Ctrl release");
+                    }
+                } else if let Some(config_options_view) = &self.config_options_view {
+                    let is_open = config_options_view
+                        .read(cx)
+                        .is_category_picker_open(acp::SessionConfigOptionCategory::Model, cx);
+                    if is_open {
+                        config_options_view.update(cx, |view, cx| {
+                            view.toggle_category_picker(
+                                acp::SessionConfigOptionCategory::Model,
+                                window,
+                                cx,
+                            );
+                        });
+                        log::info!("MRU: Closed config options model picker on Ctrl release");
                     }
                 }
-            })
-            .detach();
+                self.model_selector_opened_by_ctrl = false;
+            }
         }
     }
 

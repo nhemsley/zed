@@ -1225,8 +1225,8 @@ impl Thread {
             model.provider_id().0
         );
 
-        // Record model usage in MRU - use just model.id() to match picker's model IDs
-        let model_id = model.id().0.to_string();
+        // Record model usage in MRU - use provider_id/model_id format to match picker's model IDs
+        let model_id = format!("{}/{}", model.provider_id().0, model.id().0);
         let database_future = ThreadsDatabase::connect(cx);
         cx.background_spawn(async move {
             match database_future.await {
