@@ -27,9 +27,10 @@ use futures::FutureExt as _;
 use gpui::{
     Action, Animation, AnimationExt, AnyView, App, BorderStyle, ClickEvent, ClipboardItem,
     CursorStyle, EdgesRefinement, ElementId, Empty, Entity, FocusHandle, Focusable, Hsla, Length,
-    ListOffset, ListState, ObjectFit, PlatformDisplay, SharedString, StyleRefinement, Subscription,
-    Task, TextStyle, TextStyleRefinement, UnderlineStyle, WeakEntity, Window, WindowHandle, div,
-    ease_in_out, img, linear_color_stop, linear_gradient, list, point, pulsating_between,
+    ListOffset, ListState, ModifiersChangedEvent, ObjectFit, PlatformDisplay, SharedString,
+    StyleRefinement, Subscription, Task, TextStyle, TextStyleRefinement, UnderlineStyle,
+    WeakEntity, Window, WindowHandle, div, ease_in_out, img, linear_color_stop, linear_gradient,
+    list, point, pulsating_between,
 };
 use language::Buffer;
 
@@ -318,6 +319,7 @@ pub struct AcpThreadView {
     model_selector: Option<Entity<AcpModelSelectorPopover>>,
     config_options_view: Option<Entity<ConfigOptionsView>>,
     profile_selector: Option<Entity<ProfileSelector>>,
+    model_selector_opened_by_ctrl_alt: bool,
     notifications: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
     thread_retry_status: Option<RetryStatus>,
@@ -493,6 +495,7 @@ impl AcpThreadView {
             model_selector: None,
             config_options_view: None,
             profile_selector: None,
+            model_selector_opened_by_ctrl_alt: false,
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
             list_state: list_state,
@@ -1700,6 +1703,75 @@ impl AcpThreadView {
         });
 
         self.send_content(contents_task, window, cx);
+    }
+
+    fn handle_modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ctrl_alt_held =
+            event.modifiers.control && event.modifiers.alt && !event.modifiers.shift;
+
+        // When Ctrl+Alt is pressed (and only Ctrl+Alt), show the model selector
+        if ctrl_alt_held {
+            // Only open if we have a model selector and it's not already open
+            if let Some(model_selector) = &self.model_selector {
+                let is_deployed = model_selector.read(cx).is_deployed();
+                if !is_deployed {
+                    model_selector.update(cx, |selector, cx| {
+                        selector.toggle(window, cx);
+                    });
+                    self.model_selector_opened_by_ctrl_alt = true;
+                    log::info!("MRU: Opened model selector with Ctrl+Alt hold");
+                }
+            } else if let Some(config_options_view) = &self.config_options_view {
+                // Handle config_options_view path
+                let is_open = config_options_view
+                    .read(cx)
+                    .is_category_picker_open(acp::SessionConfigOptionCategory::Model, cx);
+                if !is_open {
+                    config_options_view.update(cx, |view, cx| {
+                        view.toggle_category_picker(
+                            acp::SessionConfigOptionCategory::Model,
+                            window,
+                            cx,
+                        );
+                    });
+                    self.model_selector_opened_by_ctrl_alt = true;
+                    log::info!("MRU: Opened config options model picker with Ctrl+Alt hold");
+                }
+            }
+        } else {
+            // When Ctrl+Alt is released, close the model selector if we opened it
+            if self.model_selector_opened_by_ctrl_alt {
+                if let Some(model_selector) = &self.model_selector {
+                    let is_deployed = model_selector.read(cx).is_deployed();
+                    if is_deployed {
+                        model_selector.update(cx, |selector, cx| {
+                            selector.toggle(window, cx);
+                        });
+                        log::info!("MRU: Closed model selector on Ctrl+Alt release");
+                    }
+                } else if let Some(config_options_view) = &self.config_options_view {
+                    let is_open = config_options_view
+                        .read(cx)
+                        .is_category_picker_open(acp::SessionConfigOptionCategory::Model, cx);
+                    if is_open {
+                        config_options_view.update(cx, |view, cx| {
+                            view.toggle_category_picker(
+                                acp::SessionConfigOptionCategory::Model,
+                                window,
+                                cx,
+                            );
+                        });
+                        log::info!("MRU: Closed config options model picker on Ctrl+Alt release");
+                    }
+                }
+                self.model_selector_opened_by_ctrl_alt = false;
+            }
+        }
     }
 
     fn cancel_editing(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -7021,6 +7093,7 @@ impl Render for AcpThreadView {
             .on_action(cx.listener(Self::allow_once))
             .on_action(cx.listener(Self::reject_once))
             .on_action(cx.listener(Self::select_mru_model))
+            .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
             .on_action(cx.listener(|this, _: &SendNextQueuedMessage, window, cx| {
                 this.send_queued_message_at_index(0, true, window, cx);
             }))

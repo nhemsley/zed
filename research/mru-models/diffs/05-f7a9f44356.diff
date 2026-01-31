@@ -1,0 +1,196 @@
+commit f7a9f443566606b82cf712a89639e94e53a7b599
+Author: Nicholas Hemsley <nick.hems@gmail.com>
+Date:   Fri Jan 30 13:57:58 2026 +0800
+
+    Add Ctrl+1-9 keybindings for MRU model selection
+    
+    - Add SelectMruModel action with index parameter (1-9)
+    - Implement select_mru_model handler that fetches MRU from database
+    - Select the model and queue/send message with new model
+    - Add keybindings for Linux, macOS, and Windows
+
+diff --git a/assets/keymaps/default-linux.json b/assets/keymaps/default-linux.json
+index 73ddf48f91..bb5ea99449 100644
+--- a/assets/keymaps/default-linux.json
++++ b/assets/keymaps/default-linux.json
+@@ -294,6 +294,20 @@
+       "alt-enter": "editor::Newline",
+     },
+   },
++  {
++    "context": "AcpThread",
++    "bindings": {
++      "ctrl-1": ["agent::SelectMruModel", { "index": 1 }],
++      "ctrl-2": ["agent::SelectMruModel", { "index": 2 }],
++      "ctrl-3": ["agent::SelectMruModel", { "index": 3 }],
++      "ctrl-4": ["agent::SelectMruModel", { "index": 4 }],
++      "ctrl-5": ["agent::SelectMruModel", { "index": 5 }],
++      "ctrl-6": ["agent::SelectMruModel", { "index": 6 }],
++      "ctrl-7": ["agent::SelectMruModel", { "index": 7 }],
++      "ctrl-8": ["agent::SelectMruModel", { "index": 8 }],
++      "ctrl-9": ["agent::SelectMruModel", { "index": 9 }],
++    },
++  },
+   {
+     "context": "AcpThread > ModeSelector",
+     "bindings": {
+diff --git a/assets/keymaps/default-macos.json b/assets/keymaps/default-macos.json
+index d4249adfb1..664ff4782f 100644
+--- a/assets/keymaps/default-macos.json
++++ b/assets/keymaps/default-macos.json
+@@ -342,6 +342,20 @@
+       "ctrl--": "pane::GoBack",
+     },
+   },
++  {
++    "context": "AcpThread",
++    "bindings": {
++      "ctrl-1": ["agent::SelectMruModel", { "index": 1 }],
++      "ctrl-2": ["agent::SelectMruModel", { "index": 2 }],
++      "ctrl-3": ["agent::SelectMruModel", { "index": 3 }],
++      "ctrl-4": ["agent::SelectMruModel", { "index": 4 }],
++      "ctrl-5": ["agent::SelectMruModel", { "index": 5 }],
++      "ctrl-6": ["agent::SelectMruModel", { "index": 6 }],
++      "ctrl-7": ["agent::SelectMruModel", { "index": 7 }],
++      "ctrl-8": ["agent::SelectMruModel", { "index": 8 }],
++      "ctrl-9": ["agent::SelectMruModel", { "index": 9 }],
++    },
++  },
+   {
+     "context": "AcpThread > ModeSelector",
+     "bindings": {
+diff --git a/assets/keymaps/default-windows.json b/assets/keymaps/default-windows.json
+index 672ad37413..731cb43770 100644
+--- a/assets/keymaps/default-windows.json
++++ b/assets/keymaps/default-windows.json
+@@ -296,6 +296,20 @@
+       "alt-enter": "editor::Newline",
+     },
+   },
++  {
++    "context": "AcpThread",
++    "bindings": {
++      "ctrl-1": ["agent::SelectMruModel", { "index": 1 }],
++      "ctrl-2": ["agent::SelectMruModel", { "index": 2 }],
++      "ctrl-3": ["agent::SelectMruModel", { "index": 3 }],
++      "ctrl-4": ["agent::SelectMruModel", { "index": 4 }],
++      "ctrl-5": ["agent::SelectMruModel", { "index": 5 }],
++      "ctrl-6": ["agent::SelectMruModel", { "index": 6 }],
++      "ctrl-7": ["agent::SelectMruModel", { "index": 7 }],
++      "ctrl-8": ["agent::SelectMruModel", { "index": 8 }],
++      "ctrl-9": ["agent::SelectMruModel", { "index": 9 }],
++    },
++  },
+   {
+     "context": "AcpThread > ModeSelector",
+     "bindings": {
+diff --git a/crates/agent_ui/src/acp/thread_view.rs b/crates/agent_ui/src/acp/thread_view.rs
+index 2d83e3496d..6a7520c0a8 100644
+--- a/crates/agent_ui/src/acp/thread_view.rs
++++ b/crates/agent_ui/src/acp/thread_view.rs
+@@ -56,7 +56,7 @@ use ui::{
+ use util::defer;
+ use util::{ResultExt, size::format_file_size, time::duration_alt_display};
+ use workspace::{CollaboratorId, NewTerminal, Toast, Workspace, notifications::NotificationId};
+-use zed_actions::agent::{Chat, ToggleModelSelector};
++use zed_actions::agent::{Chat, SelectMruModel, ToggleModelSelector};
+ use zed_actions::assistant::OpenRulesLibrary;
+ 
+ use super::config_options::ConfigOptionsView;
+@@ -1580,6 +1580,63 @@ impl AcpThreadView {
+         .detach_and_log_err(cx);
+     }
+ 
++    fn select_mru_model(
++        &mut self,
++        action: &SelectMruModel,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        let index = action.index;
++        if index < 1 || index > 9 {
++            return;
++        }
++
++        let Some(thread) = self.thread().cloned() else {
++            return;
++        };
++
++        let Some(model_selector) = thread
++            .read(cx)
++            .connection()
++            .model_selector(thread.read(cx).session_id())
++        else {
++            log::info!("MRU: No model selector available");
++            return;
++        };
++
++        let database_future = ThreadsDatabase::connect(cx);
++
++        cx.spawn_in(window, async move |this, cx| {
++            let db = database_future.await.map_err(|err| anyhow::anyhow!(err))?;
++            let mru_models = db.get_mru_models_with_stats(9).await?;
++
++            let Some(mru_model) = mru_models.get(index - 1) else {
++                log::info!("MRU: No model at index {}", index);
++                return Ok::<(), anyhow::Error>(());
++            };
++
++            let model_id = acp::ModelId::new(mru_model.model_id.clone());
++            log::info!(
++                "MRU: Selecting model at index {}: {}",
++                index,
++                mru_model.model_id
++            );
++
++            // Select the model
++            let select_task =
++                this.update(cx, |_this, cx| model_selector.select_model(model_id, cx))?;
++            select_task.await?;
++
++            // Queue/send the message if there's content
++            this.update_in(cx, |this, window, cx| {
++                this.queue_message(window, cx);
++            })?;
++
++            Ok(())
++        })
++        .detach_and_log_err(cx);
++    }
++
+     fn send_queued_message_at_index(
+         &mut self,
+         index: usize,
+@@ -7083,6 +7140,7 @@ impl Render for AcpThreadView {
+                     });
+                 }
+             }))
++            .on_action(cx.listener(Self::select_mru_model))
+             .track_focus(&self.focus_handle)
+             .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
+             .bg(cx.theme().colors().panel_background)
+diff --git a/crates/zed_actions/src/lib.rs b/crates/zed_actions/src/lib.rs
+index ab126fd4db..fd54069edf 100644
+--- a/crates/zed_actions/src/lib.rs
++++ b/crates/zed_actions/src/lib.rs
+@@ -326,7 +326,19 @@ pub mod settings_profile_selector {
+ }
+ 
+ pub mod agent {
+-    use gpui::actions;
++    use gpui::{Action, actions};
++    use schemars::JsonSchema;
++    use serde::Deserialize;
++
++    /// Selects an MRU (Most Recently Used) model by index and sends/queues the current message.
++    /// Index 1-9 corresponds to Ctrl+1 through Ctrl+9 keybindings.
++    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
++    #[action(namespace = agent)]
++    #[serde(deny_unknown_fields)]
++    pub struct SelectMruModel {
++        /// The 1-based index of the MRU model to select (1-9).
++        pub index: usize,
++    }
+ 
+     actions!(
+         agent,

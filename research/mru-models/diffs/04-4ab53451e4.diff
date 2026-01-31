@@ -1,0 +1,27 @@
+commit 4ab53451e4d60c18dd77407ab2fd9b1ccc621d76
+Author: Nicholas Hemsley <nick.hems@gmail.com>
+Date:   Fri Jan 30 13:49:03 2026 +0800
+
+    Add detailed logging for model ID tracking and fix MRU to use model.id() directly
+
+diff --git a/crates/agent/src/thread.rs b/crates/agent/src/thread.rs
+index 4fa45e71d6..f70872a765 100644
+--- a/crates/agent/src/thread.rs
++++ b/crates/agent/src/thread.rs
+@@ -1218,9 +1218,14 @@ impl Thread {
+     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
+         let model = self.model().context("No language model configured")?;
+ 
+-        log::info!("Thread::send called with model: {}", model.name().0);
++        log::info!(
++            "Thread::send called with model: name={}, id={}, provider_id={}",
++            model.name().0,
++            model.id().0,
++            model.provider_id().0
++        );
+ 
+-        // Record model usage in MRU
++        // Record model usage in MRU - use just model.id() to match picker's model IDs
+         let model_id = model.id().0.to_string();
+         let database_future = ThreadsDatabase::connect(cx);
+         cx.background_spawn(async move {

@@ -1,0 +1,122 @@
+commit 509642041f41ac5543119866e2e8564c3e10a5fe
+Author: Nicholas Hemsley <nick.hems@gmail.com>
+Date:   Fri Jan 30 14:39:31 2026 +0800
+
+    feat(agent_ui): Filter out invalid MRU model IDs and improve error handling
+    
+    - Filter out model IDs without provider prefix when loading MRU list
+    - Log warning for invalid model IDs (e.g., old entries without provider)
+    - Improve error handling in select_mru_model to gracefully skip invalid IDs
+    - Add clear_mru.sh utility script for cleaning MRU table
+    
+    This handles legacy data that was recorded before the provider_id/model_id
+    format was introduced.
+
+diff --git a/clear_mru.sh b/clear_mru.sh
+new file mode 100755
+index 0000000000..0b59347896
+--- /dev/null
++++ b/clear_mru.sh
+@@ -0,0 +1,32 @@
++#!/bin/bash
++
++# Script to clear the MRU (Most Recently Used) models table
++
++DB_PATH="$HOME/.local/share/zed/threads/threads.db"
++
++if [ ! -f "$DB_PATH" ]; then
++    echo "Error: Database not found at $DB_PATH"
++    exit 1
++fi
++
++echo "Clearing MRU table from: $DB_PATH"
++
++# Check if Zed is running
++if pgrep -x "zed" > /dev/null; then
++    echo "Warning: Zed is currently running. Please close Zed first to avoid database locks."
++    read -p "Press Enter to continue anyway or Ctrl+C to cancel..."
++fi
++
++# Clear the MRU table
++sqlite3 "$DB_PATH" "DELETE FROM model_mru;"
++
++if [ $? -eq 0 ]; then
++    echo "✓ MRU table cleared successfully!"
++
++    # Show the count
++    COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM model_mru;")
++    echo "  Remaining entries: $COUNT"
++else
++    echo "✗ Failed to clear MRU table"
++    exit 1
++fi
+diff --git a/crates/agent_ui/src/acp/model_selector.rs b/crates/agent_ui/src/acp/model_selector.rs
+index d86adc6a1f..1165aca961 100644
+--- a/crates/agent_ui/src/acp/model_selector.rs
++++ b/crates/agent_ui/src/acp/model_selector.rs
+@@ -134,18 +134,36 @@ impl AcpModelPickerDelegate {
+                 ) -> Result<()> {
+                     let db = database_future.await.map_err(|err| anyhow::anyhow!(err))?;
+                     let mru_infos = db.get_mru_models_with_stats(9).await?;
+-                    let mru_ids: Vec<ModelId> = mru_infos
+-                        .into_iter()
+-                        .map(|info| ModelId::new(info.model_id))
+-                        .collect();
++
++                    // Filter out invalid model IDs (e.g., old entries without provider prefix)
++                    let mut valid_ids = Vec::new();
++                    let mut invalid_ids = Vec::new();
++
++                    for info in mru_infos {
++                        let model_id_str = &info.model_id;
++                        // Valid model IDs should have format: provider_id/model_id
++                        if model_id_str.contains('/') {
++                            valid_ids.push(ModelId::new(info.model_id));
++                        } else {
++                            invalid_ids.push(model_id_str.clone());
++                        }
++                    }
++
++                    if !invalid_ids.is_empty() {
++                        log::warn!(
++                            "MRU: Filtered out {} invalid model IDs (old format): {:?}",
++                            invalid_ids.len(),
++                            invalid_ids
++                        );
++                    }
+ 
+                     log::info!(
+-                        "MRU: Loaded {} MRU model IDs into picker: {:?}",
+-                        mru_ids.len(),
+-                        mru_ids
++                        "MRU: Loaded {} valid MRU model IDs into picker: {:?}",
++                        valid_ids.len(),
++                        valid_ids
+                     );
+                     this.update_in(cx, |picker, window, cx| {
+-                        picker.delegate.mru_model_ids = mru_ids;
++                        picker.delegate.mru_model_ids = valid_ids;
+                         picker.refresh(window, cx);
+                     })
+                 }
+diff --git a/crates/agent_ui/src/acp/thread_view.rs b/crates/agent_ui/src/acp/thread_view.rs
+index 0b5b071a31..fb3f7da589 100644
+--- a/crates/agent_ui/src/acp/thread_view.rs
++++ b/crates/agent_ui/src/acp/thread_view.rs
+@@ -1627,7 +1627,15 @@ impl AcpThreadView {
+             // Select the model
+             let select_task =
+                 this.update(cx, |_this, cx| model_selector.select_model(model_id, cx))?;
+-            select_task.await?;
++
++            if let Err(e) = select_task.await {
++                log::error!(
++                    "MRU: Failed to select model '{}': {}. This may be an old MRU entry with invalid format.",
++                    mru_model.model_id,
++                    e
++                );
++                return Ok(());
++            }
+ 
+             // Queue/send the message if there's content
+             this.update_in(cx, |this, window, cx| {

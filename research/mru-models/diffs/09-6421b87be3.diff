@@ -1,0 +1,353 @@
+commit 6421b87be307fdbb83da3a2d18abdc0f089b8ca1
+Author: Nicholas Hemsley <nick.hems@gmail.com>
+Date:   Fri Jan 30 14:43:56 2026 +0800
+
+    feat(agent_ui): Change MRU to Ctrl+Alt and show numbers in picker
+    
+    - Change model selector modal trigger from Ctrl to Ctrl+Alt
+    - Change MRU keybindings from Ctrl+1-9 to Ctrl+Alt+1-9
+    - Display MRU index (1-9) next to models in 'Most Recently Used' section
+    - Add mru_index field to ModelSelectorListItem for visual display
+    
+    This makes it clearer which Ctrl+Alt+number corresponds to which model.
+    
+    Related: zed-vb7.4
+
+diff --git a/assets/keymaps/default-linux.json b/assets/keymaps/default-linux.json
+index bb5ea99449..934a7ece83 100644
+--- a/assets/keymaps/default-linux.json
++++ b/assets/keymaps/default-linux.json
+@@ -297,15 +297,15 @@
+   {
+     "context": "AcpThread",
+     "bindings": {
+-      "ctrl-1": ["agent::SelectMruModel", { "index": 1 }],
+-      "ctrl-2": ["agent::SelectMruModel", { "index": 2 }],
+-      "ctrl-3": ["agent::SelectMruModel", { "index": 3 }],
+-      "ctrl-4": ["agent::SelectMruModel", { "index": 4 }],
+-      "ctrl-5": ["agent::SelectMruModel", { "index": 5 }],
+-      "ctrl-6": ["agent::SelectMruModel", { "index": 6 }],
+-      "ctrl-7": ["agent::SelectMruModel", { "index": 7 }],
+-      "ctrl-8": ["agent::SelectMruModel", { "index": 8 }],
+-      "ctrl-9": ["agent::SelectMruModel", { "index": 9 }],
++      "ctrl-alt-1": ["agent::SelectMruModel", { "index": 1 }],
++      "ctrl-alt-2": ["agent::SelectMruModel", { "index": 2 }],
++      "ctrl-alt-3": ["agent::SelectMruModel", { "index": 3 }],
++      "ctrl-alt-4": ["agent::SelectMruModel", { "index": 4 }],
++      "ctrl-alt-5": ["agent::SelectMruModel", { "index": 5 }],
++      "ctrl-alt-6": ["agent::SelectMruModel", { "index": 6 }],
++      "ctrl-alt-7": ["agent::SelectMruModel", { "index": 7 }],
++      "ctrl-alt-8": ["agent::SelectMruModel", { "index": 8 }],
++      "ctrl-alt-9": ["agent::SelectMruModel", { "index": 9 }],
+     },
+   },
+   {
+diff --git a/assets/keymaps/default-macos.json b/assets/keymaps/default-macos.json
+index 664ff4782f..432bb9a8ed 100644
+--- a/assets/keymaps/default-macos.json
++++ b/assets/keymaps/default-macos.json
+@@ -345,15 +345,15 @@
+   {
+     "context": "AcpThread",
+     "bindings": {
+-      "ctrl-1": ["agent::SelectMruModel", { "index": 1 }],
+-      "ctrl-2": ["agent::SelectMruModel", { "index": 2 }],
+-      "ctrl-3": ["agent::SelectMruModel", { "index": 3 }],
+-      "ctrl-4": ["agent::SelectMruModel", { "index": 4 }],
+-      "ctrl-5": ["agent::SelectMruModel", { "index": 5 }],
+-      "ctrl-6": ["agent::SelectMruModel", { "index": 6 }],
+-      "ctrl-7": ["agent::SelectMruModel", { "index": 7 }],
+-      "ctrl-8": ["agent::SelectMruModel", { "index": 8 }],
+-      "ctrl-9": ["agent::SelectMruModel", { "index": 9 }],
++      "ctrl-alt-1": ["agent::SelectMruModel", { "index": 1 }],
++      "ctrl-alt-2": ["agent::SelectMruModel", { "index": 2 }],
++      "ctrl-alt-3": ["agent::SelectMruModel", { "index": 3 }],
++      "ctrl-alt-4": ["agent::SelectMruModel", { "index": 4 }],
++      "ctrl-alt-5": ["agent::SelectMruModel", { "index": 5 }],
++      "ctrl-alt-6": ["agent::SelectMruModel", { "index": 6 }],
++      "ctrl-alt-7": ["agent::SelectMruModel", { "index": 7 }],
++      "ctrl-alt-8": ["agent::SelectMruModel", { "index": 8 }],
++      "ctrl-alt-9": ["agent::SelectMruModel", { "index": 9 }],
+     },
+   },
+   {
+diff --git a/assets/keymaps/default-windows.json b/assets/keymaps/default-windows.json
+index 731cb43770..f23e2f4cd7 100644
+--- a/assets/keymaps/default-windows.json
++++ b/assets/keymaps/default-windows.json
+@@ -299,15 +299,15 @@
+   {
+     "context": "AcpThread",
+     "bindings": {
+-      "ctrl-1": ["agent::SelectMruModel", { "index": 1 }],
+-      "ctrl-2": ["agent::SelectMruModel", { "index": 2 }],
+-      "ctrl-3": ["agent::SelectMruModel", { "index": 3 }],
+-      "ctrl-4": ["agent::SelectMruModel", { "index": 4 }],
+-      "ctrl-5": ["agent::SelectMruModel", { "index": 5 }],
+-      "ctrl-6": ["agent::SelectMruModel", { "index": 6 }],
+-      "ctrl-7": ["agent::SelectMruModel", { "index": 7 }],
+-      "ctrl-8": ["agent::SelectMruModel", { "index": 8 }],
+-      "ctrl-9": ["agent::SelectMruModel", { "index": 9 }],
++      "ctrl-alt-1": ["agent::SelectMruModel", { "index": 1 }],
++      "ctrl-alt-2": ["agent::SelectMruModel", { "index": 2 }],
++      "ctrl-alt-3": ["agent::SelectMruModel", { "index": 3 }],
++      "ctrl-alt-4": ["agent::SelectMruModel", { "index": 4 }],
++      "ctrl-alt-5": ["agent::SelectMruModel", { "index": 5 }],
++      "ctrl-alt-6": ["agent::SelectMruModel", { "index": 6 }],
++      "ctrl-alt-7": ["agent::SelectMruModel", { "index": 7 }],
++      "ctrl-alt-8": ["agent::SelectMruModel", { "index": 8 }],
++      "ctrl-alt-9": ["agent::SelectMruModel", { "index": 9 }],
+     },
+   },
+   {
+diff --git a/crates/agent_ui/src/acp/model_selector.rs b/crates/agent_ui/src/acp/model_selector.rs
+index 1165aca961..7b10506270 100644
+--- a/crates/agent_ui/src/acp/model_selector.rs
++++ b/crates/agent_ui/src/acp/model_selector.rs
+@@ -44,7 +44,7 @@ pub fn acp_model_selector(
+ 
+ enum AcpModelPickerEntry {
+     Separator(SharedString),
+-    Model(AgentModelInfo, bool),
++    Model(AgentModelInfo, bool, Option<usize>), // model_info, is_favorite, mru_index (1-9)
+ }
+ 
+ pub struct AcpModelPickerDelegate {
+@@ -244,7 +244,7 @@ impl AcpModelPickerDelegate {
+ 
+         // Keep the picker selection aligned with the newly-selected model
+         if let Some(new_index) = self.filtered_entries.iter().position(|entry| {
+-            matches!(entry, AcpModelPickerEntry::Model(model_info, _) if self.selected_model.as_ref().is_some_and(|selected| model_info.id == selected.id))
++            matches!(entry, AcpModelPickerEntry::Model(model_info, _, _) if self.selected_model.as_ref().is_some_and(|selected| model_info.id == selected.id))
+         }) {
+             self.set_selected_index(new_index, window, cx);
+         } else {
+@@ -276,7 +276,7 @@ impl PickerDelegate for AcpModelPickerDelegate {
+         _cx: &mut Context<Picker<Self>>,
+     ) -> bool {
+         match self.filtered_entries.get(ix) {
+-            Some(AcpModelPickerEntry::Model(_, _)) => true,
++            Some(AcpModelPickerEntry::Model(_, _, _)) => true,
+             Some(AcpModelPickerEntry::Separator(_)) | None => false,
+         }
+     }
+@@ -319,7 +319,7 @@ impl PickerDelegate for AcpModelPickerDelegate {
+                     .as_ref()
+                     .and_then(|selected| {
+                         this.delegate.filtered_entries.iter().position(|entry| {
+-                            if let AcpModelPickerEntry::Model(model_info, _) = entry {
++                            if let AcpModelPickerEntry::Model(model_info, _, _) = entry {
+                                 model_info.id == selected.id
+                             } else {
+                                 false
+@@ -335,7 +335,7 @@ impl PickerDelegate for AcpModelPickerDelegate {
+     }
+ 
+     fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+-        if let Some(AcpModelPickerEntry::Model(model_info, _)) =
++        if let Some(AcpModelPickerEntry::Model(model_info, _, _)) =
+             self.filtered_entries.get(self.selected_index)
+         {
+             let model_id = model_info.id.clone();
+@@ -383,7 +383,7 @@ impl PickerDelegate for AcpModelPickerDelegate {
+             AcpModelPickerEntry::Separator(title) => {
+                 Some(ModelSelectorHeader::new(title, ix > 1).into_any_element())
+             }
+-            AcpModelPickerEntry::Model(model_info, is_favorite) => {
++            AcpModelPickerEntry::Model(model_info, is_favorite, mru_index) => {
+                 let is_selected = Some(model_info) == self.selected_model.as_ref();
+                 let default_model = self.agent_server.default_model(cx);
+                 let is_default = default_model.as_ref() == Some(&model_info.id);
+@@ -428,6 +428,7 @@ impl PickerDelegate for AcpModelPickerDelegate {
+                                 .is_selected(is_selected)
+                                 .is_focused(selected)
+                                 .is_favorite(is_favorite)
++                                .mru_index(*mru_index)
+                                 .on_toggle_favorite(handle_action_click),
+                         )
+                         .into_any_element(),
+@@ -520,9 +521,13 @@ fn info_list_to_picker_entries(
+     );
+     if has_mru {
+         entries.push(AcpModelPickerEntry::Separator("Most Recently Used".into()));
+-        for model in mru_models {
++        for (idx, model) in mru_models.iter().enumerate() {
+             let is_favorite = favorites.contains(&model.id);
+-            entries.push(AcpModelPickerEntry::Model((*model).clone(), is_favorite));
++            entries.push(AcpModelPickerEntry::Model(
++                (*model).clone(),
++                is_favorite,
++                Some(idx + 1),
++            ));
+         }
+     }
+ 
+@@ -537,7 +542,7 @@ fn info_list_to_picker_entries(
+     if has_favorites {
+         entries.push(AcpModelPickerEntry::Separator("Favorite".into()));
+         for model in favorite_models {
+-            entries.push(AcpModelPickerEntry::Model((*model).clone(), true));
++            entries.push(AcpModelPickerEntry::Model((*model).clone(), true, None));
+         }
+     }
+ 
+@@ -548,7 +553,7 @@ fn info_list_to_picker_entries(
+             }
+             for model in list {
+                 let is_favorite = favorites.contains(&model.id);
+-                entries.push(AcpModelPickerEntry::Model(model, is_favorite));
++                entries.push(AcpModelPickerEntry::Model(model, is_favorite, None));
+             }
+         }
+         AgentModelList::Grouped(index_map) => {
+@@ -556,7 +561,7 @@ fn info_list_to_picker_entries(
+                 entries.push(AcpModelPickerEntry::Separator(group_name.0));
+                 for model in models {
+                     let is_favorite = favorites.contains(&model.id);
+-                    entries.push(AcpModelPickerEntry::Model(model, is_favorite));
++                    entries.push(AcpModelPickerEntry::Model(model, is_favorite, None));
+                 }
+             }
+         }
+@@ -695,7 +700,7 @@ mod tests {
+         entries
+             .iter()
+             .filter_map(|entry| match entry {
+-                AcpModelPickerEntry::Model(info, _) => Some(info.id.0.as_ref()),
++                AcpModelPickerEntry::Model(info, _, _) => Some(info.id.0.as_ref()),
+                 _ => None,
+             })
+             .collect()
+@@ -705,7 +710,7 @@ mod tests {
+         entries
+             .iter()
+             .map(|entry| match entry {
+-                AcpModelPickerEntry::Model(info, _) => info.id.0.as_ref(),
++                AcpModelPickerEntry::Model(info, _, _) => info.id.0.as_ref(),
+                 AcpModelPickerEntry::Separator(s) => &s,
+             })
+             .collect()
+@@ -794,7 +799,7 @@ mod tests {
+         let entries = info_list_to_picker_entries(models, &favorites, &[]);
+ 
+         for entry in &entries {
+-            if let AcpModelPickerEntry::Model(info, is_favorite) = entry {
++            if let AcpModelPickerEntry::Model(info, is_favorite, _) = entry {
+                 if info.id.0.as_ref() == "zed/claude" {
+                     assert!(is_favorite, "zed/claude should be a favorite");
+                 } else {
+@@ -922,7 +927,7 @@ mod tests {
+         let entries = info_list_to_picker_entries(models, &favorites, &[]);
+ 
+         for entry in &entries {
+-            if let AcpModelPickerEntry::Model(info, is_favorite) = entry {
++            if let AcpModelPickerEntry::Model(info, is_favorite, _) = entry {
+                 if info.id.0.as_ref() == "favorite-model" {
+                     assert!(*is_favorite, "favorite-model should have is_favorite=true");
+                 } else if info.id.0.as_ref() == "regular-model" {
+diff --git a/crates/agent_ui/src/acp/thread_view.rs b/crates/agent_ui/src/acp/thread_view.rs
+index fb3f7da589..ef53a4d52b 100644
+--- a/crates/agent_ui/src/acp/thread_view.rs
++++ b/crates/agent_ui/src/acp/thread_view.rs
+@@ -5354,10 +5354,11 @@ impl AcpThreadView {
+         window: &mut Window,
+         cx: &mut Context<Self>,
+     ) {
+-        let ctrl_held = event.modifiers.control && !event.modifiers.alt && !event.modifiers.shift;
++        let ctrl_alt_held =
++            event.modifiers.control && event.modifiers.alt && !event.modifiers.shift;
+ 
+-        // When Ctrl is pressed (and only Ctrl), show the model selector
+-        if ctrl_held {
++        // When Ctrl+Alt is pressed (and only Ctrl+Alt), show the model selector
++        if ctrl_alt_held {
+             // Only open if we have a model selector and it's not already open
+             if let Some(model_selector) = &self.model_selector {
+                 let is_deployed = model_selector.read(cx).is_deployed();
+@@ -5366,7 +5367,7 @@ impl AcpThreadView {
+                         selector.toggle(window, cx);
+                     });
+                     self.model_selector_opened_by_ctrl = true;
+-                    log::info!("MRU: Opened model selector with Ctrl hold");
++                    log::info!("MRU: Opened model selector with Ctrl+Alt hold");
+                 }
+             } else if let Some(config_options_view) = &self.config_options_view {
+                 // Handle config_options_view path
+@@ -5382,11 +5383,11 @@ impl AcpThreadView {
+                         );
+                     });
+                     self.model_selector_opened_by_ctrl = true;
+-                    log::info!("MRU: Opened config options model picker with Ctrl hold");
++                    log::info!("MRU: Opened config options model picker with Ctrl+Alt hold");
+                 }
+             }
+         } else {
+-            // When Ctrl is released, close the model selector if we opened it
++            // When Ctrl+Alt is released, close the model selector if we opened it
+             if self.model_selector_opened_by_ctrl {
+                 if let Some(model_selector) = &self.model_selector {
+                     let is_deployed = model_selector.read(cx).is_deployed();
+@@ -5394,7 +5395,7 @@ impl AcpThreadView {
+                         model_selector.update(cx, |selector, cx| {
+                             selector.toggle(window, cx);
+                         });
+-                        log::info!("MRU: Closed model selector on Ctrl release");
++                        log::info!("MRU: Closed model selector on Ctrl+Alt release");
+                     }
+                 } else if let Some(config_options_view) = &self.config_options_view {
+                     let is_open = config_options_view
+@@ -5408,7 +5409,7 @@ impl AcpThreadView {
+                                 cx,
+                             );
+                         });
+-                        log::info!("MRU: Closed config options model picker on Ctrl release");
++                        log::info!("MRU: Closed config options model picker on Ctrl+Alt release");
+                     }
+                 }
+                 self.model_selector_opened_by_ctrl = false;
+diff --git a/crates/agent_ui/src/ui/model_selector_components.rs b/crates/agent_ui/src/ui/model_selector_components.rs
+index de4036b8de..da329e7bb0 100644
+--- a/crates/agent_ui/src/ui/model_selector_components.rs
++++ b/crates/agent_ui/src/ui/model_selector_components.rs
+@@ -51,6 +51,7 @@ pub struct ModelSelectorListItem {
+     is_selected: bool,
+     is_focused: bool,
+     is_favorite: bool,
++    mru_index: Option<usize>,
+     on_toggle_favorite: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+ }
+ 
+@@ -63,6 +64,7 @@ impl ModelSelectorListItem {
+             is_selected: false,
+             is_focused: false,
+             is_favorite: false,
++            mru_index: None,
+             on_toggle_favorite: None,
+         }
+     }
+@@ -92,6 +94,11 @@ impl ModelSelectorListItem {
+         self
+     }
+ 
++    pub fn mru_index(mut self, mru_index: Option<usize>) -> Self {
++        self.mru_index = mru_index;
++        self
++    }
++
+     pub fn on_toggle_favorite(
+         mut self,
+         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+@@ -119,6 +126,13 @@ impl RenderOnce for ModelSelectorListItem {
+                 h_flex()
+                     .w_full()
+                     .gap_1p5()
++                    .when_some(self.mru_index, |this, idx| {
++                        this.child(
++                            Label::new(format!("{}", idx))
++                                .color(Color::Muted)
++                                .size(LabelSize::Small),
++                        )
++                    })
+                     .when_some(self.icon, |this, icon| {
+                         this.child(
+                             match icon {

@@ -1,0 +1,96 @@
+commit 6c70f7c2d3585a9c8468194b3646ae017f8b3740
+Author: Nicholas Hemsley <nick.hems@gmail.com>
+Date:   Fri Jan 30 15:24:51 2026 +0800
+
+    Filter invalid model IDs and refresh MRU list in model selector
+    
+    The model selector now:
+    - Refreshes MRU models from database when showing the picker
+    - Filters out old/invalid model IDs (ones without '/' character)
+    - Adds logging for debugging MRU issues
+    - Updates the delegate's MRU list with only valid IDs
+    
+    This prevents errors when trying to select old format model IDs
+    and ensures the MRU list is always current.
+    
+    Closes zed-vb7.6
+
+diff --git a/crates/agent_ui/src/acp/model_selector.rs b/crates/agent_ui/src/acp/model_selector.rs
+index 7b10506270..e1d35365e6 100644
+--- a/crates/agent_ui/src/acp/model_selector.rs
++++ b/crates/agent_ui/src/acp/model_selector.rs
+@@ -292,21 +292,66 @@ impl PickerDelegate for AcpModelPickerDelegate {
+         cx: &mut Context<Picker<Self>>,
+     ) -> Task<()> {
+         let favorites = self.favorites.clone();
++        let database_future = ThreadsDatabase::connect(cx);
+ 
+         cx.spawn_in(window, async move |this, cx| {
+-            let (filtered_models, mru_model_ids) = match this
++            // Refresh MRU models from database
++            let mru_model_ids = async {
++                let db = database_future.await.map_err(|err| anyhow::anyhow!(err))?;
++                let mru_infos = db.get_mru_models_with_stats(9).await?;
++
++                let mut valid_ids = Vec::new();
++                let mut invalid_ids = Vec::new();
++
++                for info in mru_infos {
++                    let model_id_str = &info.model_id;
++                    if model_id_str.contains('/') {
++                        valid_ids.push(ModelId::new(info.model_id));
++                    } else {
++                        invalid_ids.push(model_id_str.clone());
++                    }
++                }
++
++                if !invalid_ids.is_empty() {
++                    log::warn!(
++                        "MRU: Filtered out {} invalid model IDs (old format): {:?}",
++                        invalid_ids.len(),
++                        invalid_ids
++                    );
++                }
++
++                log::info!(
++                    "MRU: Refreshed {} valid MRU model IDs: {:?}",
++                    valid_ids.len(),
++                    valid_ids
++                );
++
++                Ok::<Vec<ModelId>, anyhow::Error>(valid_ids)
++            }
++            .await
++            .unwrap_or_else(|e| {
++                log::error!("MRU: Failed to refresh MRU models: {}", e);
++                Vec::new()
++            });
++
++            // Update the delegate's MRU list
++            this.update(cx, |this, cx| {
++                this.delegate.mru_model_ids = mru_model_ids.clone();
++                cx.notify();
++            })
++            .ok();
++
++            let filtered_models = match this
+                 .read_with(cx, |this, cx| {
+-                    let models = this.delegate.models.clone().map(move |models| {
++                    this.delegate.models.clone().map(move |models| {
+                         fuzzy_search(models, query, cx.background_executor().clone())
+-                    });
+-                    let mru_ids = this.delegate.mru_model_ids.clone();
+-                    (models, mru_ids)
++                    })
+                 })
+                 .ok()
+             {
+-                Some((Some(task), mru_ids)) => (task.await, mru_ids),
+-                Some((None, mru_ids)) => (AgentModelList::Flat(vec![]), mru_ids),
+-                None => (AgentModelList::Flat(vec![]), vec![]),
++                Some(Some(task)) => task.await,
++                Some(None) => AgentModelList::Flat(vec![]),
++                None => AgentModelList::Flat(vec![]),
+             };
+ 
+             this.update_in(cx, |this, window, cx| {

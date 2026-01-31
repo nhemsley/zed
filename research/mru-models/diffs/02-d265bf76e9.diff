@@ -1,0 +1,257 @@
+commit d265bf76e912c74c0472a2d2fa717b15bbfd6c81
+Author: Nicholas Hemsley <nick.hems@gmail.com>
+Date:   Fri Jan 30 13:32:27 2026 +0800
+
+    Track model usage in MRU database and log MRU on Ctrl hold
+    
+    - Move MRU tracking from model selector to Thread::send for better accuracy
+    - Add get_mru_models_with_stats() to retrieve models with usage stats
+    - Add ModifiersChangedEvent handler to log MRU models when Ctrl is held
+    - Remove duplicate MRU tracking from model_selector.rs
+
+diff --git a/.cargo/config.toml b/.cargo/config.toml
+index 9b2e6f51c9..5e4e80622c 100644
+--- a/.cargo/config.toml
++++ b/.cargo/config.toml
+@@ -2,6 +2,10 @@
+ # v0 mangling scheme provides more detailed backtraces around closures
+ rustflags = ["-C", "symbol-mangling-version=v0", "--cfg", "tokio_unstable"]
+ 
++[target.x86_64-unknown-linux-gnu]
++linker = "clang"
++rustflags = ["-Clink-arg=--ld-path=wild"]
++
+ [alias]
+ xtask = "run --package xtask --"
+ perf-test = ["test", "--profile", "release-fast", "--lib", "--bins", "--tests", "--all-features", "--config", "target.'cfg(true)'.runner='cargo run -p perf --release'", "--config", "target.'cfg(true)'.rustflags=[\"--cfg\", \"perf_enabled\"]"]
+diff --git a/crates/agent/src/db.rs b/crates/agent/src/db.rs
+index a8331edfe9..e4ee2bf014 100644
+--- a/crates/agent/src/db.rs
++++ b/crates/agent/src/db.rs
+@@ -19,6 +19,13 @@ use std::sync::Arc;
+ use ui::{App, SharedString};
+ use zed_env_vars::ZED_STATELESS;
+ 
++#[derive(Debug, Clone)]
++pub struct ModelMruInfo {
++    pub model_id: String,
++    pub last_used_at: String,
++    pub use_count: i64,
++}
++
+ pub type DbMessage = crate::Message;
+ pub type DbSummary = crate::legacy_thread::DetailedSummaryState;
+ pub type DbLanguageModel = crate::legacy_thread::SerializedLanguageModel;
+@@ -556,6 +563,41 @@ impl ThreadsDatabase {
+             Ok(model_ids)
+         })
+     }
++
++    pub fn get_mru_models_with_stats(&self, limit: usize) -> Task<Result<Vec<ModelMruInfo>>> {
++        let connection = self.connection.clone();
++
++        self.executor.spawn(async move {
++            log::debug!("MRU: Fetching top {} MRU models with stats", limit);
++            let connection = connection.lock();
++
++            let mut select_all = connection.select_bound::<(), (String, String, i64)>(indoc! {"
++                SELECT model_id, last_used_at, use_count FROM model_mru
++                ORDER BY last_used_at DESC
++            "})?;
++
++            let rows = select_all(())?;
++            let model_infos: Vec<ModelMruInfo> = rows
++                .into_iter()
++                .take(limit)
++                .map(|(model_id, last_used_at, use_count)| ModelMruInfo {
++                    model_id,
++                    last_used_at,
++                    use_count,
++                })
++                .collect();
++
++            log::info!(
++                "MRU: Retrieved {} models with stats: {:?}",
++                model_infos.len(),
++                model_infos
++                    .iter()
++                    .map(|m| format!("{}({})", m.model_id, m.use_count))
++                    .collect::<Vec<_>>()
++            );
++            Ok(model_infos)
++        })
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/agent/src/thread.rs b/crates/agent/src/thread.rs
+index 9a579b12e4..4fa45e71d6 100644
+--- a/crates/agent/src/thread.rs
++++ b/crates/agent/src/thread.rs
+@@ -3,7 +3,7 @@ use crate::{
+     DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, GrepTool,
+     ListDirectoryTool, MovePathTool, NowTool, OpenTool, ProjectSnapshot, ReadFileTool,
+     RestoreFileFromDiskTool, SaveFileTool, SubagentTool, SystemPromptTemplate, Template, Templates,
+-    TerminalTool, ThinkingTool, WebSearchTool,
++    TerminalTool, ThinkingTool, ThreadsDatabase, WebSearchTool,
+ };
+ use acp_thread::{MentionUri, UserMessageId};
+ use action_log::ActionLog;
+@@ -1219,6 +1219,22 @@ impl Thread {
+         let model = self.model().context("No language model configured")?;
+ 
+         log::info!("Thread::send called with model: {}", model.name().0);
++
++        // Record model usage in MRU
++        let model_id = model.id().0.to_string();
++        let database_future = ThreadsDatabase::connect(cx);
++        cx.background_spawn(async move {
++            match database_future.await {
++                Ok(db) => {
++                    db.record_model_usage(model_id).await.log_err();
++                }
++                Err(e) => {
++                    log::error!("MRU: Failed to connect to database: {:?}", e);
++                }
++            }
++        })
++        .detach();
++
+         self.advance_prompt_id();
+ 
+         log::debug!("Total messages in thread: {}", self.messages.len());
+diff --git a/crates/agent_ui/src/acp/model_selector.rs b/crates/agent_ui/src/acp/model_selector.rs
+index 5048fbaf28..f750d8b10f 100644
+--- a/crates/agent_ui/src/acp/model_selector.rs
++++ b/crates/agent_ui/src/acp/model_selector.rs
+@@ -1,7 +1,6 @@
+ use std::{cmp::Reverse, rc::Rc, sync::Arc};
+ 
+ use acp_thread::{AgentModelIcon, AgentModelInfo, AgentModelList, AgentModelSelector};
+-use agent::ThreadsDatabase;
+ use agent_client_protocol::ModelId;
+ use agent_servers::AgentServer;
+ use agent_settings::AgentSettings;
+@@ -281,10 +280,7 @@ impl PickerDelegate for AcpModelPickerDelegate {
+         if let Some(AcpModelPickerEntry::Model(model_info, _)) =
+             self.filtered_entries.get(self.selected_index)
+         {
+-            // Clone model_id early to avoid borrow checker issues
+             let model_id = model_info.id.clone();
+-            let model_id_str = model_id.to_string();
+-            log::info!("MRU: Model selected in picker: {}", model_id_str);
+ 
+             if window.modifiers().secondary() {
+                 let default_model = self.agent_server.default_model(cx);
+@@ -308,22 +304,6 @@ impl PickerDelegate for AcpModelPickerDelegate {
+             let current_index = self.selected_index;
+             self.set_selected_index(current_index, window, cx);
+ 
+-            // Track model usage in MRU
+-            log::debug!("MRU: Connecting to database to track model usage");
+-            let database_future = ThreadsDatabase::connect(cx);
+-            cx.background_spawn(async move {
+-                match database_future.await {
+-                    Ok(db) => {
+-                        log::debug!("MRU: Database connected, recording usage");
+-                        db.record_model_usage(model_id_str).await.log_err();
+-                    }
+-                    Err(e) => {
+-                        log::error!("MRU: Failed to connect to database: {:?}", e);
+-                    }
+-                }
+-            })
+-            .detach();
+-
+             cx.emit(DismissEvent);
+         }
+     }
+diff --git a/crates/agent_ui/src/acp/thread_view.rs b/crates/agent_ui/src/acp/thread_view.rs
+index c7cb6860e4..2d83e3496d 100644
+--- a/crates/agent_ui/src/acp/thread_view.rs
++++ b/crates/agent_ui/src/acp/thread_view.rs
+@@ -5,7 +5,7 @@ use acp_thread::{
+ };
+ use acp_thread::{AgentConnection, Plan};
+ use action_log::{ActionLog, ActionLogTelemetry};
+-use agent::{DbThreadMetadata, NativeAgentServer, SharedThread, ThreadStore};
++use agent::{DbThreadMetadata, NativeAgentServer, SharedThread, ThreadStore, ThreadsDatabase};
+ use agent_client_protocol::{self as acp, PromptCapabilities};
+ use agent_servers::{AgentServer, AgentServerDelegate};
+ use agent_settings::{AgentProfileId, AgentSettings, CompletionMode};
+@@ -27,9 +27,10 @@ use futures::FutureExt as _;
+ use gpui::{
+     Action, Animation, AnimationExt, AnyView, App, BorderStyle, ClickEvent, ClipboardItem,
+     CursorStyle, EdgesRefinement, ElementId, Empty, Entity, FocusHandle, Focusable, Hsla, Length,
+-    ListOffset, ListState, ObjectFit, PlatformDisplay, SharedString, StyleRefinement, Subscription,
+-    Task, TextStyle, TextStyleRefinement, UnderlineStyle, WeakEntity, Window, WindowHandle, div,
+-    ease_in_out, img, linear_color_stop, linear_gradient, list, point, pulsating_between,
++    ListOffset, ListState, ModifiersChangedEvent, ObjectFit, PlatformDisplay, SharedString,
++    StyleRefinement, Subscription, Task, TextStyle, TextStyleRefinement, UnderlineStyle,
++    WeakEntity, Window, WindowHandle, div, ease_in_out, img, linear_color_stop, linear_gradient,
++    list, point, pulsating_between,
+ };
+ use language::Buffer;
+ 
+@@ -5280,6 +5281,53 @@ impl AcpThreadView {
+         self.authorize_pending_tool_call(acp::PermissionOptionKind::RejectOnce, window, cx);
+     }
+ 
++    fn handle_modifiers_changed(
++        &mut self,
++        event: &ModifiersChangedEvent,
++        _window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        log::info!(
++            "MRU: Modifiers changed - ctrl:{} alt:{} shift:{} platform:{}",
++            event.modifiers.control,
++            event.modifiers.alt,
++            event.modifiers.shift,
++            event.modifiers.platform
++        );
++
++        if event.modifiers.control && !event.modifiers.alt && !event.modifiers.shift {
++            let database_future = ThreadsDatabase::connect(cx);
++            cx.background_spawn(async move {
++                match database_future.await {
++                    Ok(db) => match db.get_mru_models_with_stats(9).await {
++                        Ok(models) => {
++                            log::info!("MRU Models (Ctrl held):");
++                            for (i, model_info) in models.iter().enumerate() {
++                                log::info!(
++                                    "  Ctrl+{}: {} (used {} times, last: {})",
++                                    i + 1,
++                                    model_info.model_id,
++                                    model_info.use_count,
++                                    model_info.last_used_at
++                                );
++                            }
++                            if models.is_empty() {
++                                log::info!("  (no MRU models recorded yet)");
++                            }
++                        }
++                        Err(e) => {
++                            log::error!("Failed to fetch MRU models: {:?}", e);
++                        }
++                    },
++                    Err(e) => {
++                        log::error!("Failed to connect to database for MRU: {:?}", e);
++                    }
++                }
++            })
++            .detach();
++        }
++    }
++
+     fn authorize_pending_tool_call(
+         &mut self,
+         kind: acp::PermissionOptionKind,
+@@ -7036,6 +7084,7 @@ impl Render for AcpThreadView {
+                 }
+             }))
+             .track_focus(&self.focus_handle)
++            .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
+             .bg(cx.theme().colors().panel_background)
+             .child(match &self.thread_state {
+                 ThreadState::Unauthenticated {

@@ -56,6 +56,10 @@ impl AcpModelSelectorPopover {
             selector.delegate.cycle_favorite_models(window, cx);
         });
     }
+
+    pub fn is_deployed(&self) -> bool {
+        self.menu_handle.is_deployed()
+    }
 }
 
 impl Render for AcpModelSelectorPopover {

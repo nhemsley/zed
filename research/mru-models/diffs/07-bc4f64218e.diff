@@ -1,0 +1,199 @@
+commit bc4f64218ea8330306b4d50937fbbf7759bbff1b
+Author: Nicholas Hemsley <nick.hems@gmail.com>
+Date:   Fri Jan 30 14:26:00 2026 +0800
+
+    feat(agent_ui): Show model selector when holding Ctrl key
+    
+    - Add modal chooser that displays when Ctrl is held down
+    - Shows existing model selector with MRU models at the top
+    - Automatically closes when Ctrl is released without selection
+    - Track state to only close picker if it was opened by Ctrl hold
+    - Support both legacy model_selector and config_options_view paths
+    - Add is_deployed() method to AcpModelSelectorPopover
+    - Add is_category_picker_open() method to ConfigOptionsView
+    
+    Closes: zed-vb7.3
+
+diff --git a/crates/agent/src/thread.rs b/crates/agent/src/thread.rs
+index f70872a765..fd1e85a168 100644
+--- a/crates/agent/src/thread.rs
++++ b/crates/agent/src/thread.rs
+@@ -1225,8 +1225,8 @@ impl Thread {
+             model.provider_id().0
+         );
+ 
+-        // Record model usage in MRU - use just model.id() to match picker's model IDs
+-        let model_id = model.id().0.to_string();
++        // Record model usage in MRU - use provider_id/model_id format to match picker's model IDs
++        let model_id = format!("{}/{}", model.provider_id().0, model.id().0);
+         let database_future = ThreadsDatabase::connect(cx);
+         cx.background_spawn(async move {
+             match database_future.await {
+diff --git a/crates/agent_ui/src/acp/config_options.rs b/crates/agent_ui/src/acp/config_options.rs
+index 387069cd16..29d420e5b6 100644
+--- a/crates/agent_ui/src/acp/config_options.rs
++++ b/crates/agent_ui/src/acp/config_options.rs
+@@ -88,6 +88,22 @@ impl ConfigOptionsView {
+         true
+     }
+ 
++    pub fn is_category_picker_open(
++        &self,
++        category: acp::SessionConfigOptionCategory,
++        cx: &App,
++    ) -> bool {
++        let Some(config_id) = self.first_config_option_id(category) else {
++            return false;
++        };
++
++        let Some(selector) = self.selector_for_config_id(&config_id, cx) else {
++            return false;
++        };
++
++        selector.read(cx).picker_handle.is_deployed()
++    }
++
+     pub fn cycle_category_option(
+         &mut self,
+         category: acp::SessionConfigOptionCategory,
+diff --git a/crates/agent_ui/src/acp/model_selector_popover.rs b/crates/agent_ui/src/acp/model_selector_popover.rs
+index 34b77704cc..93c30732f5 100644
+--- a/crates/agent_ui/src/acp/model_selector_popover.rs
++++ b/crates/agent_ui/src/acp/model_selector_popover.rs
+@@ -56,6 +56,10 @@ impl AcpModelSelectorPopover {
+             selector.delegate.cycle_favorite_models(window, cx);
+         });
+     }
++
++    pub fn is_deployed(&self) -> bool {
++        self.menu_handle.is_deployed()
++    }
+ }
+ 
+ impl Render for AcpModelSelectorPopover {
+diff --git a/crates/agent_ui/src/acp/thread_view.rs b/crates/agent_ui/src/acp/thread_view.rs
+index 6a7520c0a8..0b5b071a31 100644
+--- a/crates/agent_ui/src/acp/thread_view.rs
++++ b/crates/agent_ui/src/acp/thread_view.rs
+@@ -319,6 +319,7 @@ pub struct AcpThreadView {
+     model_selector: Option<Entity<AcpModelSelectorPopover>>,
+     config_options_view: Option<Entity<ConfigOptionsView>>,
+     profile_selector: Option<Entity<ProfileSelector>>,
++    model_selector_opened_by_ctrl: bool,
+     notifications: Vec<WindowHandle<AgentNotification>>,
+     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
+     thread_retry_status: Option<RetryStatus>,
+@@ -494,6 +495,7 @@ impl AcpThreadView {
+             model_selector: None,
+             config_options_view: None,
+             profile_selector: None,
++            model_selector_opened_by_ctrl: false,
+             notifications: Vec::new(),
+             notification_subscriptions: HashMap::default(),
+             list_state: list_state,
+@@ -5341,47 +5343,68 @@ impl AcpThreadView {
+     fn handle_modifiers_changed(
+         &mut self,
+         event: &ModifiersChangedEvent,
+-        _window: &mut Window,
++        window: &mut Window,
+         cx: &mut Context<Self>,
+     ) {
+-        log::info!(
+-            "MRU: Modifiers changed - ctrl:{} alt:{} shift:{} platform:{}",
+-            event.modifiers.control,
+-            event.modifiers.alt,
+-            event.modifiers.shift,
+-            event.modifiers.platform
+-        );
+-
+-        if event.modifiers.control && !event.modifiers.alt && !event.modifiers.shift {
+-            let database_future = ThreadsDatabase::connect(cx);
+-            cx.background_spawn(async move {
+-                match database_future.await {
+-                    Ok(db) => match db.get_mru_models_with_stats(9).await {
+-                        Ok(models) => {
+-                            log::info!("MRU Models (Ctrl held):");
+-                            for (i, model_info) in models.iter().enumerate() {
+-                                log::info!(
+-                                    "  Ctrl+{}: {} (used {} times, last: {})",
+-                                    i + 1,
+-                                    model_info.model_id,
+-                                    model_info.use_count,
+-                                    model_info.last_used_at
+-                                );
+-                            }
+-                            if models.is_empty() {
+-                                log::info!("  (no MRU models recorded yet)");
+-                            }
+-                        }
+-                        Err(e) => {
+-                            log::error!("Failed to fetch MRU models: {:?}", e);
+-                        }
+-                    },
+-                    Err(e) => {
+-                        log::error!("Failed to connect to database for MRU: {:?}", e);
++        let ctrl_held = event.modifiers.control && !event.modifiers.alt && !event.modifiers.shift;
++
++        // When Ctrl is pressed (and only Ctrl), show the model selector
++        if ctrl_held {
++            // Only open if we have a model selector and it's not already open
++            if let Some(model_selector) = &self.model_selector {
++                let is_deployed = model_selector.read(cx).is_deployed();
++                if !is_deployed {
++                    model_selector.update(cx, |selector, cx| {
++                        selector.toggle(window, cx);
++                    });
++                    self.model_selector_opened_by_ctrl = true;
++                    log::info!("MRU: Opened model selector with Ctrl hold");
++                }
++            } else if let Some(config_options_view) = &self.config_options_view {
++                // Handle config_options_view path
++                let is_open = config_options_view
++                    .read(cx)
++                    .is_category_picker_open(acp::SessionConfigOptionCategory::Model, cx);
++                if !is_open {
++                    config_options_view.update(cx, |view, cx| {
++                        view.toggle_category_picker(
++                            acp::SessionConfigOptionCategory::Model,
++                            window,
++                            cx,
++                        );
++                    });
++                    self.model_selector_opened_by_ctrl = true;
++                    log::info!("MRU: Opened config options model picker with Ctrl hold");
++                }
++            }
++        } else {
++            // When Ctrl is released, close the model selector if we opened it
++            if self.model_selector_opened_by_ctrl {
++                if let Some(model_selector) = &self.model_selector {
++                    let is_deployed = model_selector.read(cx).is_deployed();
++                    if is_deployed {
++                        model_selector.update(cx, |selector, cx| {
++                            selector.toggle(window, cx);
++                        });
++                        log::info!("MRU: Closed model selector on Ctrl release");
++                    }
++                } else if let Some(config_options_view) = &self.config_options_view {
++                    let is_open = config_options_view
++                        .read(cx)
++                        .is_category_picker_open(acp::SessionConfigOptionCategory::Model, cx);
++                    if is_open {
++                        config_options_view.update(cx, |view, cx| {
++                            view.toggle_category_picker(
++                                acp::SessionConfigOptionCategory::Model,
++                                window,
++                                cx,
++                            );
++                        });
++                        log::info!("MRU: Closed config options model picker on Ctrl release");
+                     }
+                 }
+-            })
+-            .detach();
++                self.model_selector_opened_by_ctrl = false;
++            }
+         }
+     }
+ 

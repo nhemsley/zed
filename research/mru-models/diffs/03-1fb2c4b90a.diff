@@ -1,0 +1,203 @@
+commit 1fb2c4b90aceabdeaed30951b38f32b50f91b34a
+Author: Nicholas Hemsley <nick.hems@gmail.com>
+Date:   Fri Jan 30 13:42:24 2026 +0800
+
+    Add 'Most Recently Used' section to Change Model Chooser
+    
+    - Fetch MRU models from database on picker initialization
+    - Display MRU section at top of model picker (before Favorites)
+    - Pass MRU model IDs through to info_list_to_picker_entries
+    - Update tests to include empty MRU slice parameter
+
+diff --git a/crates/agent_ui/src/acp/model_selector.rs b/crates/agent_ui/src/acp/model_selector.rs
+index f750d8b10f..3dc9849ab9 100644
+--- a/crates/agent_ui/src/acp/model_selector.rs
++++ b/crates/agent_ui/src/acp/model_selector.rs
+@@ -1,6 +1,7 @@
+ use std::{cmp::Reverse, rc::Rc, sync::Arc};
+ 
+ use acp_thread::{AgentModelIcon, AgentModelInfo, AgentModelList, AgentModelSelector};
++use agent::ThreadsDatabase;
+ use agent_client_protocol::ModelId;
+ use agent_servers::AgentServer;
+ use agent_settings::AgentSettings;
+@@ -56,6 +57,7 @@ pub struct AcpModelPickerDelegate {
+     selected_description: Option<(usize, SharedString, bool)>,
+     selected_model: Option<AgentModelInfo>,
+     favorites: HashSet<ModelId>,
++    mru_model_ids: Vec<ModelId>,
+     _refresh_models_task: Task<()>,
+     _settings_subscription: Subscription,
+     focus_handle: FocusHandle,
+@@ -118,6 +120,36 @@ impl AcpModelPickerDelegate {
+             });
+         let favorites = agent_server.favorite_model_ids(cx);
+ 
++        // Fetch MRU models from database
++        let mru_model_ids = Vec::new();
++        let database_future = ThreadsDatabase::connect(cx);
++        cx.spawn_in(window, {
++            async move |this, cx| {
++                async fn fetch_mru(
++                    this: &WeakEntity<Picker<AcpModelPickerDelegate>>,
++                    database_future: futures::future::Shared<
++                        gpui::Task<Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>,
++                    >,
++                    cx: &mut AsyncWindowContext,
++                ) -> Result<()> {
++                    let db = database_future.await.map_err(|err| anyhow::anyhow!(err))?;
++                    let mru_infos = db.get_mru_models_with_stats(9).await?;
++                    let mru_ids: Vec<ModelId> = mru_infos
++                        .into_iter()
++                        .map(|info| ModelId::new(info.model_id))
++                        .collect();
++
++                    this.update_in(cx, |picker, window, cx| {
++                        picker.delegate.mru_model_ids = mru_ids;
++                        picker.refresh(window, cx);
++                    })
++                }
++
++                fetch_mru(&this, database_future, cx).await.log_err();
++            }
++        })
++        .detach();
++
+         Self {
+             selector,
+             agent_server,
+@@ -128,6 +160,7 @@ impl AcpModelPickerDelegate {
+             selected_index: 0,
+             selected_description: None,
+             favorites,
++            mru_model_ids,
+             _refresh_models_task: refresh_models_task,
+             _settings_subscription: settings_subscription,
+             focus_handle,
+@@ -238,22 +271,24 @@ impl PickerDelegate for AcpModelPickerDelegate {
+         let favorites = self.favorites.clone();
+ 
+         cx.spawn_in(window, async move |this, cx| {
+-            let filtered_models = match this
++            let (filtered_models, mru_model_ids) = match this
+                 .read_with(cx, |this, cx| {
+-                    this.delegate.models.clone().map(move |models| {
++                    let models = this.delegate.models.clone().map(move |models| {
+                         fuzzy_search(models, query, cx.background_executor().clone())
+-                    })
++                    });
++                    let mru_ids = this.delegate.mru_model_ids.clone();
++                    (models, mru_ids)
+                 })
+                 .ok()
+-                .flatten()
+             {
+-                Some(task) => task.await,
+-                None => AgentModelList::Flat(vec![]),
++                Some((Some(task), mru_ids)) => (task.await, mru_ids),
++                Some((None, mru_ids)) => (AgentModelList::Flat(vec![]), mru_ids),
++                None => (AgentModelList::Flat(vec![]), vec![]),
+             };
+ 
+             this.update_in(cx, |this, window, cx| {
+                 this.delegate.filtered_entries =
+-                    info_list_to_picker_entries(filtered_models, &favorites);
++                    info_list_to_picker_entries(filtered_models, &favorites, &mru_model_ids);
+                 // Finds the currently selected model in the list
+                 let new_index = this
+                     .delegate
+@@ -432,6 +467,7 @@ impl PickerDelegate for AcpModelPickerDelegate {
+ fn info_list_to_picker_entries(
+     model_list: AgentModelList,
+     favorites: &HashSet<ModelId>,
++    mru_model_ids: &[ModelId],
+ ) -> Vec<AcpModelPickerEntry> {
+     let mut entries = Vec::new();
+ 
+@@ -440,6 +476,23 @@ fn info_list_to_picker_entries(
+         AgentModelList::Grouped(index_map) => index_map.values().flatten().collect(),
+     };
+ 
++    // Add MRU section
++    let mru_models: Vec<_> = mru_model_ids
++        .iter()
++        .filter_map(|id| all_models.iter().find(|m| &m.id == id).copied())
++        .unique_by(|m| &m.id)
++        .collect();
++
++    let has_mru = !mru_models.is_empty();
++    if has_mru {
++        entries.push(AcpModelPickerEntry::Separator("Most Recently Used".into()));
++        for model in mru_models {
++            let is_favorite = favorites.contains(&model.id);
++            entries.push(AcpModelPickerEntry::Model((*model).clone(), is_favorite));
++        }
++    }
++
++    // Add favorites section
+     let favorite_models: Vec<_> = all_models
+         .iter()
+         .filter(|m| favorites.contains(&m.id))
+@@ -672,7 +725,7 @@ mod tests {
+         ]);
+         let favorites = create_favorites(vec!["zed/gemini"]);
+ 
+-        let entries = info_list_to_picker_entries(models, &favorites);
++        let entries = info_list_to_picker_entries(models, &favorites, &[]);
+ 
+         assert!(matches!(
+             entries.first(),
+@@ -688,7 +741,7 @@ mod tests {
+         let models = create_model_list(vec![("zed", vec!["zed/claude", "zed/gemini"])]);
+         let favorites = create_favorites(vec![]);
+ 
+-        let entries = info_list_to_picker_entries(models, &favorites);
++        let entries = info_list_to_picker_entries(models, &favorites, &[]);
+ 
+         assert!(matches!(
+             entries.first(),
+@@ -704,7 +757,7 @@ mod tests {
+         ]);
+         let favorites = create_favorites(vec!["zed/claude"]);
+ 
+-        let entries = info_list_to_picker_entries(models, &favorites);
++        let entries = info_list_to_picker_entries(models, &favorites, &[]);
+ 
+         for entry in &entries {
+             if let AcpModelPickerEntry::Model(info, is_favorite) = entry {
+@@ -725,7 +778,7 @@ mod tests {
+         ]);
+         let favorites = create_favorites(vec!["zed/gemini", "openai/gpt-5"]);
+ 
+-        let entries = info_list_to_picker_entries(models, &favorites);
++        let entries = info_list_to_picker_entries(models, &favorites, &[]);
+         let model_ids = get_entry_model_ids(&entries);
+ 
+         assert_eq!(model_ids[0], "zed/gemini");
+@@ -746,7 +799,7 @@ mod tests {
+ 
+         let favorites = create_favorites(vec!["zed/claude"]);
+ 
+-        let entries = info_list_to_picker_entries(models, &favorites);
++        let entries = info_list_to_picker_entries(models, &favorites, &[]);
+         let labels = get_entry_labels(&entries);
+ 
+         assert_eq!(
+@@ -786,7 +839,7 @@ mod tests {
+         ]);
+         let favorites = create_favorites(vec!["zed/gemini"]);
+ 
+-        let entries = info_list_to_picker_entries(models, &favorites);
++        let entries = info_list_to_picker_entries(models, &favorites, &[]);
+ 
+         assert!(matches!(
+             entries.first(),
+@@ -832,7 +885,7 @@ mod tests {
+         ]);
+         let favorites = create_favorites(vec!["favorite-model"]);
+ 
+-        let entries = info_list_to_picker_entries(models, &favorites);
++        let entries = info_list_to_picker_entries(models, &favorites, &[]);
+ 
+         for entry in &entries {
+             if let AcpModelPickerEntry::Model(info, is_favorite) = entry {

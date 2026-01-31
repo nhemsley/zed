@@ -1,0 +1,46 @@
+commit 3de4e7bc0749be1f01a7fb4c43540d9e75a2df4f
+Author: Nicholas Hemsley <nick.hems@gmail.com>
+Date:   Fri Jan 30 13:59:57 2026 +0800
+
+    Add logging to MRU model picker for debugging
+
+diff --git a/crates/agent_ui/src/acp/model_selector.rs b/crates/agent_ui/src/acp/model_selector.rs
+index 3dc9849ab9..d86adc6a1f 100644
+--- a/crates/agent_ui/src/acp/model_selector.rs
++++ b/crates/agent_ui/src/acp/model_selector.rs
+@@ -139,6 +139,11 @@ impl AcpModelPickerDelegate {
+                         .map(|info| ModelId::new(info.model_id))
+                         .collect();
+ 
++                    log::info!(
++                        "MRU: Loaded {} MRU model IDs into picker: {:?}",
++                        mru_ids.len(),
++                        mru_ids
++                    );
+                     this.update_in(cx, |picker, window, cx| {
+                         picker.delegate.mru_model_ids = mru_ids;
+                         picker.refresh(window, cx);
+@@ -479,11 +484,22 @@ fn info_list_to_picker_entries(
+     // Add MRU section
+     let mru_models: Vec<_> = mru_model_ids
+         .iter()
+-        .filter_map(|id| all_models.iter().find(|m| &m.id == id).copied())
++        .filter_map(|id| {
++            let found = all_models.iter().find(|m| &m.id == id).copied();
++            if found.is_none() {
++                log::debug!("MRU: Model ID {} not found in available models", id.0);
++            }
++            found
++        })
+         .unique_by(|m| &m.id)
+         .collect();
+ 
+     let has_mru = !mru_models.is_empty();
++    log::info!(
++        "MRU: Building picker with {} MRU models from {} MRU IDs",
++        mru_models.len(),
++        mru_model_ids.len()
++    );
+     if has_mru {
+         entries.push(AcpModelPickerEntry::Separator("Most Recently Used".into()));
+         for model in mru_models {

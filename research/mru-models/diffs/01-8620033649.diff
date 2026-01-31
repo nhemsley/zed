@@ -1,0 +1,165 @@
+commit 862003364916361e6b82a699a2402c0e48f21bd0
+Author: Nicholas Hemsley <nick.hems@gmail.com>
+Date:   Fri Jan 30 12:13:29 2026 +0800
+
+    Add MRU tracking for model usage (zed-vb7.1)
+    
+    - Add model_mru table to ThreadsDatabase schema
+    - Track model usage with timestamp and use count
+    - Record MRU when model is selected in picker
+    - Add get_mru_models method to retrieve top N models
+    - Add comprehensive logging at all nexus points
+    - Make ThreadsDatabase public for external access
+    
+    This implements task zed-vb7.1: Add MRU tracking for model usage
+
+diff --git a/crates/agent/src/db.rs b/crates/agent/src/db.rs
+index 3425997524..a8331edfe9 100644
+--- a/crates/agent/src/db.rs
++++ b/crates/agent/src/db.rs
+@@ -301,7 +301,7 @@ impl Column for DataType {
+     }
+ }
+ 
+-pub(crate) struct ThreadsDatabase {
++pub struct ThreadsDatabase {
+     executor: BackgroundExecutor,
+     connection: Arc<Mutex<Connection>>,
+ }
+@@ -364,6 +364,15 @@ impl ThreadsDatabase {
+         "})?()
+         .map_err(|e| anyhow!("Failed to create threads table: {}", e))?;
+ 
++        connection.exec(indoc! {"
++            CREATE TABLE IF NOT EXISTS model_mru (
++                model_id TEXT PRIMARY KEY,
++                last_used_at TEXT NOT NULL,
++                use_count INTEGER NOT NULL DEFAULT 1
++            )
++        "})?()
++        .map_err(|e| anyhow!("Failed to create model_mru table: {}", e))?;
++
+         let db = Self {
+             executor,
+             connection: Arc::new(Mutex::new(connection)),
+@@ -498,6 +507,55 @@ impl ThreadsDatabase {
+             Ok(())
+         })
+     }
++
++    pub fn record_model_usage(&self, model_id: String) -> Task<Result<()>> {
++        let connection = self.connection.clone();
++
++        self.executor.spawn(async move {
++            log::info!("MRU: Recording model usage: {}", model_id);
++            let connection = connection.lock();
++            let now = Utc::now().to_rfc3339();
++
++            let mut upsert = connection.exec_bound::<(String, String, String)>(indoc! {"
++                INSERT INTO model_mru (model_id, last_used_at, use_count)
++                VALUES (?, ?, 1)
++                ON CONFLICT(model_id) DO UPDATE SET
++                    last_used_at = ?,
++                    use_count = use_count + 1
++            "})?;
++
++            upsert((model_id.clone(), now.clone(), now))?;
++            log::info!("MRU: Successfully recorded model usage: {}", model_id);
++
++            Ok(())
++        })
++    }
++
++    pub fn get_mru_models(&self, limit: usize) -> Task<Result<Vec<String>>> {
++        let connection = self.connection.clone();
++
++        self.executor.spawn(async move {
++            log::debug!("MRU: Fetching top {} MRU models", limit);
++            let connection = connection.lock();
++
++            // Note: sqlez doesn't support binding the LIMIT directly in the query,
++            // so we'll select all and limit in Rust
++            let mut select_all = connection.select_bound::<(), (String, String, i64)>(indoc! {"
++                SELECT model_id, last_used_at, use_count FROM model_mru
++                ORDER BY last_used_at DESC
++            "})?;
++
++            let rows = select_all(())?;
++            let model_ids: Vec<String> = rows
++                .into_iter()
++                .take(limit)
++                .map(|(model_id, _, _)| model_id)
++                .collect();
++
++            log::info!("MRU: Retrieved {} models: {:?}", model_ids.len(), model_ids);
++            Ok(model_ids)
++        })
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/agent_ui/src/acp/model_selector.rs b/crates/agent_ui/src/acp/model_selector.rs
+index e2f2bee9c4..5048fbaf28 100644
+--- a/crates/agent_ui/src/acp/model_selector.rs
++++ b/crates/agent_ui/src/acp/model_selector.rs
+@@ -1,6 +1,7 @@
+ use std::{cmp::Reverse, rc::Rc, sync::Arc};
+ 
+ use acp_thread::{AgentModelIcon, AgentModelInfo, AgentModelList, AgentModelSelector};
++use agent::ThreadsDatabase;
+ use agent_client_protocol::ModelId;
+ use agent_servers::AgentServer;
+ use agent_settings::AgentSettings;
+@@ -280,15 +281,20 @@ impl PickerDelegate for AcpModelPickerDelegate {
+         if let Some(AcpModelPickerEntry::Model(model_info, _)) =
+             self.filtered_entries.get(self.selected_index)
+         {
++            // Clone model_id early to avoid borrow checker issues
++            let model_id = model_info.id.clone();
++            let model_id_str = model_id.to_string();
++            log::info!("MRU: Model selected in picker: {}", model_id_str);
++
+             if window.modifiers().secondary() {
+                 let default_model = self.agent_server.default_model(cx);
+-                let is_default = default_model.as_ref() == Some(&model_info.id);
++                let is_default = default_model.as_ref() == Some(&model_id);
+ 
+                 self.agent_server.set_default_model(
+                     if is_default {
+                         None
+                     } else {
+-                        Some(model_info.id.clone())
++                        Some(model_id.clone())
+                     },
+                     self.fs.clone(),
+                     cx,
+@@ -296,12 +302,28 @@ impl PickerDelegate for AcpModelPickerDelegate {
+             }
+ 
+             self.selector
+-                .select_model(model_info.id.clone(), cx)
++                .select_model(model_id.clone(), cx)
+                 .detach_and_log_err(cx);
+             self.selected_model = Some(model_info.clone());
+             let current_index = self.selected_index;
+             self.set_selected_index(current_index, window, cx);
+ 
++            // Track model usage in MRU
++            log::debug!("MRU: Connecting to database to track model usage");
++            let database_future = ThreadsDatabase::connect(cx);
++            cx.background_spawn(async move {
++                match database_future.await {
++                    Ok(db) => {
++                        log::debug!("MRU: Database connected, recording usage");
++                        db.record_model_usage(model_id_str).await.log_err();
++                    }
++                    Err(e) => {
++                        log::error!("MRU: Failed to connect to database: {:?}", e);
++                    }
++                }
++            })
++            .detach();
++
+             cx.emit(DismissEvent);
+         }
+     }

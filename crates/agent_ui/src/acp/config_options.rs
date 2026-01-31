@@ -88,6 +88,22 @@ impl ConfigOptionsView {
         true
     }
 
+    pub fn is_category_picker_open(
+        &self,
+        category: acp::SessionConfigOptionCategory,
+        cx: &App,
+    ) -> bool {
+        let Some(config_id) = self.first_config_option_id(category) else {
+            return false;
+        };
+
+        let Some(selector) = self.selector_for_config_id(&config_id, cx) else {
+            return false;
+        };
+
+        selector.read(cx).picker_handle.is_deployed()
+    }
+
     pub fn cycle_category_option(
         &mut self,
         category: acp::SessionConfigOptionCategory,

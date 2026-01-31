@@ -1,0 +1,25 @@
+commit 20cb60cf948719985d76d8bf668a29b30572575d
+Author: Nicholas Hemsley <nick.hems@gmail.com>
+Date:   Fri Jan 30 15:24:41 2026 +0800
+
+    Fix MRU model ordering to prioritize use count over recency
+    
+    The MRU query was only sorting by last_used_at DESC, but should
+    prioritize by use_count DESC first to ensure frequently used models
+    appear before recently but infrequently used models.
+    
+    Closes zed-vb7.5
+
+diff --git a/crates/agent/src/db.rs b/crates/agent/src/db.rs
+index e4ee2bf014..0b2bcf92ba 100644
+--- a/crates/agent/src/db.rs
++++ b/crates/agent/src/db.rs
+@@ -573,7 +573,7 @@ impl ThreadsDatabase {
+ 
+             let mut select_all = connection.select_bound::<(), (String, String, i64)>(indoc! {"
+                 SELECT model_id, last_used_at, use_count FROM model_mru
+-                ORDER BY last_used_at DESC
++                ORDER BY use_count DESC, last_used_at DESC
+             "})?;
+ 
+             let rows = select_all(())?;
