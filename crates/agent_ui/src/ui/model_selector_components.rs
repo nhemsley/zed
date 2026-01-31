@@ -51,6 +51,7 @@ pub struct ModelSelectorListItem {
     is_selected: bool,
     is_focused: bool,
     is_favorite: bool,
+    mru_index: Option<usize>,
     on_toggle_favorite: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
 }
 
@@ -63,6 +64,7 @@ impl ModelSelectorListItem {
             is_selected: false,
             is_focused: false,
             is_favorite: false,
+            mru_index: None,
             on_toggle_favorite: None,
         }
     }
@@ -89,6 +91,11 @@ impl ModelSelectorListItem {
 
     pub fn is_favorite(mut self, is_favorite: bool) -> Self {
         self.is_favorite = is_favorite;
+        self
+    }
+
+    pub fn mru_index(mut self, mru_index: Option<usize>) -> Self {
+        self.mru_index = mru_index;
         self
     }
 
@@ -119,6 +126,13 @@ impl RenderOnce for ModelSelectorListItem {
                 h_flex()
                     .w_full()
                     .gap_1p5()
+                    .when_some(self.mru_index, |this, idx| {
+                        this.child(
+                            Label::new(format!("{}", idx))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    })
                     .when_some(self.icon, |this, icon| {
                         this.child(
                             match icon {

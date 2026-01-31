@@ -326,7 +326,19 @@ pub mod settings_profile_selector {
 }
 
 pub mod agent {
-    use gpui::actions;
+    use gpui::{Action, actions};
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    /// Selects an MRU (Most Recently Used) model by index and sends/queues the current message.
+    /// Index 1-9 corresponds to Ctrl+Alt+1 through Ctrl+Alt+9 keybindings.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = agent)]
+    #[serde(deny_unknown_fields)]
+    pub struct SelectMruModel {
+        /// The 1-based index of the MRU model to select (1-9).
+        pub index: usize,
+    }
 
     actions!(
         agent,

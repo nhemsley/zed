@@ -343,6 +343,20 @@
     },
   },
   {
+    "context": "AcpThread",
+    "bindings": {
+      "ctrl-alt-1": ["agent::SelectMruModel", { "index": 1 }],
+      "ctrl-alt-2": ["agent::SelectMruModel", { "index": 2 }],
+      "ctrl-alt-3": ["agent::SelectMruModel", { "index": 3 }],
+      "ctrl-alt-4": ["agent::SelectMruModel", { "index": 4 }],
+      "ctrl-alt-5": ["agent::SelectMruModel", { "index": 5 }],
+      "ctrl-alt-6": ["agent::SelectMruModel", { "index": 6 }],
+      "ctrl-alt-7": ["agent::SelectMruModel", { "index": 7 }],
+      "ctrl-alt-8": ["agent::SelectMruModel", { "index": 8 }],
+      "ctrl-alt-9": ["agent::SelectMruModel", { "index": 9 }],
+    },
+  },
+  {
     "context": "AcpThread > ModeSelector",
     "bindings": {
       "cmd-enter": "menu::Confirm",

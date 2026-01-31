@@ -5,7 +5,7 @@ use acp_thread::{
 };
 use acp_thread::{AgentConnection, Plan};
 use action_log::{ActionLog, ActionLogTelemetry};
-use agent::{DbThreadMetadata, NativeAgentServer, SharedThread, ThreadStore};
+use agent::{DbThreadMetadata, NativeAgentServer, SharedThread, ThreadStore, ThreadsDatabase};
 use agent_client_protocol::{self as acp, PromptCapabilities};
 use agent_servers::{AgentServer, AgentServerDelegate};
 use agent_settings::{AgentProfileId, AgentSettings, CompletionMode};
@@ -55,7 +55,7 @@ use ui::{
 use util::defer;
 use util::{ResultExt, size::format_file_size, time::duration_alt_display};
 use workspace::{CollaboratorId, NewTerminal, Toast, Workspace, notifications::NotificationId};
-use zed_actions::agent::{Chat, ToggleModelSelector};
+use zed_actions::agent::{Chat, SelectMruModel, ToggleModelSelector};
 use zed_actions::assistant::OpenRulesLibrary;
 
 use super::config_options::ConfigOptionsView;
@@ -1574,6 +1574,81 @@ impl AcpThreadView {
                 });
                 cx.notify();
             })?;
+            Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn select_mru_model(
+        &mut self,
+        action: &SelectMruModel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = action.index;
+        if index < 1 || index > 9 {
+            return;
+        }
+
+        let Some(thread) = self.thread().cloned() else {
+            return;
+        };
+
+        let Some(model_selector) = thread
+            .read(cx)
+            .connection()
+            .model_selector(thread.read(cx).session_id())
+        else {
+            log::info!("MRU: No model selector available");
+            return;
+        };
+
+        let database_future = ThreadsDatabase::connect(cx);
+
+        cx.spawn_in(window, async move |this, cx| {
+            let db = database_future.await.map_err(|err| anyhow::anyhow!(err))?;
+            let mru_models = db.get_mru_models_with_stats(9).await?;
+
+            let Some(mru_model) = mru_models.get(index - 1) else {
+                log::info!("MRU: No model at index {}", index);
+                return Ok::<(), anyhow::Error>(());
+            };
+
+            // Skip invalid model IDs (old format without provider prefix)
+            if !mru_model.model_id.contains('/') {
+                log::warn!(
+                    "MRU: Skipping invalid model ID at index {}: {}",
+                    index,
+                    mru_model.model_id
+                );
+                return Ok(());
+            }
+
+            let model_id = acp::ModelId::new(mru_model.model_id.clone());
+            log::info!(
+                "MRU: Selecting model at index {}: {}",
+                index,
+                mru_model.model_id
+            );
+
+            // Select the model
+            let select_task =
+                this.update(cx, |_this, cx| model_selector.select_model(model_id, cx))?;
+
+            if let Err(e) = select_task.await {
+                log::error!(
+                    "MRU: Failed to select model '{}': {}. This may be an old MRU entry with invalid format.",
+                    mru_model.model_id,
+                    e
+                );
+                return Ok(());
+            }
+
+            // Queue/send the message if there's content
+            this.update_in(cx, |this, window, cx| {
+                this.queue_message(window, cx);
+            })?;
+
             Ok(())
         })
         .detach_and_log_err(cx);
@@ -6945,6 +7020,7 @@ impl Render for AcpThreadView {
             .on_action(cx.listener(Self::allow_always))
             .on_action(cx.listener(Self::allow_once))
             .on_action(cx.listener(Self::reject_once))
+            .on_action(cx.listener(Self::select_mru_model))
             .on_action(cx.listener(|this, _: &SendNextQueuedMessage, window, cx| {
                 this.send_queued_message_at_index(0, true, window, cx);
             }))
