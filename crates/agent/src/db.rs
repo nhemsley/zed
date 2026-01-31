@@ -23,6 +23,14 @@ pub type DbMessage = crate::Message;
 pub type DbSummary = crate::legacy_thread::DetailedSummaryState;
 pub type DbLanguageModel = crate::legacy_thread::SerializedLanguageModel;
 
+/// Information about a model's usage in the MRU (Most Recently Used) list.
+#[derive(Debug, Clone)]
+pub struct ModelMruInfo {
+    pub model_id: String,
+    pub last_used_at: String,
+    pub use_count: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbThreadMetadata {
     pub id: acp::SessionId,
@@ -301,7 +309,7 @@ impl Column for DataType {
     }
 }
 
-pub(crate) struct ThreadsDatabase {
+pub struct ThreadsDatabase {
     executor: BackgroundExecutor,
     connection: Arc<Mutex<Connection>>,
 }
@@ -363,6 +371,15 @@ impl ThreadsDatabase {
             )
         "})?()
         .map_err(|e| anyhow!("Failed to create threads table: {}", e))?;
+
+        connection.exec(indoc! {"
+            CREATE TABLE IF NOT EXISTS model_mru (
+                model_id TEXT PRIMARY KEY,
+                last_used_at TEXT NOT NULL,
+                use_count INTEGER NOT NULL DEFAULT 1
+            )
+        "})?()
+        .map_err(|e| anyhow!("Failed to create model_mru table: {}", e))?;
 
         let db = Self {
             executor,
@@ -496,6 +513,95 @@ impl ThreadsDatabase {
             delete(())?;
 
             Ok(())
+        })
+    }
+
+    /// Records that a model was used, updating its MRU entry.
+    /// If the model doesn't exist in the table, it's inserted with use_count=1.
+    /// If it exists, use_count is incremented and last_used_at is updated.
+    pub fn record_model_usage(&self, model_id: String) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+
+        self.executor.spawn(async move {
+            log::info!("MRU: Recording model usage: {}", model_id);
+            let connection = connection.lock();
+            let now = Utc::now().to_rfc3339();
+
+            let mut upsert = connection.exec_bound::<(String, String, String)>(indoc! {"
+                INSERT INTO model_mru (model_id, last_used_at, use_count)
+                VALUES (?, ?, 1)
+                ON CONFLICT(model_id) DO UPDATE SET
+                    last_used_at = ?,
+                    use_count = use_count + 1
+            "})?;
+
+            upsert((model_id.clone(), now.clone(), now))?;
+            log::info!("MRU: Successfully recorded model usage: {}", model_id);
+
+            Ok(())
+        })
+    }
+
+    /// Returns the top N most recently used model IDs, ordered by use count (descending),
+    /// then by last used time (descending).
+    pub fn get_mru_models(&self, limit: usize) -> Task<Result<Vec<String>>> {
+        let connection = self.connection.clone();
+
+        self.executor.spawn(async move {
+            log::debug!("MRU: Fetching top {} MRU models", limit);
+            let connection = connection.lock();
+
+            let mut select_all = connection.select_bound::<(), (String, String, i64)>(indoc! {"
+                SELECT model_id, last_used_at, use_count FROM model_mru
+                ORDER BY use_count DESC, last_used_at DESC
+            "})?;
+
+            let rows = select_all(())?;
+            let model_ids: Vec<String> = rows
+                .into_iter()
+                .take(limit)
+                .map(|(model_id, _, _)| model_id)
+                .collect();
+
+            log::info!("MRU: Retrieved {} models: {:?}", model_ids.len(), model_ids);
+            Ok(model_ids)
+        })
+    }
+
+    /// Returns the top N most recently used models with full statistics,
+    /// ordered by use count (descending), then by last used time (descending).
+    pub fn get_mru_models_with_stats(&self, limit: usize) -> Task<Result<Vec<ModelMruInfo>>> {
+        let connection = self.connection.clone();
+
+        self.executor.spawn(async move {
+            log::debug!("MRU: Fetching top {} MRU models with stats", limit);
+            let connection = connection.lock();
+
+            let mut select_all = connection.select_bound::<(), (String, String, i64)>(indoc! {"
+                SELECT model_id, last_used_at, use_count FROM model_mru
+                ORDER BY use_count DESC, last_used_at DESC
+            "})?;
+
+            let rows = select_all(())?;
+            let model_infos: Vec<ModelMruInfo> = rows
+                .into_iter()
+                .take(limit)
+                .map(|(model_id, last_used_at, use_count)| ModelMruInfo {
+                    model_id,
+                    last_used_at,
+                    use_count,
+                })
+                .collect();
+
+            log::info!(
+                "MRU: Retrieved {} models with stats: {:?}",
+                model_infos.len(),
+                model_infos
+                    .iter()
+                    .map(|m| format!("{}({})", m.model_id, m.use_count))
+                    .collect::<Vec<_>>()
+            );
+            Ok(model_infos)
         })
     }
 }
