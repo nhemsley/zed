@@ -52,6 +52,10 @@ pub struct DbThread {
     pub profile: Option<AgentProfileId>,
     #[serde(default)]
     pub imported: bool,
+    #[serde(default)]
+    pub focused_context_mode: Option<bool>,
+    #[serde(default)]
+    pub num_messages: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +97,8 @@ impl SharedThread {
             completion_mode: self.completion_mode,
             profile: None,
             imported: true,
+            focused_context_mode: None,
+            num_messages: None,
         }
     }
 
@@ -267,6 +273,8 @@ impl DbThread {
             completion_mode: thread.completion_mode,
             profile: thread.profile,
             imported: false,
+            focused_context_mode: None,
+            num_messages: None,
         })
     }
 }
@@ -561,6 +569,8 @@ mod tests {
             completion_mode: None,
             profile: None,
             imported: false,
+            focused_context_mode: None,
+            num_messages: None,
         }
     }
 

@@ -60,6 +60,7 @@ use zed_actions::assistant::OpenRulesLibrary;
 
 use super::config_options::ConfigOptionsView;
 use super::entry_view_state::EntryViewState;
+use super::focused_context_panel;
 use crate::acp::AcpModelSelectorPopover;
 use crate::acp::ModeSelector;
 use crate::acp::entry_view_state::{EntryViewEvent, ViewEvent};
@@ -318,6 +319,8 @@ pub struct AcpThreadView {
     model_selector: Option<Entity<AcpModelSelectorPopover>>,
     config_options_view: Option<Entity<ConfigOptionsView>>,
     profile_selector: Option<Entity<ProfileSelector>>,
+    focused_context_panel: Option<Entity<focused_context_panel::FocusedContextPanel>>,
+    _focused_context_subscription: Option<Subscription>,
     notifications: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
     thread_retry_status: Option<RetryStatus>,
@@ -493,6 +496,8 @@ impl AcpThreadView {
             model_selector: None,
             config_options_view: None,
             profile_selector: None,
+            focused_context_panel: None,
+            _focused_context_subscription: None,
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
             list_state: list_state,
@@ -782,6 +787,20 @@ impl AcpThreadView {
                                 )
                             })
                         });
+
+                        this.focused_context_panel = this.thread().map(|thread| {
+                            cx.new(|cx| {
+                                focused_context_panel::FocusedContextPanel::new(thread.clone(), cx)
+                            })
+                        });
+                        this._focused_context_subscription =
+                            this.focused_context_panel.as_ref().map(|panel| {
+                                cx.subscribe_in(
+                                    panel,
+                                    window,
+                                    Self::handle_focused_context_panel_event,
+                                )
+                            });
 
                         this.message_editor.focus_handle(cx).focus(window, cx);
 
@@ -2320,6 +2339,38 @@ impl AcpThreadView {
             .detach_and_log_err(cx);
     }
 
+    fn set_context_from_entry(&mut self, entry_ix: usize, cx: &mut Context<Self>) {
+        let Some(thread) = self.thread() else {
+            return;
+        };
+
+        let entries = thread.read(cx).entries();
+        let total = thread.read(cx).message_count();
+        if total == 0 {
+            return;
+        }
+
+        // Count UserMessage/AssistantMessage entries before entry_ix
+        let mut message_index = 0;
+        for (i, entry) in entries.iter().enumerate() {
+            if i >= entry_ix {
+                break;
+            }
+            match entry {
+                AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_) => {
+                    message_index += 1;
+                }
+                AgentThreadEntry::ToolCall(_) => {}
+            }
+        }
+
+        let num_messages_from_here = total.saturating_sub(message_index).max(1);
+
+        thread.update(cx, |thread, cx| {
+            thread.set_num_messages(Some(num_messages_from_here), cx);
+        });
+    }
+
     fn render_entry(
         &self,
         entry_ix: usize,
@@ -2408,33 +2459,53 @@ impl AcpThreadView {
                         })
                     }))
                     .child(
-                        div()
-                            .relative()
+                        h_flex()
+                            .gap_2()
+                            .items_center()
                             .child(
                                 div()
-                                    .py_3()
-                                    .px_2()
-                                    .rounded_md()
-                                    .shadow_md()
-                                    .bg(cx.theme().colors().editor_background)
                                     .border_1()
-                                    .when(is_indented, |this| {
-                                        this.py_2().px_2().shadow_sm()
-                                    })
-                                    .when(editing && !editor_focus, |this| this.border_dashed())
                                     .border_color(cx.theme().colors().border)
-                                    .map(|this|{
-                                        if editing && editor_focus {
-                                            this.border_color(focus_border)
-                                        } else if message.id.is_some() {
-                                            this.hover(|s| s.border_color(focus_border.opacity(0.8)))
-                                        } else {
-                                            this
-                                        }
-                                    })
-                                    .text_xs()
-                                    .child(editor.clone().into_any_element())
+                                    .rounded_md()
+                                    .child(
+                                        IconButton::new(("context-from-here", entry_ix), IconName::ArrowRight)
+                                            .icon_size(IconSize::Small)
+                                            .icon_color(Color::Muted)
+                                            .tooltip(Tooltip::text("Set context window to start from this message"))
+                                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                                this.set_context_from_entry(entry_ix, cx);
+                                            }))
+                                    )
                             )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .relative()
+                                    .child(
+                                        div()
+                                            .py_3()
+                                            .px_2()
+                                            .rounded_md()
+                                            .shadow_md()
+                                            .bg(cx.theme().colors().editor_background)
+                                            .border_1()
+                                            .when(is_indented, |this| {
+                                                this.py_2().px_2().shadow_sm()
+                                            })
+                                            .when(editing && !editor_focus, |this| this.border_dashed())
+                                            .border_color(cx.theme().colors().border)
+                                            .map(|this|{
+                                                if editing && editor_focus {
+                                                    this.border_color(focus_border)
+                                                } else if message.id.is_some() {
+                                                    this.hover(|s| s.border_color(focus_border.opacity(0.8)))
+                                                } else {
+                                                    this
+                                                }
+                                            })
+                                            .text_xs()
+                                            .child(editor.clone().into_any_element())
+                                    )
                             .when(editor_focus, |this| {
                                 let base_container = h_flex()
                                     .absolute()
@@ -2511,7 +2582,8 @@ impl AcpThreadView {
                                             )
                                     )
                                 }
-                            }),
+                            })
+                            )
                     )
                     .into_any()
             }
@@ -5133,6 +5205,7 @@ impl AcpThreadView {
                             .gap_0p5()
                             .child(self.render_add_context_button(cx))
                             .child(self.render_follow_toggle(cx))
+                            .children(self.render_focused_context_mode_toggle(cx))
                             .children(self.render_burn_mode_toggle(cx)),
                     )
                     .child(
@@ -5302,6 +5375,44 @@ impl AcpThreadView {
         );
 
         Some(())
+    }
+
+    fn render_focused_context_mode_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let thread = self.thread()?;
+        let focused_context_mode_enabled = thread.read(cx).focused_context_mode();
+
+        Some(
+            IconButton::new("focused-context-mode", IconName::ZedFocusedContext)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .toggle_state(focused_context_mode_enabled)
+                .selected_icon_color(Color::Accent)
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.toggle_focused_context_mode(cx);
+                }))
+                .tooltip(move |_window, cx| {
+                    Tooltip::with_meta(
+                        if focused_context_mode_enabled {
+                            "Focused Context (On)"
+                        } else {
+                            "Focused Context (Off)"
+                        },
+                        None,
+                        "Limits context to recent messages only",
+                        cx,
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn toggle_focused_context_mode(&mut self, cx: &mut Context<Self>) {
+        if let Some(thread) = self.thread() {
+            thread.update(cx, |thread, cx| {
+                let current = thread.focused_context_mode();
+                thread.set_focused_context_mode(!current, cx);
+            });
+        }
     }
 
     fn render_burn_mode_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -5759,6 +5870,40 @@ impl AcpThreadView {
     fn scroll_to_top(&mut self, cx: &mut Context<Self>) {
         self.list_state.scroll_to(ListOffset::default());
         cx.notify();
+    }
+
+    fn handle_focused_context_panel_event(
+        &mut self,
+        _panel: &Entity<focused_context_panel::FocusedContextPanel>,
+        event: &focused_context_panel::FocusedContextPanelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            focused_context_panel::FocusedContextPanelEvent::ScrollToMessage {
+                message_index,
+                total_messages,
+            } => {
+                let Some(thread) = self.thread() else {
+                    return;
+                };
+
+                let total_entries = thread.read(cx).entries().len();
+                if *total_messages == 0 || total_entries == 0 {
+                    return;
+                }
+
+                let fraction = *message_index as f64 / *total_messages as f64;
+                let target_entry_index = (fraction * total_entries as f64).round() as usize;
+                let target_entry_index = target_entry_index.min(total_entries.saturating_sub(1));
+
+                self.list_state.scroll_to(ListOffset {
+                    item_ix: target_entry_index,
+                    offset_in_item: px(0.0),
+                });
+                cx.notify();
+            }
+        }
     }
 
     fn scroll_to_most_recent_user_prompt(&mut self, cx: &mut Context<Self>) {
@@ -7103,6 +7248,7 @@ impl Render for AcpThreadView {
                 }
                 _ => this,
             })
+            .children(self.focused_context_panel.clone())
             .children(self.render_thread_retry_status_callout(window, cx))
             .when(self.show_codex_windows_warning, |this| {
                 this.child(self.render_codex_windows_warning(cx))
