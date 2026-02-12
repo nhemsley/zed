@@ -347,7 +347,6 @@ impl NativeAgent {
             )
         });
 
-        let thread_for_beads = thread_handle.clone();
         let subscriptions = vec![
             cx.observe_release(&acp_thread, |this, acp_thread, _cx| {
                 this.sessions.remove(acp_thread.session_id());
@@ -356,19 +355,6 @@ impl NativeAgent {
             cx.subscribe(&thread_handle, Self::handle_thread_token_usage_updated),
             cx.observe(&thread_handle, move |this, thread, cx| {
                 this.save_thread(thread, cx)
-            }),
-            cx.observe(&acp_thread, move |_this, acp_thread, cx| {
-                let acp = acp_thread.read(cx);
-                let beads_mode = acp.beads_mode();
-                let num_messages = acp.num_messages();
-                thread_for_beads.update(cx, |thread, cx| {
-                    if thread.beads_mode() != beads_mode {
-                        thread.set_beads_mode(beads_mode, cx);
-                    }
-                    if thread.num_messages() != num_messages {
-                        thread.set_num_messages(num_messages, cx);
-                    }
-                });
             }),
         ];
 
@@ -1370,6 +1356,35 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
 
     fn telemetry(&self) -> Option<Rc<dyn acp_thread::AgentTelemetry>> {
         Some(Rc::new(self.clone()) as Rc<dyn acp_thread::AgentTelemetry>)
+    }
+
+    fn set_beads_mode(&self, session_id: &acp::SessionId, enabled: bool, cx: &mut App) {
+        let thread = self
+            .0
+            .read(cx)
+            .sessions
+            .get(session_id)
+            .map(|session| session.thread.clone());
+        if let Some(thread) = thread {
+            thread.update(cx, |thread, cx| thread.set_beads_mode(enabled, cx));
+        }
+    }
+
+    fn set_num_messages(
+        &self,
+        session_id: &acp::SessionId,
+        num_messages: Option<usize>,
+        cx: &mut App,
+    ) {
+        let thread = self
+            .0
+            .read(cx)
+            .sessions
+            .get(session_id)
+            .map(|session| session.thread.clone());
+        if let Some(thread) = thread {
+            thread.update(cx, |thread, cx| thread.set_num_messages(num_messages, cx));
+        }
     }
 
     fn into_any(self: Rc<Self>) -> Rc<dyn Any> {

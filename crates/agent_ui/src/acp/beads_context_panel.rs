@@ -328,7 +328,7 @@ impl BeadsContextPanel {
                     .bg(bar_color)
                     .rounded_t(px(1.0))
                     .cursor(CursorStyle::PointingHand)
-                    .tooltip(Tooltip::text(tooltip_text.clone()))
+                    .tooltip(Tooltip::text(tooltip_text))
                     .on_click(
                         cx.listener(move |this, event: &gpui::ClickEvent, _window, cx| {
                             let total = this.thread.read(cx).message_count();

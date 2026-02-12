@@ -1186,6 +1186,12 @@ impl AcpThread {
             self.message_count(),
         );
         self.beads_mode = enabled;
+        self.connection
+            .set_beads_mode(&self.session_id, enabled, cx);
+        if let Some(num_messages) = self.num_messages {
+            self.connection
+                .set_num_messages(&self.session_id, Some(num_messages), cx);
+        }
         cx.notify();
     }
 
@@ -1199,6 +1205,8 @@ impl AcpThread {
     /// None means include all entries.
     pub fn set_num_messages(&mut self, num_messages: Option<usize>, cx: &mut Context<Self>) {
         self.num_messages = num_messages;
+        self.connection
+            .set_num_messages(&self.session_id, num_messages, cx);
         cx.notify();
     }
 
