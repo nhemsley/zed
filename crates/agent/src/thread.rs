@@ -2248,8 +2248,8 @@ impl Thread {
             .is_some_and(|turn| turn.tools.contains_key(name))
     }
 
-    /// Dumps the LLM request messages to temp files for debugging.
-    /// Files are written to /tmp/zed-context-dump/{thread_id}/{timestamp}/
+    /// Dumps the LLM request messages to a single file for debugging.
+    /// File is written to /tmp/zed-context-dump/{thread_id}/context_{timestamp}.md
     fn dump_context_to_files(
         messages: &[LanguageModelRequestMessage],
         thread_id: &acp::SessionId,
@@ -2258,24 +2258,29 @@ impl Thread {
         use std::io::Write;
 
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-        let dump_dir = PathBuf::from("/tmp/zed-context-dump")
-            .join(thread_id.to_string())
-            .join(timestamp.to_string());
-
+        let dump_dir = PathBuf::from("/tmp/zed-context-dump").join(thread_id.to_string());
         fs::create_dir_all(&dump_dir)?;
+
+        let filename = format!("context_{}.md", timestamp);
+        let filepath = dump_dir.join(&filename);
+        let mut file = fs::File::create(&filepath)?;
+
+        writeln!(file, "# LLM Context Dump")?;
+        writeln!(file, "Thread: {}", thread_id)?;
+        writeln!(file, "Timestamp: {}", timestamp)?;
+        writeln!(file, "Total messages: {}", messages.len())?;
+        writeln!(file)?;
+        writeln!(file, "==========================================")?;
+        writeln!(file)?;
 
         for (i, msg) in messages.iter().enumerate() {
             let role_str = match msg.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::System => "system",
+                Role::User => "USER",
+                Role::Assistant => "ASSISTANT",
+                Role::System => "SYSTEM",
             };
-            let filename = format!("{:03}_{}.md", i, role_str);
-            let filepath = dump_dir.join(&filename);
 
-            let mut file = fs::File::create(&filepath)?;
-
-            writeln!(file, "# Message {} ({})", i, role_str)?;
+            writeln!(file, "## MESSAGE {} [{}]", i, role_str)?;
             writeln!(file)?;
 
             for content in &msg.content {
@@ -2287,14 +2292,14 @@ impl Thread {
                         writeln!(file, "[Image: ~{} tokens]", img.estimate_tokens())?;
                     }
                     language_model::MessageContent::ToolUse(tu) => {
-                        writeln!(file, "## Tool Use: {}", tu.name)?;
+                        writeln!(file, "### Tool Use: {}", tu.name)?;
                         writeln!(file, "ID: {}", tu.id)?;
                         writeln!(file, "```json")?;
                         writeln!(file, "{}", tu.raw_input)?;
                         writeln!(file, "```")?;
                     }
                     language_model::MessageContent::ToolResult(tr) => {
-                        writeln!(file, "## Tool Result: {}", tr.tool_use_id)?;
+                        writeln!(file, "### Tool Result: {}", tr.tool_use_id)?;
                         if tr.is_error {
                             writeln!(file, "**ERROR**")?;
                         }
@@ -2308,7 +2313,7 @@ impl Thread {
                         }
                     }
                     language_model::MessageContent::Thinking { text, .. } => {
-                        writeln!(file, "## Thinking")?;
+                        writeln!(file, "### Thinking")?;
                         writeln!(file, "{}", text)?;
                     }
                     language_model::MessageContent::RedactedThinking(_) => {
@@ -2317,9 +2322,12 @@ impl Thread {
                 }
                 writeln!(file)?;
             }
+
+            writeln!(file, "==========================================")?;
+            writeln!(file)?;
         }
 
-        log::info!("Context dumped to: {}", dump_dir.display());
+        log::info!("Context dumped to: {}", filepath.display());
         Ok(())
     }
 
