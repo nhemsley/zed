@@ -216,7 +216,7 @@ impl BeadsContextPanel {
             )
     }
 
-    fn message_preview(message: &Message, max_len: usize) -> String {
+    fn message_preview(message: &Message, max_words: usize) -> String {
         let text = match message {
             Message::User(user_msg) => user_msg
                 .content
@@ -241,8 +241,9 @@ impl BeadsContextPanel {
             Message::Resume => "Continue where you left off".to_string(),
         };
         let trimmed = text.trim().replace('\n', " ");
-        if trimmed.len() > max_len {
-            format!("{}…", &trimmed[..max_len])
+        let words: Vec<&str> = trimmed.split_whitespace().collect();
+        if words.len() > max_words {
+            format!("{}…", words[..max_words].join(" "))
         } else {
             trimmed
         }
@@ -275,7 +276,7 @@ impl BeadsContextPanel {
             .map(|message| HistogramBar {
                 role: message.role(),
                 char_count: Thread::message_char_count(message),
-                preview: Self::message_preview(message, 100).into(),
+                preview: Self::message_preview(message, 20).into(),
             })
             .collect();
 
