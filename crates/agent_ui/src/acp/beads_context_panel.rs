@@ -241,6 +241,9 @@ impl BeadsContextPanel {
             Message::Resume => "Continue where you left off".to_string(),
         };
         let trimmed = text.trim().replace('\n', " ");
+        if trimmed.is_empty() {
+            return "[no preview]".to_string();
+        }
         let words: Vec<&str> = trimmed.split_whitespace().collect();
         if words.len() > max_words {
             format!("{}…", words[..max_words].join(" "))
