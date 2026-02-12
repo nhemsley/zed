@@ -2340,24 +2340,16 @@ impl AcpThreadView {
             return;
         };
 
-        // Count UserMessage/AssistantMessage entries up to entry_ix to get message index
-        let entries = acp_thread.read(cx).entries();
-        let mut message_index = 0;
-        for (i, entry) in entries.iter().enumerate() {
-            if i >= entry_ix {
-                break;
-            }
-            match entry {
-                AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_) => {
-                    message_index += 1;
-                }
-                AgentThreadEntry::ToolCall(_) => {}
-            }
+        let total_entries = acp_thread.read(cx).entries().len();
+        let total_messages = native_thread.read(cx).message_count();
+        if total_entries == 0 || total_messages == 0 {
+            return;
         }
 
-        // Set context to start from this message onward
-        let total_messages = native_thread.read(cx).message_count();
-        let num_messages_from_here = total_messages.saturating_sub(message_index);
+        // Proportional mapping from entry index to message index
+        let fraction = entry_ix as f64 / total_entries as f64;
+        let message_index = (fraction * total_messages as f64).round() as usize;
+        let num_messages_from_here = total_messages.saturating_sub(message_index).max(1);
 
         native_thread.update(cx, |thread, cx| {
             thread.set_num_messages(Some(num_messages_from_here), cx);
