@@ -32,6 +32,7 @@ pub struct AgentSettings {
     pub inline_assistant_model: Option<LanguageModelSelection>,
     pub inline_assistant_use_streaming_tools: bool,
     pub commit_message_model: Option<LanguageModelSelection>,
+    pub focused_context_message_limit: usize,
     pub thread_summary_model: Option<LanguageModelSelection>,
     pub inline_alternatives: Vec<LanguageModelSelection>,
     pub favorite_models: Vec<LanguageModelSelection>,
@@ -288,6 +289,7 @@ impl Settings for AgentSettings {
             use_modifier_to_send: agent.use_modifier_to_send.unwrap(),
             message_editor_min_lines: agent.message_editor_min_lines.unwrap(),
             show_turn_stats: agent.show_turn_stats.unwrap(),
+            focused_context_message_limit: agent.focused_context_message_limit.unwrap_or(100),
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
         }
     }

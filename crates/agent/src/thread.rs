@@ -600,6 +600,11 @@ pub struct Thread {
     messages: Vec<Message>,
     user_store: Entity<UserStore>,
     completion_mode: CompletionMode,
+    /// When enabled, only sends recent num_messages messages to the LLM
+    focused_context_mode: bool,
+    /// Reverse index: how many messages back from the latest to include in context.
+    /// None means include all messages.
+    num_messages: Option<usize>,
     /// Holds the task that handles agent interaction until the end of the turn.
     /// Survives across multiple requests as the model performs tool calls and
     /// we run tools, report their results.
@@ -659,6 +664,8 @@ impl Thread {
             messages: Vec::new(),
             user_store: project.read(cx).user_store(),
             completion_mode: AgentSettings::get_global(cx).preferred_completion_mode,
+            focused_context_mode: false,
+            num_messages: None,
             running_turn: None,
             pending_message: None,
             tools: BTreeMap::default(),
@@ -860,6 +867,8 @@ impl Thread {
             messages: db_thread.messages,
             user_store: project.read(cx).user_store(),
             completion_mode: db_thread.completion_mode.unwrap_or_default(),
+            focused_context_mode: db_thread.focused_context_mode.unwrap_or(false),
+            num_messages: db_thread.num_messages,
             running_turn: None,
             pending_message: None,
             tools: BTreeMap::default(),
@@ -900,6 +909,8 @@ impl Thread {
             completion_mode: Some(self.completion_mode),
             profile: Some(self.profile_id.clone()),
             imported: self.imported,
+            focused_context_mode: Some(self.focused_context_mode),
+            num_messages: self.num_messages,
         };
 
         cx.background_spawn(async move {
@@ -972,6 +983,42 @@ impl Thread {
 
     pub fn completion_mode(&self) -> CompletionMode {
         self.completion_mode
+    }
+
+    /// Returns whether focused context mode (sliding context window) is enabled
+    pub fn focused_context_mode(&self) -> bool {
+        self.focused_context_mode
+    }
+
+    /// Sets focused context mode on or off.
+    /// Auto-cap logic is handled by AcpThread; this is a passive store
+    /// used by build_request_messages().
+    pub fn set_focused_context_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.focused_context_mode = enabled;
+        cx.notify();
+    }
+
+    /// Returns the number of messages to include (reverse index from latest).
+    /// None means include all messages.
+    pub fn num_messages(&self) -> Option<usize> {
+        self.num_messages
+    }
+
+    /// Returns the total number of messages in the thread.
+    pub fn message_count(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Returns a reference to the messages in the thread.
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    /// Sets the number of messages to include (reverse index from latest).
+    /// None means include all messages.
+    pub fn set_num_messages(&mut self, num_messages: Option<usize>, cx: &mut Context<Self>) {
+        self.num_messages = num_messages;
+        cx.notify();
     }
 
     pub fn set_completion_mode(&mut self, mode: CompletionMode, cx: &mut Context<Self>) {
@@ -2041,7 +2088,6 @@ impl Thread {
 
         log::debug!("Request includes {} tools", available_tools.len());
         let messages = self.build_request_messages(available_tools, cx);
-        log::debug!("Request will include {} messages", messages.len());
 
         let request = LanguageModelRequest {
             thread_id: Some(self.id.to_string()),
@@ -2056,7 +2102,6 @@ impl Thread {
             thinking_allowed: true,
         };
 
-        log::debug!("Completion request built successfully");
         Ok(request)
     }
 
@@ -2143,11 +2188,6 @@ impl Thread {
         available_tools: Vec<SharedString>,
         cx: &App,
     ) -> Vec<LanguageModelRequestMessage> {
-        log::trace!(
-            "Building request messages from {} thread messages",
-            self.messages.len()
-        );
-
         let system_prompt = SystemPromptTemplate {
             project: self.project_context.read(cx),
             available_tools,
@@ -2162,8 +2202,20 @@ impl Thread {
             cache: false,
             reasoning_details: None,
         }];
-        for message in &self.messages {
-            messages.extend(message.to_request());
+
+        if self.focused_context_mode {
+            let take_count = self.num_messages.unwrap_or(self.messages.len());
+            let total_count = self.messages.len();
+            let skip_count = total_count.saturating_sub(take_count);
+
+            for message in self.messages.iter().skip(skip_count) {
+                messages.extend(message.to_request());
+            }
+        } else {
+            // Original behavior: include all messages
+            for message in &self.messages {
+                messages.extend(message.to_request());
+            }
         }
 
         if let Some(last_message) = messages.last_mut() {

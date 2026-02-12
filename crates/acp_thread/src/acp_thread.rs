@@ -894,6 +894,11 @@ pub struct AcpThread {
     terminals: HashMap<acp::TerminalId, Entity<Terminal>>,
     pending_terminal_output: HashMap<acp::TerminalId, Vec<Vec<u8>>>,
     pending_terminal_exit: HashMap<acp::TerminalId, acp::TerminalExitStatus>,
+    /// When enabled, only sends recent num_messages entries to the LLM
+    focused_context_mode: bool,
+    /// How many entries back from the latest to include in context.
+    /// None means include all entries.
+    num_messages: Option<usize>,
 }
 
 impl From<&AcpThread> for ActionLogTelemetry {
@@ -1125,6 +1130,8 @@ impl AcpThread {
             terminals: HashMap::default(),
             pending_terminal_output: HashMap::default(),
             pending_terminal_exit: HashMap::default(),
+            focused_context_mode: false,
+            num_messages: None,
         }
     }
 
@@ -1150,6 +1157,59 @@ impl AcpThread {
 
     pub fn entries(&self) -> &[AgentThreadEntry] {
         &self.entries
+    }
+
+    /// Returns whether focused context mode (sliding context window) is enabled
+    pub fn focused_context_mode(&self) -> bool {
+        self.focused_context_mode
+    }
+
+    /// Sets focused context mode on or off.
+    /// When enabling, auto-caps num_messages at focused_context_message_limit if currently None.
+    pub fn set_focused_context_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if enabled && self.num_messages.is_none() {
+            let limit = AgentSettings::get_global(cx).focused_context_message_limit;
+            let total = self.message_count();
+            if limit > 0 && total > limit {
+                self.num_messages = Some(limit);
+            }
+        }
+        self.focused_context_mode = enabled;
+        self.connection
+            .set_focused_context_mode(&self.session_id, enabled, cx);
+        if let Some(num_messages) = self.num_messages {
+            self.connection
+                .set_num_messages(&self.session_id, Some(num_messages), cx);
+        }
+        cx.notify();
+    }
+
+    /// Returns the number of entries to include (reverse index from latest).
+    /// None means include all entries.
+    pub fn num_messages(&self) -> Option<usize> {
+        self.num_messages
+    }
+
+    /// Sets the number of entries to include (reverse index from latest).
+    /// None means include all entries.
+    pub fn set_num_messages(&mut self, num_messages: Option<usize>, cx: &mut Context<Self>) {
+        self.num_messages = num_messages;
+        self.connection
+            .set_num_messages(&self.session_id, num_messages, cx);
+        cx.notify();
+    }
+
+    /// Returns the total number of user and assistant message entries.
+    pub fn message_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_)
+                )
+            })
+            .count()
     }
 
     pub fn session_id(&self) -> &acp::SessionId {
