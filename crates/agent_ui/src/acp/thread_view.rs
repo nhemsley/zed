@@ -5826,6 +5826,12 @@ impl AcpThreadView {
                 };
 
                 let entries = thread.read(cx).entries();
+                log::info!(
+                    "ScrollToMessage: message_index={}, total_entries={}",
+                    message_index,
+                    entries.len()
+                );
+
                 // Map message_index to entry index by counting
                 // UserMessage and AssistantMessage entries (skipping ToolCall).
                 let mut message_count = 0;
@@ -5836,6 +5842,11 @@ impl AcpThreadView {
                         | AgentThreadEntry::AssistantMessage(_) => {
                             if message_count == *message_index {
                                 target_entry_index = Some(entry_index);
+                                log::info!(
+                                    "Found target: message_index={} -> entry_index={}",
+                                    message_index,
+                                    entry_index
+                                );
                                 break;
                             }
                             message_count += 1;
@@ -5850,6 +5861,13 @@ impl AcpThreadView {
                         offset_in_item: px(0.0),
                     });
                     cx.notify();
+                } else {
+                    log::warn!(
+                        "Could not find entry for message_index={}, counted {} messages in {} entries",
+                        message_index,
+                        message_count,
+                        entries.len()
+                    );
                 }
             }
         }
