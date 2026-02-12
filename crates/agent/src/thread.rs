@@ -2148,6 +2148,11 @@ impl Thread {
             self.num_messages
         );
 
+        // Dump context to temp files for debugging
+        if let Err(err) = Self::dump_context_to_files(&messages, &self.id) {
+            log::warn!("Failed to dump context: {}", err);
+        }
+
         let request = LanguageModelRequest {
             thread_id: Some(self.id.to_string()),
             prompt_id: Some(self.prompt_id.to_string()),
@@ -2241,6 +2246,81 @@ impl Thread {
         self.running_turn
             .as_ref()
             .is_some_and(|turn| turn.tools.contains_key(name))
+    }
+
+    /// Dumps the LLM request messages to temp files for debugging.
+    /// Files are written to /tmp/zed-context-dump/{thread_id}/{timestamp}/
+    fn dump_context_to_files(
+        messages: &[LanguageModelRequestMessage],
+        thread_id: &acp::SessionId,
+    ) -> Result<()> {
+        use std::fs;
+        use std::io::Write;
+
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let dump_dir = PathBuf::from("/tmp/zed-context-dump")
+            .join(thread_id.to_string())
+            .join(timestamp.to_string());
+
+        fs::create_dir_all(&dump_dir)?;
+
+        for (i, msg) in messages.iter().enumerate() {
+            let role_str = match msg.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::System => "system",
+            };
+            let filename = format!("{:03}_{}.md", i, role_str);
+            let filepath = dump_dir.join(&filename);
+
+            let mut file = fs::File::create(&filepath)?;
+
+            writeln!(file, "# Message {} ({})", i, role_str)?;
+            writeln!(file)?;
+
+            for content in &msg.content {
+                match content {
+                    language_model::MessageContent::Text(text) => {
+                        writeln!(file, "{}", text)?;
+                    }
+                    language_model::MessageContent::Image(img) => {
+                        writeln!(file, "[Image: ~{} tokens]", img.estimate_tokens())?;
+                    }
+                    language_model::MessageContent::ToolUse(tu) => {
+                        writeln!(file, "## Tool Use: {}", tu.name)?;
+                        writeln!(file, "ID: {}", tu.id)?;
+                        writeln!(file, "```json")?;
+                        writeln!(file, "{}", tu.raw_input)?;
+                        writeln!(file, "```")?;
+                    }
+                    language_model::MessageContent::ToolResult(tr) => {
+                        writeln!(file, "## Tool Result: {}", tr.tool_use_id)?;
+                        if tr.is_error {
+                            writeln!(file, "**ERROR**")?;
+                        }
+                        match &tr.content {
+                            LanguageModelToolResultContent::Text(text) => {
+                                writeln!(file, "{}", text)?;
+                            }
+                            LanguageModelToolResultContent::Image(img) => {
+                                writeln!(file, "[Image: ~{} tokens]", img.estimate_tokens())?;
+                            }
+                        }
+                    }
+                    language_model::MessageContent::Thinking { text, .. } => {
+                        writeln!(file, "## Thinking")?;
+                        writeln!(file, "{}", text)?;
+                    }
+                    language_model::MessageContent::RedactedThinking(_) => {
+                        writeln!(file, "[Redacted thinking]")?;
+                    }
+                }
+                writeln!(file)?;
+            }
+        }
+
+        log::info!("Context dumped to: {}", dump_dir.display());
+        Ok(())
     }
 
     /// Returns the character count for a message.
