@@ -210,7 +210,7 @@ impl BeadsContextPanel {
             )
     }
 
-    fn render_minimap(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_histogram(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let thread = self.thread.read(cx);
         let total = thread.message_count();
         let included = self.effective_num_messages(cx);
@@ -222,7 +222,7 @@ impl BeadsContextPanel {
         let dimmed_user = user_color.opacity(0.25);
         let dimmed_agent = agent_color.opacity(0.25);
 
-        let minimap_height = px(40.0);
+        let histogram_height = px(40.0);
         let bar_gap = px(1.0);
 
         let messages: Vec<(Role, u32)> = thread
@@ -235,12 +235,13 @@ impl BeadsContextPanel {
 
         div()
             .w_full()
-            .h(minimap_height)
+            .h(histogram_height)
             .flex()
             .flex_row()
             .items_end()
             .gap(bar_gap)
-            .overflow_hidden()
+            .overflow_x_hidden()
+            .justify_end()
             .children(
                 messages
                     .into_iter()
@@ -259,8 +260,7 @@ impl BeadsContextPanel {
 
                         div()
                             .flex_1()
-                            .min_w(px(2.0))
-                            .h(minimap_height * height_fraction)
+                            .h(histogram_height * height_fraction)
                             .bg(bar_color)
                             .rounded_t(px(1.0))
                     }),
@@ -297,7 +297,7 @@ impl Render for BeadsContextPanel {
                     )
                     .child(Divider::horizontal().color(DividerColor::Border)),
             )
-            .child(self.render_minimap(window, cx))
+            .child(self.render_histogram(window, cx))
             .child(self.render_slider(window, cx))
             .into_any()
     }
