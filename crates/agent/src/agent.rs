@@ -817,12 +817,24 @@ impl NativeAgent {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
+        let beads_mode = session
+            .acp_thread
+            .upgrade()
+            .map(|acp| acp.read(cx).beads_mode());
+        let num_messages = session
+            .acp_thread
+            .upgrade()
+            .and_then(|acp| acp.read(cx).num_messages());
         let thread_store = self.thread_store.clone();
         session.pending_save = cx.spawn(async move |_, cx| {
             let Some(database) = database_future.await.map_err(|err| anyhow!(err)).log_err() else {
                 return;
             };
-            let db_thread = db_thread.await;
+            let mut db_thread = db_thread.await;
+            if let Some(beads_mode) = beads_mode {
+                db_thread.beads_mode = Some(beads_mode);
+            }
+            db_thread.num_messages = num_messages;
             database.save_thread(id, db_thread).await.log_err();
             thread_store.update(cx, |store, cx| store.reload(cx));
         });
