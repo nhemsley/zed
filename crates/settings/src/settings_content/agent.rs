@@ -126,6 +126,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: false
     pub show_turn_stats: Option<bool>,
+    /// When beads mode is enabled, automatically cap the context window at this many messages.
+    /// The user can still override via the slider. Set to 0 to disable auto-capping.
+    ///
+    /// Default: 100
+    pub beads_message_limit: Option<usize>,
     /// Per-tool permission rules for granular control over which tool actions require confirmation.
     ///
     /// This setting only applies to the native Zed agent. External agent servers (Claude Code, Gemini CLI, etc.)

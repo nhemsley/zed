@@ -1144,6 +1144,11 @@
     //
     // Default: false
     "show_turn_stats": false,
+    // When beads mode is enabled, automatically cap the context window at this many messages.
+    // The user can still override via the slider. Set to 0 to disable auto-capping.
+    //
+    // Default: 100
+    "beads_message_limit": 100,
   },
   // Whether the screen sharing icon is shown in the os status bar.
   "show_call_status_icon": true,
