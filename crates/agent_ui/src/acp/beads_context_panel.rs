@@ -1,7 +1,7 @@
 use agent::{Message, Thread};
 use gpui::{
-    App, Context, DragMoveEvent, Entity, IntoElement, MouseButton, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, px,
+    App, Context, CursorStyle, DragMoveEvent, Entity, EventEmitter, IntoElement, MouseButton,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use language_model::Role;
 use ui::{
@@ -11,9 +11,15 @@ use ui::{
 
 struct SliderDrag;
 
+pub enum BeadsContextPanelEvent {
+    ScrollToMessage { message_index: usize },
+}
+
 pub struct BeadsContextPanel {
     thread: Entity<Thread>,
 }
+
+impl EventEmitter<BeadsContextPanelEvent> for BeadsContextPanel {}
 
 impl BeadsContextPanel {
     pub fn new(thread: Entity<Thread>, _cx: &mut Context<Self>) -> Self {
@@ -210,6 +216,38 @@ impl BeadsContextPanel {
             )
     }
 
+    fn message_preview(message: &Message, max_len: usize) -> String {
+        let text = match message {
+            Message::User(user_msg) => user_msg
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    agent::UserMessageContent::Text(t) => Some(t.as_str()),
+                    agent::UserMessageContent::Mention { content, .. } => Some(content.as_str()),
+                    agent::UserMessageContent::Image(_) => Some("[image]"),
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            Message::Agent(agent_msg) => agent_msg
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    agent::AgentMessageContent::Text(t) => Some(t.as_str()),
+                    agent::AgentMessageContent::Thinking { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            Message::Resume => "Continue where you left off".to_string(),
+        };
+        let trimmed = text.trim().replace('\n', " ");
+        if trimmed.len() > max_len {
+            format!("{}…", &trimmed[..max_len])
+        } else {
+            trimmed
+        }
+    }
+
     fn render_histogram(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let thread = self.thread.read(cx);
         let total = thread.message_count();
@@ -225,13 +263,28 @@ impl BeadsContextPanel {
         let histogram_height = px(40.0);
         let bar_gap = px(1.0);
 
-        let messages: Vec<(Role, u32)> = thread
+        struct HistogramBar {
+            role: Role,
+            char_count: u32,
+            preview: SharedString,
+        }
+
+        let messages: Vec<HistogramBar> = thread
             .messages()
             .iter()
-            .map(|message| (message.role(), Thread::message_char_count(message)))
+            .map(|message| HistogramBar {
+                role: message.role(),
+                char_count: Thread::message_char_count(message),
+                preview: Self::message_preview(message, 100).into(),
+            })
             .collect();
 
-        let max_chars = messages.iter().map(|(_, c)| *c).max().unwrap_or(1).max(1);
+        let max_chars = messages
+            .iter()
+            .map(|m| m.char_count)
+            .max()
+            .unwrap_or(1)
+            .max(1);
 
         div()
             .w_full()
@@ -242,29 +295,60 @@ impl BeadsContextPanel {
             .gap(bar_gap)
             .overflow_x_hidden()
             .justify_end()
-            .children(
-                messages
-                    .into_iter()
-                    .enumerate()
-                    .map(move |(index, (role, char_count))| {
-                        let is_included = index >= skip_count;
-                        let height_fraction =
-                            (char_count as f32 / max_chars as f32).clamp(0.1, 1.0);
-                        let is_user = role == Role::User;
-                        let bar_color = match (is_user, is_included) {
-                            (true, true) => user_color,
-                            (true, false) => dimmed_user,
-                            (false, true) => agent_color,
-                            (false, false) => dimmed_agent,
-                        };
+            .children(messages.into_iter().enumerate().map(move |(index, bar)| {
+                let is_included = index >= skip_count;
+                let height_fraction = (bar.char_count as f32 / max_chars as f32).clamp(0.1, 1.0);
+                let is_user = bar.role == Role::User;
+                let bar_color = match (is_user, is_included) {
+                    (true, true) => user_color,
+                    (true, false) => dimmed_user,
+                    (false, true) => agent_color,
+                    (false, false) => dimmed_agent,
+                };
 
-                        div()
-                            .flex_1()
-                            .h(histogram_height * height_fraction)
-                            .bg(bar_color)
-                            .rounded_t(px(1.0))
-                    }),
-            )
+                let role_label = if is_user { "User" } else { "Agent" };
+                let included_label = if is_included { "Included" } else { "Excluded" };
+                let tooltip_text: SharedString = format!(
+                    "{} · {} · ~{} chars\n{}",
+                    role_label, included_label, bar.char_count, bar.preview
+                )
+                .into();
+
+                div()
+                    .id(ElementId::NamedInteger(
+                        "histogram-bar".into(),
+                        index as u64,
+                    ))
+                    .flex_1()
+                    .h(histogram_height * height_fraction)
+                    .bg(bar_color)
+                    .rounded_t(px(1.0))
+                    .cursor(CursorStyle::PointingHand)
+                    .tooltip(Tooltip::text(tooltip_text.clone()))
+                    .on_click(
+                        cx.listener(move |this, event: &gpui::ClickEvent, _window, cx| {
+                            if !event.modifiers().control {
+                                return;
+                            }
+                            let total = this.thread.read(cx).message_count();
+                            let new_included = total.saturating_sub(index);
+                            let current_included = this.effective_num_messages(cx);
+                            if new_included > current_included {
+                                let num_messages = if new_included >= total {
+                                    None
+                                } else {
+                                    Some(new_included)
+                                };
+                                this.thread.update(cx, |thread, cx| {
+                                    thread.set_num_messages(num_messages, cx);
+                                });
+                            }
+                            cx.emit(BeadsContextPanelEvent::ScrollToMessage {
+                                message_index: index,
+                            });
+                        }),
+                    )
+            }))
     }
 }
 

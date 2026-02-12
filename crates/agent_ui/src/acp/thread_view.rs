@@ -320,6 +320,7 @@ pub struct AcpThreadView {
     config_options_view: Option<Entity<ConfigOptionsView>>,
     profile_selector: Option<Entity<ProfileSelector>>,
     beads_context_panel: Option<Entity<beads_context_panel::BeadsContextPanel>>,
+    _beads_subscription: Option<Subscription>,
     notifications: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
     thread_retry_status: Option<RetryStatus>,
@@ -496,6 +497,7 @@ impl AcpThreadView {
             config_options_view: None,
             profile_selector: None,
             beads_context_panel: None,
+            _beads_subscription: None,
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
             list_state: list_state,
@@ -788,6 +790,9 @@ impl AcpThreadView {
 
                         this.beads_context_panel = this.as_native_thread(cx).map(|thread| {
                             cx.new(|cx| beads_context_panel::BeadsContextPanel::new(thread, cx))
+                        });
+                        this._beads_subscription = this.beads_context_panel.as_ref().map(|panel| {
+                            cx.subscribe_in(panel, window, Self::handle_beads_context_panel_event)
                         });
 
                         this.message_editor.focus_handle(cx).focus(window, cx);
@@ -5805,6 +5810,49 @@ impl AcpThreadView {
     fn scroll_to_top(&mut self, cx: &mut Context<Self>) {
         self.list_state.scroll_to(ListOffset::default());
         cx.notify();
+    }
+
+    fn handle_beads_context_panel_event(
+        &mut self,
+        _panel: &Entity<beads_context_panel::BeadsContextPanel>,
+        event: &beads_context_panel::BeadsContextPanelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            beads_context_panel::BeadsContextPanelEvent::ScrollToMessage { message_index } => {
+                let Some(thread) = self.thread() else {
+                    return;
+                };
+
+                let entries = thread.read(cx).entries();
+                // Map message_index to entry index by counting
+                // UserMessage and AssistantMessage entries (skipping ToolCall).
+                let mut message_count = 0;
+                let mut target_entry_index = None;
+                for (entry_index, entry) in entries.iter().enumerate() {
+                    match entry {
+                        AgentThreadEntry::UserMessage(_)
+                        | AgentThreadEntry::AssistantMessage(_) => {
+                            if message_count == *message_index {
+                                target_entry_index = Some(entry_index);
+                                break;
+                            }
+                            message_count += 1;
+                        }
+                        AgentThreadEntry::ToolCall(_) => {}
+                    }
+                }
+
+                if let Some(entry_index) = target_entry_index {
+                    self.list_state.scroll_to(ListOffset {
+                        item_ix: entry_index,
+                        offset_in_item: px(0.0),
+                    });
+                    cx.notify();
+                }
+            }
+        }
     }
 
     fn scroll_to_most_recent_user_prompt(&mut self, cx: &mut Context<Self>) {
