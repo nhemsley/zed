@@ -1,4 +1,4 @@
-use agent::Thread;
+use agent::{Message, Thread};
 use gpui::{
     App, Context, DragMoveEvent, Entity, IntoElement, MouseButton, ParentElement, Render,
     SharedString, StatefulInteractiveElement, Styled, Window, div, px,
@@ -41,20 +41,85 @@ impl BeadsContextPanel {
         });
     }
 
+    fn estimate_message_tokens(message: &Message) -> usize {
+        match message {
+            Message::User(user_msg) => user_msg
+                .content
+                .iter()
+                .map(|c| match c {
+                    agent::UserMessageContent::Text(t) => t.len() / 4,
+                    agent::UserMessageContent::Mention { content, .. } => content.len() / 4,
+                    agent::UserMessageContent::Image(img) => img.estimate_tokens(),
+                })
+                .sum(),
+            Message::Agent(agent_msg) => {
+                let content_tokens: usize = agent_msg
+                    .content
+                    .iter()
+                    .map(|c| match c {
+                        agent::AgentMessageContent::Text(t) => t.len() / 4,
+                        agent::AgentMessageContent::Thinking { text, .. } => text.len() / 4,
+                        agent::AgentMessageContent::RedactedThinking(_) => 0,
+                        agent::AgentMessageContent::ToolUse(tu) => tu.raw_input.len() / 4,
+                    })
+                    .sum();
+                let tool_result_tokens: usize = agent_msg
+                    .tool_results
+                    .values()
+                    .map(|tr| match &tr.content {
+                        language_model::LanguageModelToolResultContent::Text(t) => t.len() / 4,
+                        language_model::LanguageModelToolResultContent::Image(img) => {
+                            img.estimate_tokens()
+                        }
+                    })
+                    .sum();
+                content_tokens + tool_result_tokens
+            }
+            Message::Resume => 10, // "Continue where you left off"
+        }
+    }
+
     fn render_slider(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let total = self.thread.read(cx).message_count();
+        let thread = self.thread.read(cx);
+        let total = thread.message_count();
         let included = self.effective_num_messages(cx);
         let fraction = if total == 0 {
             1.0
         } else {
             included as f32 / total as f32
         };
+
+        // Calculate token estimates
+        let messages = thread.messages();
+        let total_tokens: usize = messages.iter().map(Self::estimate_message_tokens).sum();
+        let skip_count = total.saturating_sub(included);
+        let included_tokens: usize = messages
+            .iter()
+            .skip(skip_count)
+            .map(Self::estimate_message_tokens)
+            .sum();
+
+        let format_tokens = |tokens: usize| -> String {
+            if tokens >= 1000 {
+                format!("~{}k", (tokens + 500) / 1000)
+            } else {
+                format!("~{}", tokens)
+            }
+        };
+
         let label_text: SharedString = if total == 0 {
             "No messages".into()
         } else if included >= total {
-            format!("All {} messages", total).into()
+            format!("{} / {} ({})", included, total, format_tokens(total_tokens)).into()
         } else {
-            format!("{} / {} messages", included, total).into()
+            format!(
+                "{} / {} ({} / {})",
+                included,
+                total,
+                format_tokens(included_tokens),
+                format_tokens(total_tokens)
+            )
+            .into()
         };
 
         let track_height = px(6.0);
