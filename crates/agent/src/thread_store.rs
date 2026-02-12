@@ -145,7 +145,7 @@ mod tests {
             profile: None,
             imported: false,
             beads_mode: None,
-            beads_message_char_limit: None,
+            num_messages: None,
         }
     }
 

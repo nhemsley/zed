@@ -58,6 +58,7 @@ use workspace::{CollaboratorId, NewTerminal, Toast, Workspace, notifications::No
 use zed_actions::agent::{Chat, ToggleModelSelector};
 use zed_actions::assistant::OpenRulesLibrary;
 
+use super::beads_context_panel;
 use super::config_options::ConfigOptionsView;
 use super::entry_view_state::EntryViewState;
 use crate::acp::AcpModelSelectorPopover;
@@ -318,6 +319,7 @@ pub struct AcpThreadView {
     model_selector: Option<Entity<AcpModelSelectorPopover>>,
     config_options_view: Option<Entity<ConfigOptionsView>>,
     profile_selector: Option<Entity<ProfileSelector>>,
+    beads_context_panel: Option<Entity<beads_context_panel::BeadsContextPanel>>,
     notifications: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
     thread_retry_status: Option<RetryStatus>,
@@ -493,6 +495,7 @@ impl AcpThreadView {
             model_selector: None,
             config_options_view: None,
             profile_selector: None,
+            beads_context_panel: None,
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
             list_state: list_state,
@@ -781,6 +784,10 @@ impl AcpThreadView {
                                     cx,
                                 )
                             })
+                        });
+
+                        this.beads_context_panel = this.as_native_thread(cx).map(|thread| {
+                            cx.new(|cx| beads_context_panel::BeadsContextPanel::new(thread, cx))
                         });
 
                         this.message_editor.focus_handle(cx).focus(window, cx);
@@ -7142,6 +7149,7 @@ impl Render for AcpThreadView {
                 }
                 _ => this,
             })
+            .children(self.beads_context_panel.clone())
             .children(self.render_thread_retry_status_callout(window, cx))
             .when(self.show_codex_windows_warning, |this| {
                 this.child(self.render_codex_windows_warning(cx))

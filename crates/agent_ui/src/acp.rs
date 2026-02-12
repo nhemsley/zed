@@ -1,3 +1,4 @@
+mod beads_context_panel;
 mod config_options;
 mod entry_view_state;
 mod message_editor;

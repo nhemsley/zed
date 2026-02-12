@@ -589,9 +589,6 @@ enum CompletionError {
     Other(#[from] anyhow::Error),
 }
 
-/// Default character limit for beads mode
-const DEFAULT_BEADS_MESSAGE_CHAR_LIMIT: u32 = 65536;
-
 pub struct Thread {
     id: acp::SessionId,
     prompt_id: PromptId,
@@ -603,10 +600,11 @@ pub struct Thread {
     messages: Vec<Message>,
     user_store: Entity<UserStore>,
     completion_mode: CompletionMode,
-    /// When enabled, only sends recent messages up to beads_message_char_limit to the LLM
+    /// When enabled, only sends recent num_messages messages to the LLM
     beads_mode: bool,
-    /// Maximum characters to include when beads_mode is enabled
-    beads_message_char_limit: u32,
+    /// Reverse index: how many messages back from the latest to include in context.
+    /// None means include all messages.
+    num_messages: Option<usize>,
     /// Holds the task that handles agent interaction until the end of the turn.
     /// Survives across multiple requests as the model performs tool calls and
     /// we run tools, report their results.
@@ -667,7 +665,7 @@ impl Thread {
             user_store: project.read(cx).user_store(),
             completion_mode: AgentSettings::get_global(cx).preferred_completion_mode,
             beads_mode: false,
-            beads_message_char_limit: DEFAULT_BEADS_MESSAGE_CHAR_LIMIT,
+            num_messages: None,
             running_turn: None,
             pending_message: None,
             tools: BTreeMap::default(),
@@ -870,9 +868,7 @@ impl Thread {
             user_store: project.read(cx).user_store(),
             completion_mode: db_thread.completion_mode.unwrap_or_default(),
             beads_mode: db_thread.beads_mode.unwrap_or(false),
-            beads_message_char_limit: db_thread
-                .beads_message_char_limit
-                .unwrap_or(DEFAULT_BEADS_MESSAGE_CHAR_LIMIT),
+            num_messages: db_thread.num_messages,
             running_turn: None,
             pending_message: None,
             tools: BTreeMap::default(),
@@ -914,7 +910,7 @@ impl Thread {
             profile: Some(self.profile_id.clone()),
             imported: self.imported,
             beads_mode: Some(self.beads_mode),
-            beads_message_char_limit: Some(self.beads_message_char_limit),
+            num_messages: self.num_messages,
         };
 
         cx.background_spawn(async move {
@@ -997,23 +993,36 @@ impl Thread {
     /// Sets beads mode on or off
     pub fn set_beads_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
         log::info!(
-            "Beads mode {}: char_limit={}",
+            "Beads mode {}: num_messages={:?}, total_messages={}",
             if enabled { "enabled" } else { "disabled" },
-            self.beads_message_char_limit
+            self.num_messages,
+            self.messages.len(),
         );
         self.beads_mode = enabled;
         cx.notify();
     }
 
-    /// Returns the character limit for beads mode
-    pub fn beads_message_char_limit(&self) -> u32 {
-        self.beads_message_char_limit
+    /// Returns the number of messages to include (reverse index from latest).
+    /// None means include all messages.
+    pub fn num_messages(&self) -> Option<usize> {
+        self.num_messages
     }
 
-    /// Sets the character limit for beads mode
-    pub fn set_beads_message_char_limit(&mut self, limit: u32, cx: &mut Context<Self>) {
-        log::debug!("Beads mode char limit set to {}", limit);
-        self.beads_message_char_limit = limit;
+    /// Returns the total number of messages in the thread.
+    pub fn message_count(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Returns a reference to the messages in the thread.
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    /// Sets the number of messages to include (reverse index from latest).
+    /// None means include all messages.
+    pub fn set_num_messages(&mut self, num_messages: Option<usize>, cx: &mut Context<Self>) {
+        log::debug!("Beads mode num_messages set to {:?}", num_messages);
+        self.num_messages = num_messages;
         cx.notify();
     }
 
@@ -2119,12 +2128,12 @@ impl Thread {
             );
         }
         log::info!(
-            "LLM Request: {} messages, total_chars={}, est_tokens={}, beads_mode={}, beads_char_limit={}",
+            "LLM Request: {} messages, total_chars={}, est_tokens={}, beads_mode={}, num_messages={:?}",
             messages.len(),
             total_char_count,
             total_estimated_tokens,
             self.beads_mode,
-            self.beads_message_char_limit
+            self.num_messages
         );
 
         let request = LanguageModelRequest {
@@ -2223,7 +2232,7 @@ impl Thread {
     }
 
     /// Returns the character count for a message.
-    fn message_char_count(message: &Message) -> u32 {
+    pub fn message_char_count(message: &Message) -> u32 {
         match message {
             Message::User(user_msg) => user_msg
                 .content
@@ -2287,37 +2296,19 @@ impl Thread {
         }];
 
         if self.beads_mode {
-            // Sliding window: only include recent messages up to char limit
-            let mut char_count: u32 = 0;
-            let mut windowed_messages: Vec<&Message> = Vec::new();
-
-            // Iterate in reverse to get most recent messages first
-            for message in self.messages.iter().rev() {
-                let message_chars = Self::message_char_count(message);
-                if char_count + message_chars > self.beads_message_char_limit {
-                    break;
-                }
-                char_count += message_chars;
-                windowed_messages.push(message);
-            }
-
-            // Reverse to restore chronological order
-            windowed_messages.reverse();
-
-            let included_count = windowed_messages.len();
+            let take_count = self.num_messages.unwrap_or(self.messages.len());
             let total_count = self.messages.len();
-            let excluded_count = total_count - included_count;
+            let skip_count = total_count.saturating_sub(take_count);
 
             log::info!(
-                "Beads mode: including {}/{} messages (~{} chars, limit: {}), excluded: {}",
-                included_count,
+                "Beads mode: including {}/{} messages (num_messages={:?}), excluded: {}",
+                take_count.min(total_count),
                 total_count,
-                char_count,
-                self.beads_message_char_limit,
-                excluded_count
+                self.num_messages,
+                skip_count,
             );
 
-            for message in windowed_messages {
+            for message in self.messages.iter().skip(skip_count) {
                 messages.extend(message.to_request());
             }
         } else {
