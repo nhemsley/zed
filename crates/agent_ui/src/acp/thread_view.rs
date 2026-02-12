@@ -2453,16 +2453,22 @@ impl AcpThreadView {
                     }))
                     .child(
                         h_flex()
-                            .gap_1()
-                            .items_start()
+                            .gap_2()
+                            .items_center()
                             .child(
-                                IconButton::new(("context-from-here", entry_ix), IconName::ArrowRight)
-                                    .icon_size(IconSize::Small)
-                                    .icon_color(Color::Muted)
-                                    .tooltip(Tooltip::text("Set context window to start from this message"))
-                                    .on_click(cx.listener(move |this, _, _window, cx| {
-                                        this.set_context_from_entry(entry_ix, cx);
-                                    }))
+                                div()
+                                    .border_1()
+                                    .border_color(cx.theme().colors().border)
+                                    .rounded_md()
+                                    .child(
+                                        IconButton::new(("context-from-here", entry_ix), IconName::ArrowRight)
+                                            .icon_size(IconSize::Small)
+                                            .icon_color(Color::Muted)
+                                            .tooltip(Tooltip::text("Set context window to start from this message"))
+                                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                                this.set_context_from_entry(entry_ix, cx);
+                                            }))
+                                    )
                             )
                             .child(
                                 div()
