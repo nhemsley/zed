@@ -1165,7 +1165,26 @@ impl AcpThread {
     }
 
     /// Sets beads mode on or off.
+    /// When enabling, auto-caps num_messages at beads_message_limit if currently None.
     pub fn set_beads_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if enabled && self.num_messages.is_none() {
+            let limit = AgentSettings::get_global(cx).beads_message_limit;
+            let total = self.message_count();
+            if limit > 0 && total > limit {
+                log::info!(
+                    "Beads mode auto-capping num_messages to {} (total: {})",
+                    limit,
+                    total,
+                );
+                self.num_messages = Some(limit);
+            }
+        }
+        log::info!(
+            "Beads mode {}: num_messages={:?}, total_messages={}",
+            if enabled { "enabled" } else { "disabled" },
+            self.num_messages,
+            self.message_count(),
+        );
         self.beads_mode = enabled;
         cx.notify();
     }

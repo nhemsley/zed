@@ -313,8 +313,10 @@ impl NativeAgent {
         let project = thread.project.clone();
         let action_log = thread.action_log.clone();
         let prompt_capabilities_rx = thread.prompt_capabilities_rx.clone();
+        let beads_mode = thread.beads_mode();
+        let num_messages = thread.num_messages();
         let acp_thread = cx.new(|cx| {
-            acp_thread::AcpThread::new(
+            let mut acp_thread = acp_thread::AcpThread::new(
                 title,
                 connection,
                 project.clone(),
@@ -322,7 +324,14 @@ impl NativeAgent {
                 session_id.clone(),
                 prompt_capabilities_rx,
                 cx,
-            )
+            );
+            if beads_mode {
+                acp_thread.set_beads_mode(true, cx);
+            }
+            if let Some(num) = num_messages {
+                acp_thread.set_num_messages(Some(num), cx);
+            }
+            acp_thread
         });
 
         let registry = LanguageModelRegistry::read_global(cx);
