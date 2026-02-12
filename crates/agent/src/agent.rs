@@ -338,6 +338,7 @@ impl NativeAgent {
             )
         });
 
+        let thread_for_beads = thread_handle.clone();
         let subscriptions = vec![
             cx.observe_release(&acp_thread, |this, acp_thread, _cx| {
                 this.sessions.remove(acp_thread.session_id());
@@ -346,6 +347,19 @@ impl NativeAgent {
             cx.subscribe(&thread_handle, Self::handle_thread_token_usage_updated),
             cx.observe(&thread_handle, move |this, thread, cx| {
                 this.save_thread(thread, cx)
+            }),
+            cx.observe(&acp_thread, move |_this, acp_thread, cx| {
+                let acp = acp_thread.read(cx);
+                let beads_mode = acp.beads_mode();
+                let num_messages = acp.num_messages();
+                thread_for_beads.update(cx, |thread, cx| {
+                    if thread.beads_mode() != beads_mode {
+                        thread.set_beads_mode(beads_mode, cx);
+                    }
+                    if thread.num_messages() != num_messages {
+                        thread.set_num_messages(num_messages, cx);
+                    }
+                });
             }),
         ];
 

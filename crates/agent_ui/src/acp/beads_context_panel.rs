@@ -1,4 +1,4 @@
-use agent::{Message, Thread};
+use acp_thread::{AcpThread, AgentThreadEntry, AssistantMessageChunk};
 use gpui::{
     App, Context, CursorStyle, DragMoveEvent, Entity, EventEmitter, IntoElement, MouseButton,
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
@@ -19,13 +19,13 @@ pub enum BeadsContextPanelEvent {
 }
 
 pub struct BeadsContextPanel {
-    thread: Entity<Thread>,
+    thread: Entity<AcpThread>,
 }
 
 impl EventEmitter<BeadsContextPanelEvent> for BeadsContextPanel {}
 
 impl BeadsContextPanel {
-    pub fn new(thread: Entity<Thread>, _cx: &mut Context<Self>) -> Self {
+    pub fn new(thread: Entity<AcpThread>, _cx: &mut Context<Self>) -> Self {
         Self { thread }
     }
 
@@ -50,41 +50,50 @@ impl BeadsContextPanel {
         });
     }
 
-    fn estimate_message_tokens(message: &Message) -> usize {
-        match message {
-            Message::User(user_msg) => user_msg
-                .content
+    fn entry_char_count(entry: &AgentThreadEntry, cx: &App) -> u32 {
+        match entry {
+            AgentThreadEntry::UserMessage(msg) => msg.content.to_markdown(cx).len() as u32,
+            AgentThreadEntry::AssistantMessage(msg) => msg
+                .chunks
                 .iter()
-                .map(|c| match c {
-                    agent::UserMessageContent::Text(t) => t.len() / 4,
-                    agent::UserMessageContent::Mention { content, .. } => content.len() / 4,
-                    agent::UserMessageContent::Image(img) => img.estimate_tokens(),
+                .map(|chunk| match chunk {
+                    AssistantMessageChunk::Message { block }
+                    | AssistantMessageChunk::Thought { block } => {
+                        block.to_markdown(cx).len() as u32
+                    }
                 })
                 .sum(),
-            Message::Agent(agent_msg) => {
-                let content_tokens: usize = agent_msg
-                    .content
-                    .iter()
-                    .map(|c| match c {
-                        agent::AgentMessageContent::Text(t) => t.len() / 4,
-                        agent::AgentMessageContent::Thinking { text, .. } => text.len() / 4,
-                        agent::AgentMessageContent::RedactedThinking(_) => 0,
-                        agent::AgentMessageContent::ToolUse(tu) => tu.raw_input.len() / 4,
-                    })
-                    .sum();
-                let tool_result_tokens: usize = agent_msg
-                    .tool_results
-                    .values()
-                    .map(|tr| match &tr.content {
-                        language_model::LanguageModelToolResultContent::Text(t) => t.len() / 4,
-                        language_model::LanguageModelToolResultContent::Image(img) => {
-                            img.estimate_tokens()
-                        }
-                    })
-                    .sum();
-                content_tokens + tool_result_tokens
-            }
-            Message::Resume => 10, // "Continue where you left off"
+            AgentThreadEntry::ToolCall(_) => 0,
+        }
+    }
+
+    fn estimate_entry_tokens(entry: &AgentThreadEntry, cx: &App) -> usize {
+        Self::entry_char_count(entry, cx) as usize / 4
+    }
+
+    fn entry_preview(entry: &AgentThreadEntry, max_words: usize, cx: &App) -> String {
+        let text = match entry {
+            AgentThreadEntry::UserMessage(msg) => msg.content.to_markdown(cx).to_string(),
+            AgentThreadEntry::AssistantMessage(msg) => msg
+                .chunks
+                .iter()
+                .map(|chunk| match chunk {
+                    AssistantMessageChunk::Message { block } => block.to_markdown(cx).to_string(),
+                    AssistantMessageChunk::Thought { block } => block.to_markdown(cx).to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            AgentThreadEntry::ToolCall(_) => "[tool call]".to_string(),
+        };
+        let trimmed = text.trim().replace('\n', " ");
+        if trimmed.is_empty() {
+            return "[no preview]".to_string();
+        }
+        let words: Vec<&str> = trimmed.split_whitespace().collect();
+        if words.len() > max_words {
+            format!("{}…", words[..max_words].join(" "))
+        } else {
+            trimmed
         }
     }
 
@@ -98,14 +107,26 @@ impl BeadsContextPanel {
             included as f32 / total as f32
         };
 
-        // Calculate token estimates
-        let messages = thread.messages();
-        let total_tokens: usize = messages.iter().map(Self::estimate_message_tokens).sum();
+        let entries = thread.entries();
+        let message_entries: Vec<&AgentThreadEntry> = entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_)
+                )
+            })
+            .collect();
+
+        let total_tokens: usize = message_entries
+            .iter()
+            .map(|e| Self::estimate_entry_tokens(e, cx))
+            .sum();
         let skip_count = total.saturating_sub(included);
-        let included_tokens: usize = messages
+        let included_tokens: usize = message_entries
             .iter()
             .skip(skip_count)
-            .map(Self::estimate_message_tokens)
+            .map(|e| Self::estimate_entry_tokens(e, cx))
             .sum();
 
         let format_tokens = |tokens: usize| -> String {
@@ -167,7 +188,6 @@ impl BeadsContextPanel {
                     .on_drag_move::<SliderDrag>(cx.listener(
                         move |this, event: &DragMoveEvent<SliderDrag>, _window, cx| {
                             let bounds = event.bounds;
-                            // Calculate position from the RIGHT edge to match right-anchored visual
                             let relative_x_from_right =
                                 bounds.origin.x + bounds.size.width - event.event.position.x;
                             let frac = relative_x_from_right / bounds.size.width;
@@ -219,42 +239,6 @@ impl BeadsContextPanel {
             )
     }
 
-    fn message_preview(message: &Message, max_words: usize) -> String {
-        let text = match message {
-            Message::User(user_msg) => user_msg
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    agent::UserMessageContent::Text(t) => Some(t.as_str()),
-                    agent::UserMessageContent::Mention { content, .. } => Some(content.as_str()),
-                    agent::UserMessageContent::Image(_) => Some("[image]"),
-                })
-                .collect::<Vec<_>>()
-                .join(" "),
-            Message::Agent(agent_msg) => agent_msg
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    agent::AgentMessageContent::Text(t) => Some(t.as_str()),
-                    agent::AgentMessageContent::Thinking { text, .. } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(" "),
-            Message::Resume => "Continue where you left off".to_string(),
-        };
-        let trimmed = text.trim().replace('\n', " ");
-        if trimmed.is_empty() {
-            return "[no preview]".to_string();
-        }
-        let words: Vec<&str> = trimmed.split_whitespace().collect();
-        if words.len() > max_words {
-            format!("{}…", words[..max_words].join(" "))
-        } else {
-            trimmed
-        }
-    }
-
     fn render_histogram(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let thread = self.thread.read(cx);
         let total = thread.message_count();
@@ -277,12 +261,25 @@ impl BeadsContextPanel {
         }
 
         let messages: Vec<HistogramBar> = thread
-            .messages()
+            .entries()
             .iter()
-            .map(|message| HistogramBar {
-                role: message.role(),
-                char_count: Thread::message_char_count(message),
-                preview: Self::message_preview(message, 20).into(),
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_)
+                )
+            })
+            .map(|entry| {
+                let role = match entry {
+                    AgentThreadEntry::UserMessage(_) => Role::User,
+                    AgentThreadEntry::AssistantMessage(_) => Role::Assistant,
+                    _ => Role::User,
+                };
+                HistogramBar {
+                    role,
+                    char_count: Self::entry_char_count(entry, cx),
+                    preview: Self::entry_preview(entry, 20, cx).into(),
+                }
             })
             .collect();
 
@@ -337,8 +334,6 @@ impl BeadsContextPanel {
                             let total = this.thread.read(cx).message_count();
                             let new_included = total.saturating_sub(index);
 
-                            // Click: set this message as the first included
-                            // message and update the slider
                             let num_messages = if new_included >= total {
                                 None
                             } else {
@@ -348,8 +343,6 @@ impl BeadsContextPanel {
                                 thread.set_num_messages(num_messages, cx);
                             });
 
-                            // Ctrl-click: also scroll the message list to
-                            // this message
                             if event.modifiers().control {
                                 cx.emit(BeadsContextPanelEvent::ScrollToMessage {
                                     message_index: index,

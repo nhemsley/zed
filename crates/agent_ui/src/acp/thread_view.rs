@@ -788,8 +788,10 @@ impl AcpThreadView {
                             })
                         });
 
-                        this.beads_context_panel = this.as_native_thread(cx).map(|thread| {
-                            cx.new(|cx| beads_context_panel::BeadsContextPanel::new(thread, cx))
+                        this.beads_context_panel = this.thread().map(|thread| {
+                            cx.new(|cx| {
+                                beads_context_panel::BeadsContextPanel::new(thread.clone(), cx)
+                            })
                         });
                         this._beads_subscription = this.beads_context_panel.as_ref().map(|panel| {
                             cx.subscribe_in(panel, window, Self::handle_beads_context_panel_event)
@@ -2333,25 +2335,33 @@ impl AcpThreadView {
     }
 
     fn set_context_from_entry(&mut self, entry_ix: usize, cx: &mut Context<Self>) {
-        let Some(acp_thread) = self.thread() else {
-            return;
-        };
-        let Some(native_thread) = self.as_native_thread(cx) else {
+        let Some(thread) = self.thread() else {
             return;
         };
 
-        let total_entries = acp_thread.read(cx).entries().len();
-        let total_messages = native_thread.read(cx).message_count();
-        if total_entries == 0 || total_messages == 0 {
+        let entries = thread.read(cx).entries();
+        let total = thread.read(cx).message_count();
+        if total == 0 {
             return;
         }
 
-        // Proportional mapping from entry index to message index
-        let fraction = entry_ix as f64 / total_entries as f64;
-        let message_index = (fraction * total_messages as f64).round() as usize;
-        let num_messages_from_here = total_messages.saturating_sub(message_index).max(1);
+        // Count UserMessage/AssistantMessage entries before entry_ix
+        let mut message_index = 0;
+        for (i, entry) in entries.iter().enumerate() {
+            if i >= entry_ix {
+                break;
+            }
+            match entry {
+                AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_) => {
+                    message_index += 1;
+                }
+                AgentThreadEntry::ToolCall(_) => {}
+            }
+        }
 
-        native_thread.update(cx, |thread, cx| {
+        let num_messages_from_here = total.saturating_sub(message_index).max(1);
+
+        thread.update(cx, |thread, cx| {
             thread.set_num_messages(Some(num_messages_from_here), cx);
         });
     }
@@ -5363,7 +5373,7 @@ impl AcpThreadView {
     }
 
     fn render_beads_mode_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let thread = self.as_native_thread(cx)?;
+        let thread = self.thread()?;
         let beads_mode_enabled = thread.read(cx).beads_mode();
 
         Some(
@@ -5392,7 +5402,7 @@ impl AcpThreadView {
     }
 
     fn toggle_beads_mode(&mut self, cx: &mut Context<Self>) {
-        if let Some(thread) = self.as_native_thread(cx) {
+        if let Some(thread) = self.thread() {
             thread.update(cx, |thread, cx| {
                 let current = thread.beads_mode();
                 thread.set_beads_mode(!current, cx);

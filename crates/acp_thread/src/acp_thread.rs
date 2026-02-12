@@ -894,6 +894,11 @@ pub struct AcpThread {
     terminals: HashMap<acp::TerminalId, Entity<Terminal>>,
     pending_terminal_output: HashMap<acp::TerminalId, Vec<Vec<u8>>>,
     pending_terminal_exit: HashMap<acp::TerminalId, acp::TerminalExitStatus>,
+    /// When enabled, only sends recent num_messages entries to the LLM
+    beads_mode: bool,
+    /// How many entries back from the latest to include in context.
+    /// None means include all entries.
+    num_messages: Option<usize>,
 }
 
 impl From<&AcpThread> for ActionLogTelemetry {
@@ -1125,6 +1130,8 @@ impl AcpThread {
             terminals: HashMap::default(),
             pending_terminal_output: HashMap::default(),
             pending_terminal_exit: HashMap::default(),
+            beads_mode: false,
+            num_messages: None,
         }
     }
 
@@ -1150,6 +1157,43 @@ impl AcpThread {
 
     pub fn entries(&self) -> &[AgentThreadEntry] {
         &self.entries
+    }
+
+    /// Returns whether beads mode (sliding context window) is enabled
+    pub fn beads_mode(&self) -> bool {
+        self.beads_mode
+    }
+
+    /// Sets beads mode on or off.
+    pub fn set_beads_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.beads_mode = enabled;
+        cx.notify();
+    }
+
+    /// Returns the number of entries to include (reverse index from latest).
+    /// None means include all entries.
+    pub fn num_messages(&self) -> Option<usize> {
+        self.num_messages
+    }
+
+    /// Sets the number of entries to include (reverse index from latest).
+    /// None means include all entries.
+    pub fn set_num_messages(&mut self, num_messages: Option<usize>, cx: &mut Context<Self>) {
+        self.num_messages = num_messages;
+        cx.notify();
+    }
+
+    /// Returns the total number of user and assistant message entries.
+    pub fn message_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_)
+                )
+            })
+            .count()
     }
 
     pub fn session_id(&self) -> &acp::SessionId {
