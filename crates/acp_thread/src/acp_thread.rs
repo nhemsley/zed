@@ -1171,20 +1171,9 @@ impl AcpThread {
             let limit = AgentSettings::get_global(cx).focused_context_message_limit;
             let total = self.message_count();
             if limit > 0 && total > limit {
-                log::info!(
-                    "Focused context mode auto-capping num_messages to {} (total: {})",
-                    limit,
-                    total,
-                );
                 self.num_messages = Some(limit);
             }
         }
-        log::info!(
-            "Focused context mode {}: num_messages={:?}, total_messages={}",
-            if enabled { "enabled" } else { "disabled" },
-            self.num_messages,
-            self.message_count(),
-        );
         self.focused_context_mode = enabled;
         self.connection
             .set_focused_context_mode(&self.session_id, enabled, cx);

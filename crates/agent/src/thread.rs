@@ -1017,10 +1017,6 @@ impl Thread {
     /// Sets the number of messages to include (reverse index from latest).
     /// None means include all messages.
     pub fn set_num_messages(&mut self, num_messages: Option<usize>, cx: &mut Context<Self>) {
-        log::debug!(
-            "Focused context mode num_messages set to {:?}",
-            num_messages
-        );
         self.num_messages = num_messages;
         cx.notify();
     }
@@ -2092,53 +2088,6 @@ impl Thread {
 
         log::debug!("Request includes {} tools", available_tools.len());
         let messages = self.build_request_messages(available_tools, cx);
-        log::debug!("Request will include {} messages", messages.len());
-
-        // Detailed logging for debugging focused context mode and context length
-        let mut total_char_count = 0usize;
-        let mut total_estimated_tokens = 0usize;
-        for (i, msg) in messages.iter().enumerate() {
-            let msg_chars: usize = msg
-                .content
-                .iter()
-                .map(|c| match c {
-                    language_model::MessageContent::Text(t) => t.len(),
-                    language_model::MessageContent::Image(img) => img.estimate_tokens(),
-                    language_model::MessageContent::ToolUse(tu) => tu.raw_input.len(),
-                    language_model::MessageContent::ToolResult(tr) => match &tr.content {
-                        language_model::LanguageModelToolResultContent::Text(t) => t.len(),
-                        language_model::LanguageModelToolResultContent::Image(img) => {
-                            img.estimate_tokens()
-                        }
-                    },
-                    language_model::MessageContent::Thinking { text, .. } => text.len(),
-                    language_model::MessageContent::RedactedThinking(_) => 0,
-                })
-                .sum();
-            let msg_tokens = msg_chars / 4;
-            total_char_count += msg_chars;
-            total_estimated_tokens += msg_tokens;
-            log::debug!(
-                "Message {}: role={:?}, chars={}, est_tokens={}",
-                i,
-                msg.role,
-                msg_chars,
-                msg_tokens
-            );
-        }
-        log::info!(
-            "LLM Request: {} messages, total_chars={}, est_tokens={}, focused_context_mode={}, num_messages={:?}",
-            messages.len(),
-            total_char_count,
-            total_estimated_tokens,
-            self.focused_context_mode,
-            self.num_messages
-        );
-
-        // Dump context to temp files for debugging
-        if let Err(err) = Self::dump_context_to_files(&messages, &self.id) {
-            log::warn!("Failed to dump context: {}", err);
-        }
 
         let request = LanguageModelRequest {
             thread_id: Some(self.id.to_string()),
@@ -2153,7 +2102,6 @@ impl Thread {
             thinking_allowed: true,
         };
 
-        log::debug!("Completion request built successfully");
         Ok(request)
     }
 
@@ -2235,138 +2183,11 @@ impl Thread {
             .is_some_and(|turn| turn.tools.contains_key(name))
     }
 
-    /// Dumps the LLM request messages to a single file for debugging.
-    /// File is written to /tmp/zed-context-dump/{thread_id}/context_{timestamp}.md
-    fn dump_context_to_files(
-        messages: &[LanguageModelRequestMessage],
-        thread_id: &acp::SessionId,
-    ) -> Result<()> {
-        use std::fs;
-        use std::io::Write;
-
-        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-        let dump_dir = PathBuf::from("/tmp/zed-context-dump").join(thread_id.to_string());
-        fs::create_dir_all(&dump_dir)?;
-
-        let filename = format!("context_{}.md", timestamp);
-        let filepath = dump_dir.join(&filename);
-        let mut file = fs::File::create(&filepath)?;
-
-        writeln!(file, "# LLM Context Dump")?;
-        writeln!(file, "Thread: {}", thread_id)?;
-        writeln!(file, "Timestamp: {}", timestamp)?;
-        writeln!(file, "Total messages: {}", messages.len())?;
-        writeln!(file)?;
-        writeln!(file, "==========================================")?;
-        writeln!(file)?;
-
-        for (i, msg) in messages.iter().enumerate() {
-            let role_str = match msg.role {
-                Role::User => "USER",
-                Role::Assistant => "ASSISTANT",
-                Role::System => "SYSTEM",
-            };
-
-            writeln!(file, "## MESSAGE {} [{}]", i, role_str)?;
-            writeln!(file)?;
-
-            for content in &msg.content {
-                match content {
-                    language_model::MessageContent::Text(text) => {
-                        writeln!(file, "{}", text)?;
-                    }
-                    language_model::MessageContent::Image(img) => {
-                        writeln!(file, "[Image: ~{} tokens]", img.estimate_tokens())?;
-                    }
-                    language_model::MessageContent::ToolUse(tu) => {
-                        writeln!(file, "### Tool Use: {}", tu.name)?;
-                        writeln!(file, "ID: {}", tu.id)?;
-                        writeln!(file, "```json")?;
-                        writeln!(file, "{}", tu.raw_input)?;
-                        writeln!(file, "```")?;
-                    }
-                    language_model::MessageContent::ToolResult(tr) => {
-                        writeln!(file, "### Tool Result: {}", tr.tool_use_id)?;
-                        if tr.is_error {
-                            writeln!(file, "**ERROR**")?;
-                        }
-                        match &tr.content {
-                            LanguageModelToolResultContent::Text(text) => {
-                                writeln!(file, "{}", text)?;
-                            }
-                            LanguageModelToolResultContent::Image(img) => {
-                                writeln!(file, "[Image: ~{} tokens]", img.estimate_tokens())?;
-                            }
-                        }
-                    }
-                    language_model::MessageContent::Thinking { text, .. } => {
-                        writeln!(file, "### Thinking")?;
-                        writeln!(file, "{}", text)?;
-                    }
-                    language_model::MessageContent::RedactedThinking(_) => {
-                        writeln!(file, "[Redacted thinking]")?;
-                    }
-                }
-                writeln!(file)?;
-            }
-
-            writeln!(file, "==========================================")?;
-            writeln!(file)?;
-        }
-
-        log::info!("Context dumped to: {}", filepath.display());
-        Ok(())
-    }
-
-    /// Returns the character count for a message.
-    pub fn message_char_count(message: &Message) -> u32 {
-        match message {
-            Message::User(user_msg) => user_msg
-                .content
-                .iter()
-                .map(|c| match c {
-                    UserMessageContent::Text(t) => t.len() as u32,
-                    UserMessageContent::Mention { content, .. } => content.len() as u32,
-                    UserMessageContent::Image(_) => 4000, // Images count as ~4000 chars
-                })
-                .sum(),
-            Message::Agent(agent_msg) => {
-                let content_chars: u32 = agent_msg
-                    .content
-                    .iter()
-                    .map(|c| match c {
-                        AgentMessageContent::Text(t) => t.len() as u32,
-                        AgentMessageContent::Thinking { text, .. } => text.len() as u32,
-                        AgentMessageContent::RedactedThinking(_) => 0,
-                        AgentMessageContent::ToolUse(_) => 2000, // Rough estimate for tool calls
-                    })
-                    .sum();
-                let tool_result_chars: u32 = agent_msg
-                    .tool_results
-                    .values()
-                    .map(|result| match &result.content {
-                        language_model::LanguageModelToolResultContent::Text(text) => {
-                            text.len() as u32
-                        }
-                        language_model::LanguageModelToolResultContent::Image(_) => 4000,
-                    })
-                    .sum();
-                content_chars + tool_result_chars
-            }
-            Message::Resume => 40, // "Continue where you left off" is ~40 chars
-        }
-    }
-
     fn build_request_messages(
         &self,
         available_tools: Vec<SharedString>,
         cx: &App,
     ) -> Vec<LanguageModelRequestMessage> {
-        log::trace!(
-            "Building request messages from {} thread messages",
-            self.messages.len()
-        );
-
         let system_prompt = SystemPromptTemplate {
             project: self.project_context.read(cx),
             available_tools,
@@ -2386,14 +2207,6 @@ impl Thread {
             let take_count = self.num_messages.unwrap_or(self.messages.len());
             let total_count = self.messages.len();
             let skip_count = total_count.saturating_sub(take_count);
-
-            log::info!(
-                "Focused context mode: including {}/{} messages (num_messages={:?}), excluded: {}",
-                take_count.min(total_count),
-                total_count,
-                self.num_messages,
-                skip_count,
-            );
 
             for message in self.messages.iter().skip(skip_count) {
                 messages.extend(message.to_request());
