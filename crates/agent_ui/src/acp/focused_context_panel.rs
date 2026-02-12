@@ -11,20 +11,20 @@ use ui::{
 
 struct SliderDrag;
 
-pub enum BeadsContextPanelEvent {
+pub enum FocusedContextPanelEvent {
     ScrollToMessage {
         message_index: usize,
         total_messages: usize,
     },
 }
 
-pub struct BeadsContextPanel {
+pub struct FocusedContextPanel {
     thread: Entity<AcpThread>,
 }
 
-impl EventEmitter<BeadsContextPanelEvent> for BeadsContextPanel {}
+impl EventEmitter<FocusedContextPanelEvent> for FocusedContextPanel {}
 
-impl BeadsContextPanel {
+impl FocusedContextPanel {
     pub fn new(thread: Entity<AcpThread>, _cx: &mut Context<Self>) -> Self {
         Self { thread }
     }
@@ -162,7 +162,7 @@ impl BeadsContextPanel {
         let thumb_border = theme.colors().border;
 
         div()
-            .id("beads-slider")
+            .id("focused-context-slider")
             .w_full()
             .flex()
             .flex_row()
@@ -175,7 +175,7 @@ impl BeadsContextPanel {
             )
             .child(
                 div()
-                    .id("beads-slider-track-area")
+                    .id("focused-context-slider-track-area")
                     .flex_1()
                     .h(thumb_size + px(4.0))
                     .flex()
@@ -227,7 +227,7 @@ impl BeadsContextPanel {
                     ),
             )
             .child(
-                IconButton::new("beads-reset", IconName::RotateCcw)
+                IconButton::new("focused-context-reset", IconName::RotateCcw)
                     .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Include all messages"))
@@ -344,7 +344,7 @@ impl BeadsContextPanel {
                             });
 
                             if event.modifiers().control {
-                                cx.emit(BeadsContextPanelEvent::ScrollToMessage {
+                                cx.emit(FocusedContextPanelEvent::ScrollToMessage {
                                     message_index: index,
                                     total_messages: total,
                                 });
@@ -355,13 +355,13 @@ impl BeadsContextPanel {
     }
 }
 
-impl Render for BeadsContextPanel {
+impl Render for FocusedContextPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let thread = self.thread.read(cx);
-        let beads_mode = thread.beads_mode();
+        let focused_context_mode = thread.focused_context_mode();
         let has_messages = thread.message_count() > 0;
 
-        if !beads_mode || !has_messages {
+        if !focused_context_mode || !has_messages {
             return div().into_any();
         }
 

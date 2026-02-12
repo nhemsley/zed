@@ -53,7 +53,7 @@ pub struct DbThread {
     #[serde(default)]
     pub imported: bool,
     #[serde(default)]
-    pub beads_mode: Option<bool>,
+    pub focused_context_mode: Option<bool>,
     #[serde(default)]
     pub num_messages: Option<usize>,
 }
@@ -97,7 +97,7 @@ impl SharedThread {
             completion_mode: self.completion_mode,
             profile: None,
             imported: true,
-            beads_mode: None,
+            focused_context_mode: None,
             num_messages: None,
         }
     }
@@ -273,7 +273,7 @@ impl DbThread {
             completion_mode: thread.completion_mode,
             profile: thread.profile,
             imported: false,
-            beads_mode: None,
+            focused_context_mode: None,
             num_messages: None,
         })
     }
@@ -569,7 +569,7 @@ mod tests {
             completion_mode: None,
             profile: None,
             imported: false,
-            beads_mode: None,
+            focused_context_mode: None,
             num_messages: None,
         }
     }

@@ -895,7 +895,7 @@ pub struct AcpThread {
     pending_terminal_output: HashMap<acp::TerminalId, Vec<Vec<u8>>>,
     pending_terminal_exit: HashMap<acp::TerminalId, acp::TerminalExitStatus>,
     /// When enabled, only sends recent num_messages entries to the LLM
-    beads_mode: bool,
+    focused_context_mode: bool,
     /// How many entries back from the latest to include in context.
     /// None means include all entries.
     num_messages: Option<usize>,
@@ -1130,7 +1130,7 @@ impl AcpThread {
             terminals: HashMap::default(),
             pending_terminal_output: HashMap::default(),
             pending_terminal_exit: HashMap::default(),
-            beads_mode: false,
+            focused_context_mode: false,
             num_messages: None,
         }
     }
@@ -1159,20 +1159,20 @@ impl AcpThread {
         &self.entries
     }
 
-    /// Returns whether beads mode (sliding context window) is enabled
-    pub fn beads_mode(&self) -> bool {
-        self.beads_mode
+    /// Returns whether focused context mode (sliding context window) is enabled
+    pub fn focused_context_mode(&self) -> bool {
+        self.focused_context_mode
     }
 
-    /// Sets beads mode on or off.
-    /// When enabling, auto-caps num_messages at beads_message_limit if currently None.
-    pub fn set_beads_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+    /// Sets focused context mode on or off.
+    /// When enabling, auto-caps num_messages at focused_context_message_limit if currently None.
+    pub fn set_focused_context_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
         if enabled && self.num_messages.is_none() {
-            let limit = AgentSettings::get_global(cx).beads_message_limit;
+            let limit = AgentSettings::get_global(cx).focused_context_message_limit;
             let total = self.message_count();
             if limit > 0 && total > limit {
                 log::info!(
-                    "Beads mode auto-capping num_messages to {} (total: {})",
+                    "Focused context mode auto-capping num_messages to {} (total: {})",
                     limit,
                     total,
                 );
@@ -1180,14 +1180,14 @@ impl AcpThread {
             }
         }
         log::info!(
-            "Beads mode {}: num_messages={:?}, total_messages={}",
+            "Focused context mode {}: num_messages={:?}, total_messages={}",
             if enabled { "enabled" } else { "disabled" },
             self.num_messages,
             self.message_count(),
         );
-        self.beads_mode = enabled;
+        self.focused_context_mode = enabled;
         self.connection
-            .set_beads_mode(&self.session_id, enabled, cx);
+            .set_focused_context_mode(&self.session_id, enabled, cx);
         if let Some(num_messages) = self.num_messages {
             self.connection
                 .set_num_messages(&self.session_id, Some(num_messages), cx);

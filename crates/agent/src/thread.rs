@@ -601,7 +601,7 @@ pub struct Thread {
     user_store: Entity<UserStore>,
     completion_mode: CompletionMode,
     /// When enabled, only sends recent num_messages messages to the LLM
-    beads_mode: bool,
+    focused_context_mode: bool,
     /// Reverse index: how many messages back from the latest to include in context.
     /// None means include all messages.
     num_messages: Option<usize>,
@@ -664,7 +664,7 @@ impl Thread {
             messages: Vec::new(),
             user_store: project.read(cx).user_store(),
             completion_mode: AgentSettings::get_global(cx).preferred_completion_mode,
-            beads_mode: false,
+            focused_context_mode: false,
             num_messages: None,
             running_turn: None,
             pending_message: None,
@@ -867,7 +867,7 @@ impl Thread {
             messages: db_thread.messages,
             user_store: project.read(cx).user_store(),
             completion_mode: db_thread.completion_mode.unwrap_or_default(),
-            beads_mode: db_thread.beads_mode.unwrap_or(false),
+            focused_context_mode: db_thread.focused_context_mode.unwrap_or(false),
             num_messages: db_thread.num_messages,
             running_turn: None,
             pending_message: None,
@@ -909,7 +909,7 @@ impl Thread {
             completion_mode: Some(self.completion_mode),
             profile: Some(self.profile_id.clone()),
             imported: self.imported,
-            beads_mode: Some(self.beads_mode),
+            focused_context_mode: Some(self.focused_context_mode),
             num_messages: self.num_messages,
         };
 
@@ -985,16 +985,16 @@ impl Thread {
         self.completion_mode
     }
 
-    /// Returns whether beads mode (sliding context window) is enabled
-    pub fn beads_mode(&self) -> bool {
-        self.beads_mode
+    /// Returns whether focused context mode (sliding context window) is enabled
+    pub fn focused_context_mode(&self) -> bool {
+        self.focused_context_mode
     }
 
-    /// Sets beads mode on or off.
+    /// Sets focused context mode on or off.
     /// Auto-cap logic is handled by AcpThread; this is a passive store
     /// used by build_request_messages().
-    pub fn set_beads_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.beads_mode = enabled;
+    pub fn set_focused_context_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.focused_context_mode = enabled;
         cx.notify();
     }
 
@@ -1017,7 +1017,10 @@ impl Thread {
     /// Sets the number of messages to include (reverse index from latest).
     /// None means include all messages.
     pub fn set_num_messages(&mut self, num_messages: Option<usize>, cx: &mut Context<Self>) {
-        log::debug!("Beads mode num_messages set to {:?}", num_messages);
+        log::debug!(
+            "Focused context mode num_messages set to {:?}",
+            num_messages
+        );
         self.num_messages = num_messages;
         cx.notify();
     }
@@ -2091,7 +2094,7 @@ impl Thread {
         let messages = self.build_request_messages(available_tools, cx);
         log::debug!("Request will include {} messages", messages.len());
 
-        // Detailed logging for debugging beads mode and context length
+        // Detailed logging for debugging focused context mode and context length
         let mut total_char_count = 0usize;
         let mut total_estimated_tokens = 0usize;
         for (i, msg) in messages.iter().enumerate() {
@@ -2124,11 +2127,11 @@ impl Thread {
             );
         }
         log::info!(
-            "LLM Request: {} messages, total_chars={}, est_tokens={}, beads_mode={}, num_messages={:?}",
+            "LLM Request: {} messages, total_chars={}, est_tokens={}, focused_context_mode={}, num_messages={:?}",
             messages.len(),
             total_char_count,
             total_estimated_tokens,
-            self.beads_mode,
+            self.focused_context_mode,
             self.num_messages
         );
 
@@ -2379,13 +2382,13 @@ impl Thread {
             reasoning_details: None,
         }];
 
-        if self.beads_mode {
+        if self.focused_context_mode {
             let take_count = self.num_messages.unwrap_or(self.messages.len());
             let total_count = self.messages.len();
             let skip_count = total_count.saturating_sub(take_count);
 
             log::info!(
-                "Beads mode: including {}/{} messages (num_messages={:?}), excluded: {}",
+                "Focused context mode: including {}/{} messages (num_messages={:?}), excluded: {}",
                 take_count.min(total_count),
                 total_count,
                 self.num_messages,

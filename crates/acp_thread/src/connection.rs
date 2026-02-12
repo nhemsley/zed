@@ -94,9 +94,15 @@ pub trait AgentConnection {
         None
     }
 
-    /// Notifies the connection that beads mode (context windowing) has been toggled.
+    /// Notifies the connection that focused context mode (context windowing) has been toggled.
     /// Backends that build their own LLM requests should use this to filter messages.
-    fn set_beads_mode(&self, _session_id: &acp::SessionId, _enabled: bool, _cx: &mut App) {}
+    fn set_focused_context_mode(
+        &self,
+        _session_id: &acp::SessionId,
+        _enabled: bool,
+        _cx: &mut App,
+    ) {
+    }
 
     /// Notifies the connection that the number of messages to include has changed.
     /// `None` means include all messages.

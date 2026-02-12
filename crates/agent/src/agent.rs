@@ -313,7 +313,7 @@ impl NativeAgent {
         let project = thread.project.clone();
         let action_log = thread.action_log.clone();
         let prompt_capabilities_rx = thread.prompt_capabilities_rx.clone();
-        let beads_mode = thread.beads_mode();
+        let focused_context_mode = thread.focused_context_mode();
         let num_messages = thread.num_messages();
         let acp_thread = cx.new(|cx| {
             let mut acp_thread = acp_thread::AcpThread::new(
@@ -325,8 +325,8 @@ impl NativeAgent {
                 prompt_capabilities_rx,
                 cx,
             );
-            if beads_mode {
-                acp_thread.set_beads_mode(true, cx);
+            if focused_context_mode {
+                acp_thread.set_focused_context_mode(true, cx);
             }
             if let Some(num) = num_messages {
                 acp_thread.set_num_messages(Some(num), cx);
@@ -817,10 +817,10 @@ impl NativeAgent {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        let beads_mode = session
+        let focused_context_mode = session
             .acp_thread
             .upgrade()
-            .map(|acp| acp.read(cx).beads_mode());
+            .map(|acp| acp.read(cx).focused_context_mode());
         let num_messages = session
             .acp_thread
             .upgrade()
@@ -831,8 +831,8 @@ impl NativeAgent {
                 return;
             };
             let mut db_thread = db_thread.await;
-            if let Some(beads_mode) = beads_mode {
-                db_thread.beads_mode = Some(beads_mode);
+            if let Some(focused_context_mode) = focused_context_mode {
+                db_thread.focused_context_mode = Some(focused_context_mode);
             }
             db_thread.num_messages = num_messages;
             database.save_thread(id, db_thread).await.log_err();
@@ -1370,7 +1370,7 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         Some(Rc::new(self.clone()) as Rc<dyn acp_thread::AgentTelemetry>)
     }
 
-    fn set_beads_mode(&self, session_id: &acp::SessionId, enabled: bool, cx: &mut App) {
+    fn set_focused_context_mode(&self, session_id: &acp::SessionId, enabled: bool, cx: &mut App) {
         let thread = self
             .0
             .read(cx)
@@ -1378,7 +1378,9 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
             .get(session_id)
             .map(|session| session.thread.clone());
         if let Some(thread) = thread {
-            thread.update(cx, |thread, cx| thread.set_beads_mode(enabled, cx));
+            thread.update(cx, |thread, cx| {
+                thread.set_focused_context_mode(enabled, cx)
+            });
         }
     }
 

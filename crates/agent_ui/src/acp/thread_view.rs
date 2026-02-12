@@ -58,9 +58,9 @@ use workspace::{CollaboratorId, NewTerminal, Toast, Workspace, notifications::No
 use zed_actions::agent::{Chat, ToggleModelSelector};
 use zed_actions::assistant::OpenRulesLibrary;
 
-use super::beads_context_panel;
 use super::config_options::ConfigOptionsView;
 use super::entry_view_state::EntryViewState;
+use super::focused_context_panel;
 use crate::acp::AcpModelSelectorPopover;
 use crate::acp::ModeSelector;
 use crate::acp::entry_view_state::{EntryViewEvent, ViewEvent};
@@ -319,8 +319,8 @@ pub struct AcpThreadView {
     model_selector: Option<Entity<AcpModelSelectorPopover>>,
     config_options_view: Option<Entity<ConfigOptionsView>>,
     profile_selector: Option<Entity<ProfileSelector>>,
-    beads_context_panel: Option<Entity<beads_context_panel::BeadsContextPanel>>,
-    _beads_subscription: Option<Subscription>,
+    focused_context_panel: Option<Entity<focused_context_panel::FocusedContextPanel>>,
+    _focused_context_subscription: Option<Subscription>,
     notifications: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
     thread_retry_status: Option<RetryStatus>,
@@ -496,8 +496,8 @@ impl AcpThreadView {
             model_selector: None,
             config_options_view: None,
             profile_selector: None,
-            beads_context_panel: None,
-            _beads_subscription: None,
+            focused_context_panel: None,
+            _focused_context_subscription: None,
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
             list_state: list_state,
@@ -788,14 +788,19 @@ impl AcpThreadView {
                             })
                         });
 
-                        this.beads_context_panel = this.thread().map(|thread| {
+                        this.focused_context_panel = this.thread().map(|thread| {
                             cx.new(|cx| {
-                                beads_context_panel::BeadsContextPanel::new(thread.clone(), cx)
+                                focused_context_panel::FocusedContextPanel::new(thread.clone(), cx)
                             })
                         });
-                        this._beads_subscription = this.beads_context_panel.as_ref().map(|panel| {
-                            cx.subscribe_in(panel, window, Self::handle_beads_context_panel_event)
-                        });
+                        this._focused_context_subscription =
+                            this.focused_context_panel.as_ref().map(|panel| {
+                                cx.subscribe_in(
+                                    panel,
+                                    window,
+                                    Self::handle_focused_context_panel_event,
+                                )
+                            });
 
                         this.message_editor.focus_handle(cx).focus(window, cx);
 
@@ -5200,7 +5205,7 @@ impl AcpThreadView {
                             .gap_0p5()
                             .child(self.render_add_context_button(cx))
                             .child(self.render_follow_toggle(cx))
-                            .children(self.render_beads_mode_toggle(cx))
+                            .children(self.render_focused_context_mode_toggle(cx))
                             .children(self.render_burn_mode_toggle(cx)),
                     )
                     .child(
@@ -5372,25 +5377,25 @@ impl AcpThreadView {
         Some(())
     }
 
-    fn render_beads_mode_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_focused_context_mode_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let thread = self.thread()?;
-        let beads_mode_enabled = thread.read(cx).beads_mode();
+        let focused_context_mode_enabled = thread.read(cx).focused_context_mode();
 
         Some(
-            IconButton::new("beads-mode", IconName::ZedBeadsMode)
+            IconButton::new("focused-context-mode", IconName::ZedFocusedContext)
                 .icon_size(IconSize::Small)
                 .icon_color(Color::Muted)
-                .toggle_state(beads_mode_enabled)
+                .toggle_state(focused_context_mode_enabled)
                 .selected_icon_color(Color::Accent)
                 .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.toggle_beads_mode(cx);
+                    this.toggle_focused_context_mode(cx);
                 }))
                 .tooltip(move |_window, cx| {
                     Tooltip::with_meta(
-                        if beads_mode_enabled {
-                            "Beads Mode (On)"
+                        if focused_context_mode_enabled {
+                            "Focused Context (On)"
                         } else {
-                            "Beads Mode (Off)"
+                            "Focused Context (Off)"
                         },
                         None,
                         "Limits context to recent messages only",
@@ -5401,11 +5406,11 @@ impl AcpThreadView {
         )
     }
 
-    fn toggle_beads_mode(&mut self, cx: &mut Context<Self>) {
+    fn toggle_focused_context_mode(&mut self, cx: &mut Context<Self>) {
         if let Some(thread) = self.thread() {
             thread.update(cx, |thread, cx| {
-                let current = thread.beads_mode();
-                thread.set_beads_mode(!current, cx);
+                let current = thread.focused_context_mode();
+                thread.set_focused_context_mode(!current, cx);
             });
         }
     }
@@ -5867,15 +5872,15 @@ impl AcpThreadView {
         cx.notify();
     }
 
-    fn handle_beads_context_panel_event(
+    fn handle_focused_context_panel_event(
         &mut self,
-        _panel: &Entity<beads_context_panel::BeadsContextPanel>,
-        event: &beads_context_panel::BeadsContextPanelEvent,
+        _panel: &Entity<focused_context_panel::FocusedContextPanel>,
+        event: &focused_context_panel::FocusedContextPanelEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
-            beads_context_panel::BeadsContextPanelEvent::ScrollToMessage {
+            focused_context_panel::FocusedContextPanelEvent::ScrollToMessage {
                 message_index,
                 total_messages,
             } => {
@@ -7243,7 +7248,7 @@ impl Render for AcpThreadView {
                 }
                 _ => this,
             })
-            .children(self.beads_context_panel.clone())
+            .children(self.focused_context_panel.clone())
             .children(self.render_thread_retry_status_callout(window, cx))
             .when(self.show_codex_windows_warning, |this| {
                 this.child(self.render_codex_windows_warning(cx))

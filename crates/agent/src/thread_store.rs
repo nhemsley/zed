@@ -144,7 +144,7 @@ mod tests {
             completion_mode: None,
             profile: None,
             imported: false,
-            beads_mode: None,
+            focused_context_mode: None,
             num_messages: None,
         }
     }
