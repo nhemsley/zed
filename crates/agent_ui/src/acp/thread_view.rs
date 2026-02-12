@@ -5820,55 +5820,28 @@ impl AcpThreadView {
         cx: &mut Context<Self>,
     ) {
         match event {
-            beads_context_panel::BeadsContextPanelEvent::ScrollToMessage { message_index } => {
+            beads_context_panel::BeadsContextPanelEvent::ScrollToMessage {
+                message_index,
+                total_messages,
+            } => {
                 let Some(thread) = self.thread() else {
                     return;
                 };
 
-                let entries = thread.read(cx).entries();
-                log::info!(
-                    "ScrollToMessage: message_index={}, total_entries={}",
-                    message_index,
-                    entries.len()
-                );
-
-                // Map message_index to entry index by counting
-                // UserMessage and AssistantMessage entries (skipping ToolCall).
-                let mut message_count = 0;
-                let mut target_entry_index = None;
-                for (entry_index, entry) in entries.iter().enumerate() {
-                    match entry {
-                        AgentThreadEntry::UserMessage(_)
-                        | AgentThreadEntry::AssistantMessage(_) => {
-                            if message_count == *message_index {
-                                target_entry_index = Some(entry_index);
-                                log::info!(
-                                    "Found target: message_index={} -> entry_index={}",
-                                    message_index,
-                                    entry_index
-                                );
-                                break;
-                            }
-                            message_count += 1;
-                        }
-                        AgentThreadEntry::ToolCall(_) => {}
-                    }
+                let total_entries = thread.read(cx).entries().len();
+                if *total_messages == 0 || total_entries == 0 {
+                    return;
                 }
 
-                if let Some(entry_index) = target_entry_index {
-                    self.list_state.scroll_to(ListOffset {
-                        item_ix: entry_index,
-                        offset_in_item: px(0.0),
-                    });
-                    cx.notify();
-                } else {
-                    log::warn!(
-                        "Could not find entry for message_index={}, counted {} messages in {} entries",
-                        message_index,
-                        message_count,
-                        entries.len()
-                    );
-                }
+                let fraction = *message_index as f64 / *total_messages as f64;
+                let target_entry_index = (fraction * total_entries as f64).round() as usize;
+                let target_entry_index = target_entry_index.min(total_entries.saturating_sub(1));
+
+                self.list_state.scroll_to(ListOffset {
+                    item_ix: target_entry_index,
+                    offset_in_item: px(0.0),
+                });
+                cx.notify();
             }
         }
     }

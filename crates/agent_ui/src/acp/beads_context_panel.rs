@@ -12,7 +12,10 @@ use ui::{
 struct SliderDrag;
 
 pub enum BeadsContextPanelEvent {
-    ScrollToMessage { message_index: usize },
+    ScrollToMessage {
+        message_index: usize,
+        total_messages: usize,
+    },
 }
 
 pub struct BeadsContextPanel {
@@ -350,6 +353,7 @@ impl BeadsContextPanel {
                             if event.modifiers().control {
                                 cx.emit(BeadsContextPanelEvent::ScrollToMessage {
                                     message_index: index,
+                                    total_messages: total,
                                 });
                             }
                         }),
