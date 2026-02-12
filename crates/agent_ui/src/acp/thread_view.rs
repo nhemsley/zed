@@ -7116,24 +7116,45 @@ impl Render for AcpThreadView {
                     .into_any(),
                 ThreadState::Ready { .. } => v_flex().flex_1().map(|this| {
                     if has_messages {
+                        let agent_context_minimap = self
+                            .beads_context_panel
+                            .as_ref()
+                            .map(|panel| panel.read(cx).render_agent_context_minimap(window, cx));
+
                         this.child(
-                            list(
-                                self.list_state.clone(),
-                                cx.processor(|this, index: usize, window, cx| {
-                                    let Some((entry, len)) = this.thread().and_then(|thread| {
-                                        let entries = &thread.read(cx).entries();
-                                        Some((entries.get(index)?, entries.len()))
-                                    }) else {
-                                        return Empty.into_any();
-                                    };
-                                    this.render_entry(index, len, entry, window, cx)
-                                }),
-                            )
-                            .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
-                            .flex_grow()
-                            .into_any(),
+                            h_flex()
+                                .flex_1()
+                                .overflow_hidden()
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .child(
+                                            list(
+                                                self.list_state.clone(),
+                                                cx.processor(|this, index: usize, window, cx| {
+                                                    let Some((entry, len)) =
+                                                        this.thread().and_then(|thread| {
+                                                            let entries =
+                                                                &thread.read(cx).entries();
+                                                            Some((
+                                                                entries.get(index)?,
+                                                                entries.len(),
+                                                            ))
+                                                        })
+                                                    else {
+                                                        return Empty.into_any();
+                                                    };
+                                                    this.render_entry(index, len, entry, window, cx)
+                                                }),
+                                            )
+                                            .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+                                            .flex_grow()
+                                            .into_any(),
+                                        )
+                                        .vertical_scrollbar_for(&self.list_state, window, cx),
+                                )
+                                .children(agent_context_minimap),
                         )
-                        .vertical_scrollbar_for(&self.list_state, window, cx)
                         .into_any()
                     } else {
                         this.child(self.render_recent_history(cx)).into_any()

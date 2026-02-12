@@ -1,7 +1,7 @@
 use agent::{Message, Thread};
 use gpui::{
-    App, Context, DragMoveEvent, Entity, IntoElement, MouseButton, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, px,
+    AnyElement, App, Context, DragMoveEvent, Entity, IntoElement, MouseButton, ParentElement,
+    Render, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use language_model::Role;
 use ui::{
@@ -208,6 +208,73 @@ impl BeadsContextPanel {
                         });
                     })),
             )
+    }
+
+    pub fn render_agent_context_minimap(&self, _window: &mut Window, cx: &App) -> AnyElement {
+        let thread = self.thread.read(cx);
+        if !thread.beads_mode() || thread.message_count() == 0 {
+            return div().into_any();
+        }
+
+        let total = thread.message_count();
+        let included = {
+            let num = thread.num_messages().unwrap_or(total).min(total);
+            num
+        };
+        let skip_count = total.saturating_sub(included);
+
+        let theme = cx.theme();
+        let user_color = theme.colors().icon_accent;
+        let agent_color = theme.colors().icon_muted;
+        let dimmed_user = user_color.opacity(0.25);
+        let dimmed_agent = agent_color.opacity(0.25);
+
+        let bar_gap = px(1.0);
+        let minimap_width = px(20.0);
+
+        let messages: Vec<(Role, u32)> = thread
+            .messages()
+            .iter()
+            .map(|message| (message.role(), Thread::message_char_count(message)))
+            .collect();
+
+        let total_chars: u32 = messages.iter().map(|(_, c)| *c).sum::<u32>().max(1);
+
+        div()
+            .h_full()
+            .w(minimap_width)
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap(bar_gap)
+            .overflow_y_hidden()
+            .py_1()
+            .children(
+                messages
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(index, (role, char_count))| {
+                        let is_included = index >= skip_count;
+                        let height_fraction =
+                            (char_count as f32 / total_chars as f32).clamp(0.005, 1.0);
+                        let is_user = role == Role::User;
+                        let bar_color = match (is_user, is_included) {
+                            (true, true) => user_color,
+                            (true, false) => dimmed_user,
+                            (false, true) => agent_color,
+                            (false, false) => dimmed_agent,
+                        };
+
+                        div()
+                            .w_full()
+                            .flex_grow()
+                            .min_h(px(2.0))
+                            .h(gpui::relative(height_fraction))
+                            .bg(bar_color)
+                            .rounded_l(px(1.0))
+                    }),
+            )
+            .into_any()
     }
 
     fn render_histogram(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
