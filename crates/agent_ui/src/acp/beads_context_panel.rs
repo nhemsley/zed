@@ -93,8 +93,10 @@ impl BeadsContextPanel {
                     .on_drag_move::<SliderDrag>(cx.listener(
                         move |this, event: &DragMoveEvent<SliderDrag>, _window, cx| {
                             let bounds = event.bounds;
-                            let relative_x = event.event.position.x - bounds.origin.x;
-                            let frac = relative_x / bounds.size.width;
+                            // Calculate position from the RIGHT edge to match right-anchored visual
+                            let relative_x_from_right =
+                                bounds.origin.x + bounds.size.width - event.event.position.x;
+                            let frac = relative_x_from_right / bounds.size.width;
                             this.set_num_messages_from_fraction(frac, cx);
                         },
                     ))
@@ -108,7 +110,7 @@ impl BeadsContextPanel {
                             .child(
                                 div()
                                     .absolute()
-                                    .left_0()
+                                    .right_0()
                                     .top_0()
                                     .h_full()
                                     .rounded(track_height / 2.0)
@@ -119,8 +121,8 @@ impl BeadsContextPanel {
                                 div()
                                     .absolute()
                                     .top(-(thumb_size - track_height) / 2.0)
-                                    .left(gpui::relative(fraction))
-                                    .ml(-(thumb_size / 2.0))
+                                    .right(gpui::relative(fraction))
+                                    .mr(-(thumb_size / 2.0))
                                     .size(thumb_size)
                                     .rounded(thumb_size / 2.0)
                                     .bg(thumb_color)
