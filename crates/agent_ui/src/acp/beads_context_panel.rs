@@ -327,25 +327,27 @@ impl BeadsContextPanel {
                     .tooltip(Tooltip::text(tooltip_text.clone()))
                     .on_click(
                         cx.listener(move |this, event: &gpui::ClickEvent, _window, cx| {
-                            if !event.modifiers().control {
-                                return;
-                            }
                             let total = this.thread.read(cx).message_count();
                             let new_included = total.saturating_sub(index);
-                            let current_included = this.effective_num_messages(cx);
-                            if new_included > current_included {
-                                let num_messages = if new_included >= total {
-                                    None
-                                } else {
-                                    Some(new_included)
-                                };
-                                this.thread.update(cx, |thread, cx| {
-                                    thread.set_num_messages(num_messages, cx);
+
+                            // Click: set this message as the first included
+                            // message and update the slider
+                            let num_messages = if new_included >= total {
+                                None
+                            } else {
+                                Some(new_included)
+                            };
+                            this.thread.update(cx, |thread, cx| {
+                                thread.set_num_messages(num_messages, cx);
+                            });
+
+                            // Ctrl-click: also scroll the message list to
+                            // this message
+                            if event.modifiers().control {
+                                cx.emit(BeadsContextPanelEvent::ScrollToMessage {
+                                    message_index: index,
                                 });
                             }
-                            cx.emit(BeadsContextPanelEvent::ScrollToMessage {
-                                message_index: index,
-                            });
                         }),
                     )
             }))
