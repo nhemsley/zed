@@ -2332,6 +2332,38 @@ impl AcpThreadView {
             .detach_and_log_err(cx);
     }
 
+    fn set_context_from_entry(&mut self, entry_ix: usize, cx: &mut Context<Self>) {
+        let Some(acp_thread) = self.thread() else {
+            return;
+        };
+        let Some(native_thread) = self.as_native_thread(cx) else {
+            return;
+        };
+
+        // Count UserMessage/AssistantMessage entries up to entry_ix to get message index
+        let entries = acp_thread.read(cx).entries();
+        let mut message_index = 0;
+        for (i, entry) in entries.iter().enumerate() {
+            if i >= entry_ix {
+                break;
+            }
+            match entry {
+                AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_) => {
+                    message_index += 1;
+                }
+                AgentThreadEntry::ToolCall(_) => {}
+            }
+        }
+
+        // Set context to start from this message onward
+        let total_messages = native_thread.read(cx).message_count();
+        let num_messages_from_here = total_messages.saturating_sub(message_index);
+
+        native_thread.update(cx, |thread, cx| {
+            thread.set_num_messages(Some(num_messages_from_here), cx);
+        });
+    }
+
     fn render_entry(
         &self,
         entry_ix: usize,
@@ -2420,33 +2452,47 @@ impl AcpThreadView {
                         })
                     }))
                     .child(
-                        div()
-                            .relative()
+                        h_flex()
+                            .gap_1()
+                            .items_start()
+                            .child(
+                                IconButton::new(("context-from-here", entry_ix), IconName::ArrowRight)
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Set context window to start from this message"))
+                                    .on_click(cx.listener(move |this, _, _window, cx| {
+                                        this.set_context_from_entry(entry_ix, cx);
+                                    }))
+                            )
                             .child(
                                 div()
-                                    .py_3()
-                                    .px_2()
-                                    .rounded_md()
-                                    .shadow_md()
-                                    .bg(cx.theme().colors().editor_background)
-                                    .border_1()
-                                    .when(is_indented, |this| {
-                                        this.py_2().px_2().shadow_sm()
-                                    })
-                                    .when(editing && !editor_focus, |this| this.border_dashed())
-                                    .border_color(cx.theme().colors().border)
-                                    .map(|this|{
-                                        if editing && editor_focus {
-                                            this.border_color(focus_border)
-                                        } else if message.id.is_some() {
-                                            this.hover(|s| s.border_color(focus_border.opacity(0.8)))
-                                        } else {
-                                            this
-                                        }
-                                    })
-                                    .text_xs()
-                                    .child(editor.clone().into_any_element())
-                            )
+                                    .flex_1()
+                                    .relative()
+                                    .child(
+                                        div()
+                                            .py_3()
+                                            .px_2()
+                                            .rounded_md()
+                                            .shadow_md()
+                                            .bg(cx.theme().colors().editor_background)
+                                            .border_1()
+                                            .when(is_indented, |this| {
+                                                this.py_2().px_2().shadow_sm()
+                                            })
+                                            .when(editing && !editor_focus, |this| this.border_dashed())
+                                            .border_color(cx.theme().colors().border)
+                                            .map(|this|{
+                                                if editing && editor_focus {
+                                                    this.border_color(focus_border)
+                                                } else if message.id.is_some() {
+                                                    this.hover(|s| s.border_color(focus_border.opacity(0.8)))
+                                                } else {
+                                                    this
+                                                }
+                                            })
+                                            .text_xs()
+                                            .child(editor.clone().into_any_element())
+                                    )
                             .when(editor_focus, |this| {
                                 let base_container = h_flex()
                                     .absolute()
@@ -2523,7 +2569,8 @@ impl AcpThreadView {
                                             )
                                     )
                                 }
-                            }),
+                            })
+                            )
                     )
                     .into_any()
             }
