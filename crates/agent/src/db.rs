@@ -67,6 +67,10 @@ pub struct DbThread {
     #[serde(default)]
     pub imported: bool,
     #[serde(default)]
+    pub focused_context_mode: Option<bool>,
+    #[serde(default)]
+    pub num_messages: Option<usize>,
+    #[serde(default)]
     pub subagent_context: Option<crate::SubagentContext>,
     #[serde(default)]
     pub git_worktree_info: Option<AgentGitWorktreeInfo>,
@@ -107,6 +111,8 @@ impl SharedThread {
             model: self.model,
             profile: None,
             imported: true,
+            focused_context_mode: None,
+            num_messages: None,
             subagent_context: None,
             git_worktree_info: None,
         }
@@ -282,6 +288,8 @@ impl DbThread {
             model: thread.model,
             profile: thread.profile,
             imported: false,
+            focused_context_mode: None,
+            num_messages: None,
             subagent_context: None,
             git_worktree_info: None,
         })
@@ -608,6 +616,8 @@ mod tests {
             model: None,
             profile: None,
             imported: false,
+            focused_context_mode: None,
+            num_messages: None,
             subagent_context: None,
             git_worktree_info: None,
         }

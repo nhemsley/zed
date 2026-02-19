@@ -161,6 +161,8 @@ mod tests {
             model: None,
             profile: None,
             imported: false,
+            focused_context_mode: None,
+            num_messages: None,
             subagent_context: None,
             git_worktree_info: None,
         }

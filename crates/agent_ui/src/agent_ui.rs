@@ -572,6 +572,7 @@ mod tests {
             message_editor_min_lines: 1,
             tool_permissions: Default::default(),
             show_turn_stats: false,
+            focused_context_message_limit: 100,
         };
 
         cx.update(|cx| {

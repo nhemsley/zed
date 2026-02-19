@@ -111,6 +111,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: false
     pub show_turn_stats: Option<bool>,
+    /// When focused context mode is enabled, automatically cap the context window at this many
+    /// messages. The user can still override via the slider. Set to 0 to disable auto-capping.
+    ///
+    /// Default: 100
+    pub focused_context_message_limit: Option<usize>,
     /// Per-tool permission rules for granular control over which tool actions
     /// require confirmation.
     ///
