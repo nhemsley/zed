@@ -354,6 +354,8 @@ impl NativeAgent {
         let project = thread.project.clone();
         let action_log = thread.action_log.clone();
         let prompt_capabilities_rx = thread.prompt_capabilities_rx.clone();
+        let focused_context_mode = thread.focused_context_mode();
+        let num_messages = thread.num_messages();
         let acp_thread = cx.new(|cx| {
             acp_thread::AcpThread::new(
                 parent_session_id,
@@ -366,6 +368,12 @@ impl NativeAgent {
                 cx,
             )
         });
+
+        if focused_context_mode || num_messages.is_some() {
+            acp_thread.update(cx, |acp_thread, cx| {
+                acp_thread.restore_focused_context_state(focused_context_mode, num_messages, cx);
+            });
+        }
 
         let registry = LanguageModelRegistry::read_global(cx);
         let summarization_model = registry.thread_summary_model().map(|c| c.model);
@@ -850,12 +858,16 @@ impl NativeAgent {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
+        let focused_context_mode = session.acp_thread.read(cx).focused_context_mode();
+        let num_messages = session.acp_thread.read(cx).num_messages();
         let thread_store = self.thread_store.clone();
         session.pending_save = cx.spawn(async move |_, cx| {
             let Some(database) = database_future.await.map_err(|err| anyhow!(err)).log_err() else {
                 return;
             };
-            let db_thread = db_thread.await;
+            let mut db_thread = db_thread.await;
+            db_thread.focused_context_mode = Some(focused_context_mode);
+            db_thread.num_messages = num_messages;
             database.save_thread(id, db_thread).await.log_err();
             thread_store.update(cx, |store, cx| store.reload(cx));
         });
@@ -1418,6 +1430,37 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
 
     fn telemetry(&self) -> Option<Rc<dyn acp_thread::AgentTelemetry>> {
         Some(Rc::new(self.clone()) as Rc<dyn acp_thread::AgentTelemetry>)
+    }
+
+    fn set_focused_context_mode(&self, session_id: &acp::SessionId, enabled: bool, cx: &mut App) {
+        let thread = self
+            .0
+            .read(cx)
+            .sessions
+            .get(session_id)
+            .map(|session| session.thread.clone());
+        if let Some(thread) = thread {
+            thread.update(cx, |thread, cx| {
+                thread.set_focused_context_mode(enabled, cx)
+            });
+        }
+    }
+
+    fn set_num_messages(
+        &self,
+        session_id: &acp::SessionId,
+        num_messages: Option<usize>,
+        cx: &mut App,
+    ) {
+        let thread = self
+            .0
+            .read(cx)
+            .sessions
+            .get(session_id)
+            .map(|session| session.thread.clone());
+        if let Some(thread) = thread {
+            thread.update(cx, |thread, cx| thread.set_num_messages(num_messages, cx));
+        }
     }
 
     fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
