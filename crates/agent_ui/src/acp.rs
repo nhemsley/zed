@@ -1,5 +1,6 @@
 mod config_options;
 mod entry_view_state;
+mod focused_context_panel;
 mod message_editor;
 mod mode_selector;
 mod model_selector;
