@@ -62,6 +62,7 @@ use zed_actions::assistant::OpenRulesLibrary;
 
 use super::config_options::ConfigOptionsView;
 use super::entry_view_state::EntryViewState;
+use super::focused_context_panel;
 use super::thread_history::AcpThreadHistory;
 use crate::acp::AcpModelSelectorPopover;
 use crate::acp::ModeSelector;

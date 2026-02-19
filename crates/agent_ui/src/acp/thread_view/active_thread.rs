@@ -202,6 +202,8 @@ pub struct AcpThreadView {
     pub mode_selector: Option<Entity<ModeSelector>>,
     pub model_selector: Option<Entity<AcpModelSelectorPopover>>,
     pub profile_selector: Option<Entity<ProfileSelector>>,
+    pub focused_context_panel: Option<Entity<focused_context_panel::FocusedContextPanel>>,
+    pub _focused_context_subscription: Option<Subscription>,
     pub permission_dropdown_handle: PopoverMenuHandle<ContextMenu>,
     pub thread_retry_status: Option<RetryStatus>,
     pub(super) thread_error: Option<ThreadError>,
@@ -402,6 +404,8 @@ impl AcpThreadView {
             resumed_without_history,
             resume_thread_metadata,
             _subscriptions: subscriptions,
+            focused_context_panel: None,
+            _focused_context_subscription: None,
             permission_dropdown_handle: PopoverMenuHandle::default(),
             thread_retry_status: None,
             thread_error: None,
@@ -445,6 +449,21 @@ impl AcpThreadView {
             _history_subscription: history_subscription,
             show_codex_windows_warning,
         };
+
+        this.focused_context_panel = Some(
+            cx.new(|cx| {
+                focused_context_panel::FocusedContextPanel::new(this.thread.clone(), cx)
+            }),
+        );
+        this._focused_context_subscription =
+            this.focused_context_panel.as_ref().map(|panel| {
+                cx.subscribe_in(
+                    panel,
+                    window,
+                    Self::handle_focused_context_panel_event,
+                )
+            });
+
         if should_auto_submit {
             this.send(window, cx);
         }
@@ -2487,6 +2506,7 @@ impl AcpThreadView {
                             .gap_0p5()
                             .child(self.render_add_context_button(cx))
                             .child(self.render_follow_toggle(cx))
+                            .children(self.render_focused_context_mode_toggle(cx))
                             .children(self.render_thinking_control(cx)),
                     )
                     .child(
@@ -3388,6 +3408,69 @@ impl AcpThreadView {
                 this.toggle_following(window, cx);
             }))
     }
+
+    fn render_focused_context_mode_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let focused_context_mode_enabled = self.thread.read(cx).focused_context_mode();
+
+        Some(
+            IconButton::new("focused-context-mode", IconName::ZedFocusedContext)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .toggle_state(focused_context_mode_enabled)
+                .selected_icon_color(Color::Accent)
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.toggle_focused_context_mode(cx);
+                }))
+                .tooltip(move |_window, cx| {
+                    Tooltip::with_meta(
+                        if focused_context_mode_enabled {
+                            "Focused Context (On)"
+                        } else {
+                            "Focused Context (Off)"
+                        },
+                        None,
+                        "Limits context to recent messages only",
+                        cx,
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn toggle_focused_context_mode(&mut self, cx: &mut Context<Self>) {
+        self.thread.update(cx, |thread, cx| {
+            let current = thread.focused_context_mode();
+            thread.set_focused_context_mode(!current, cx);
+        });
+    }
+
+    fn set_context_from_entry(&mut self, entry_ix: usize, cx: &mut Context<Self>) {
+        let thread = &self.thread;
+        let entries = thread.read(cx).entries();
+        let total = thread.read(cx).message_count();
+        if total == 0 {
+            return;
+        }
+
+        let mut message_index = 0;
+        for (i, entry) in entries.iter().enumerate() {
+            if i >= entry_ix {
+                break;
+            }
+            match entry {
+                AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_) => {
+                    message_index += 1;
+                }
+                AgentThreadEntry::ToolCall(_) => {}
+            }
+        }
+
+        let num_messages_from_here = total.saturating_sub(message_index).max(1);
+
+        thread.update(cx, |thread, cx| {
+            thread.set_num_messages(Some(num_messages_from_here), cx);
+        });
+    }
 }
 
 impl AcpThreadView {
@@ -3501,40 +3584,60 @@ impl AcpThreadView {
                         })
                     }))
                     .child(
-                        div()
-                            .relative()
+                        h_flex()
+                            .gap_2()
+                            .items_center()
                             .child(
                                 div()
-                                    .py_3()
-                                    .px_2()
-                                    .rounded_md()
-                                    .bg(cx.theme().colors().editor_background)
                                     .border_1()
-                                    .when(is_indented, |this| {
-                                        this.py_2().px_2().shadow_sm()
-                                    })
                                     .border_color(cx.theme().colors().border)
-                                    .map(|this| {
-                                        if is_subagent {
-                                            return this.border_dashed();
-                                        }
-                                        if editing && editor_focus {
-                                            return this.border_color(focus_border);
-                                        }
-                                        if editing && !editor_focus {
-                                            return this.border_dashed()
-                                        }
-                                        if message.id.is_some() {
-                                            return this.shadow_md().hover(|s| {
-                                                s.border_color(focus_border.opacity(0.8))
-                                            });
-                                        }
-                                        this
-                                    })
-                                    .text_xs()
-                                    .child(editor.clone().into_any_element())
+                                    .rounded_md()
+                                    .child(
+                                        IconButton::new(("context-from-here", entry_ix), IconName::ArrowRight)
+                                            .icon_size(IconSize::Small)
+                                            .icon_color(Color::Muted)
+                                            .tooltip(Tooltip::text("Set context window to start from this message"))
+                                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                                this.set_context_from_entry(entry_ix, cx);
+                                            }))
+                                    )
                             )
-                            .when(editor_focus, |this| {
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .relative()
+                                    .child(
+                                        div()
+                                            .py_3()
+                                            .px_2()
+                                            .rounded_md()
+                                            .bg(cx.theme().colors().editor_background)
+                                            .border_1()
+                                            .when(is_indented, |this| {
+                                                this.py_2().px_2().shadow_sm()
+                                            })
+                                            .border_color(cx.theme().colors().border)
+                                            .map(|this| {
+                                                if is_subagent {
+                                                    return this.border_dashed();
+                                                }
+                                                if editing && editor_focus {
+                                                    return this.border_color(focus_border);
+                                                }
+                                                if editing && !editor_focus {
+                                                    return this.border_dashed()
+                                                }
+                                                if message.id.is_some() {
+                                                    return this.shadow_md().hover(|s| {
+                                                        s.border_color(focus_border.opacity(0.8))
+                                                    });
+                                                }
+                                                this
+                                            })
+                                            .text_xs()
+                                            .child(editor.clone().into_any_element())
+                                    )
+                                    .when(editor_focus, |this| {
                                 let base_container = h_flex()
                                     .absolute()
                                     .top_neg_3p5()
@@ -3621,7 +3724,8 @@ impl AcpThreadView {
                                             )
                                     )
                                 }
-                            }),
+                            })
+                            )
                     )
                     .into_any()
             }
@@ -4020,6 +4124,24 @@ impl AcpThreadView {
             .child(scroll_to_recent_user_prompt)
             .child(scroll_to_top)
             .into_any_element()
+    }
+
+    fn handle_focused_context_panel_event(
+        &mut self,
+        _panel: &Entity<focused_context_panel::FocusedContextPanel>,
+        event: &focused_context_panel::FocusedContextPanelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            focused_context_panel::FocusedContextPanelEvent::ScrollToEntry { entry_index } => {
+                self.list_state.scroll_to(ListOffset {
+                    item_ix: *entry_index,
+                    offset_in_item: px(0.0),
+                });
+                cx.notify();
+            }
+        }
     }
 
     pub(crate) fn scroll_to_most_recent_user_prompt(&mut self, cx: &mut Context<Self>) {
@@ -7475,6 +7597,7 @@ impl Render for AcpThreadView {
             .size_full()
             .children(self.render_subagent_titlebar(cx))
             .child(conversation)
+            .children(self.focused_context_panel.clone())
             .children(self.render_activity_bar(window, cx))
             .when(self.show_codex_windows_warning, |this| {
                 this.child(self.render_codex_windows_warning(cx))
