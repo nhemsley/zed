@@ -151,6 +151,26 @@ pub trait AgentConnection {
         None
     }
 
+    /// Notifies the connection that focused context mode (context windowing) has been toggled.
+    /// Backends that build their own LLM requests should use this to filter messages.
+    fn set_focused_context_mode(
+        &self,
+        _session_id: &acp::SessionId,
+        _enabled: bool,
+        _cx: &mut App,
+    ) {
+    }
+
+    /// Notifies the connection that the number of messages to include has changed.
+    /// `None` means include all messages.
+    fn set_num_messages(
+        &self,
+        _session_id: &acp::SessionId,
+        _num_messages: Option<usize>,
+        _cx: &mut App,
+    ) {
+    }
+
     fn into_any(self: Rc<Self>) -> Rc<dyn Any>;
 }
 
