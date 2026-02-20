@@ -3412,22 +3412,20 @@ impl AcpThreadView {
     fn render_focused_context_mode_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let pin_mode_enabled = self.thread.read(cx).focused_context_mode();
 
-        let (icon, tooltip_title, tooltip_meta) = if pin_mode_enabled {
+        let (tooltip_title, tooltip_meta) = if pin_mode_enabled {
             (
-                IconName::ZedFocusedContext,
                 "Pin Mode",
                 "Context starts from pinned message. Click to switch to Session mode.",
             )
         } else {
             (
-                IconName::HistoryRerun,
                 "Session Mode",
                 "All messages are sent. Click to switch to Pin mode.",
             )
         };
 
         Some(
-            IconButton::new("focused-context-mode", icon)
+            IconButton::new("focused-context-mode", IconName::HistoryRerun)
                 .icon_size(IconSize::Small)
                 .icon_color(Color::Muted)
                 .toggle_state(pin_mode_enabled)
