@@ -3410,28 +3410,33 @@ impl AcpThreadView {
     }
 
     fn render_focused_context_mode_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let focused_context_mode_enabled = self.thread.read(cx).focused_context_mode();
+        let pin_mode_enabled = self.thread.read(cx).focused_context_mode();
+
+        let (icon, tooltip_title, tooltip_meta) = if pin_mode_enabled {
+            (
+                IconName::ZedFocusedContext,
+                "Pin Mode",
+                "Context starts from pinned message. Click to switch to Session mode.",
+            )
+        } else {
+            (
+                IconName::HistoryRerun,
+                "Session Mode",
+                "All messages are sent. Click to switch to Pin mode.",
+            )
+        };
 
         Some(
-            IconButton::new("focused-context-mode", IconName::ZedFocusedContext)
+            IconButton::new("focused-context-mode", icon)
                 .icon_size(IconSize::Small)
                 .icon_color(Color::Muted)
-                .toggle_state(focused_context_mode_enabled)
+                .toggle_state(pin_mode_enabled)
                 .selected_icon_color(Color::Accent)
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.toggle_focused_context_mode(cx);
                 }))
                 .tooltip(move |_window, cx| {
-                    Tooltip::with_meta(
-                        if focused_context_mode_enabled {
-                            "Focused Context (On)"
-                        } else {
-                            "Focused Context (Off)"
-                        },
-                        None,
-                        "Limits context to recent messages only",
-                        cx,
-                    )
+                    Tooltip::with_meta(tooltip_title, None, tooltip_meta, cx)
                 })
                 .into_any_element(),
         )
@@ -3439,16 +3444,18 @@ impl AcpThreadView {
 
     fn toggle_focused_context_mode(&mut self, cx: &mut Context<Self>) {
         self.thread.update(cx, |thread, cx| {
-            let current = thread.focused_context_mode();
-            thread.set_focused_context_mode(!current, cx);
+            if thread.focused_context_mode() {
+                thread.set_pinned_message_index(None, cx);
+            } else {
+                thread.set_pinned_message_index(Some(0), cx);
+            }
         });
     }
 
     fn set_context_from_entry(&mut self, entry_ix: usize, cx: &mut Context<Self>) {
         let thread = &self.thread;
         let entries = thread.read(cx).entries();
-        let total = thread.read(cx).message_count();
-        if total == 0 {
+        if entries.is_empty() {
             return;
         }
 
@@ -3465,10 +3472,8 @@ impl AcpThreadView {
             }
         }
 
-        let num_messages_from_here = total.saturating_sub(message_index).max(1);
-
         thread.update(cx, |thread, cx| {
-            thread.set_num_messages(Some(num_messages_from_here), cx);
+            thread.set_pinned_message_index(Some(message_index), cx);
         });
     }
 }

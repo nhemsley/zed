@@ -1,0 +1,13 @@
+diff --git a/crates/agent/src/thread_store.rs b/crates/agent/src/thread_store.rs
+index bba5cf2c2b..85cd67957f 100644
+--- a/crates/agent/src/thread_store.rs
++++ b/crates/agent/src/thread_store.rs
+@@ -144,6 +144,8 @@ mod tests {
+             completion_mode: None,
+             profile: None,
+             imported: false,
++            focused_context_mode: None,
++            num_messages: None,
+         }
+     }
+ 

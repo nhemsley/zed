@@ -1,0 +1,211 @@
+From 1ca365b8287b6d024f1ba918011a340bb75a667c Mon Sep 17 00:00:00 2001
+From: Nicholas Hemsley <nick.hems@gmail.com>
+Date: Thu, 12 Feb 2026 20:21:50 +0800
+Subject: [PATCH 2/4] fix scrolling from 'histogram'
+
+---
+ .../agent_ui/src/acp/focused_context_panel.rs | 124 +++++++++---------
+ crates/agent_ui/src/acp/thread_view.rs        |  20 +--
+ 2 files changed, 67 insertions(+), 77 deletions(-)
+
+diff --git a/crates/agent_ui/src/acp/focused_context_panel.rs b/crates/agent_ui/src/acp/focused_context_panel.rs
+index 3381810f47..47931fcbc2 100644
+--- a/crates/agent_ui/src/acp/focused_context_panel.rs
++++ b/crates/agent_ui/src/acp/focused_context_panel.rs
+@@ -12,10 +12,7 @@ use ui::{
+ struct SliderDrag;
+ 
+ pub enum FocusedContextPanelEvent {
+-    ScrollToMessage {
+-        message_index: usize,
+-        total_messages: usize,
+-    },
++    ScrollToEntry { entry_index: usize },
+ }
+ 
+ pub struct FocusedContextPanel {
+@@ -258,18 +255,20 @@ impl FocusedContextPanel {
+             role: Role,
+             char_count: u32,
+             preview: SharedString,
++            entry_index: usize,
+         }
+ 
+         let messages: Vec<HistogramBar> = thread
+             .entries()
+             .iter()
+-            .filter(|e| {
++            .enumerate()
++            .filter(|(_, e)| {
+                 matches!(
+                     e,
+                     AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_)
+                 )
+             })
+-            .map(|entry| {
++            .map(|(entry_index, entry)| {
+                 let role = match entry {
+                     AgentThreadEntry::UserMessage(_) => Role::User,
+                     AgentThreadEntry::AssistantMessage(_) => Role::Assistant,
+@@ -279,6 +278,7 @@ impl FocusedContextPanel {
+                     role,
+                     char_count: Self::entry_char_count(entry, cx),
+                     preview: Self::entry_preview(entry, 20, cx).into(),
++                    entry_index,
+                 }
+             })
+             .collect();
+@@ -299,59 +299,65 @@ impl FocusedContextPanel {
+             .gap(bar_gap)
+             .overflow_x_hidden()
+             .justify_end()
+-            .children(messages.into_iter().enumerate().map(move |(index, bar)| {
+-                let is_included = index >= skip_count;
+-                let height_fraction = (bar.char_count as f32 / max_chars as f32).clamp(0.1, 1.0);
+-                let is_user = bar.role == Role::User;
+-                let bar_color = match (is_user, is_included) {
+-                    (true, true) => user_color,
+-                    (true, false) => dimmed_user,
+-                    (false, true) => agent_color,
+-                    (false, false) => dimmed_agent,
+-                };
+-
+-                let role_label = if is_user { "User" } else { "Agent" };
+-                let included_label = if is_included { "Included" } else { "Excluded" };
+-                let tooltip_text: SharedString = format!(
+-                    "{} · {} · ~{} chars\n{}",
+-                    role_label, included_label, bar.char_count, bar.preview
+-                )
+-                .into();
+-
+-                div()
+-                    .id(ElementId::NamedInteger(
+-                        "histogram-bar".into(),
+-                        index as u64,
+-                    ))
+-                    .flex_1()
+-                    .h(histogram_height * height_fraction)
+-                    .bg(bar_color)
+-                    .rounded_t(px(1.0))
+-                    .cursor(CursorStyle::PointingHand)
+-                    .tooltip(Tooltip::text(tooltip_text))
+-                    .on_click(
+-                        cx.listener(move |this, event: &gpui::ClickEvent, _window, cx| {
+-                            let total = this.thread.read(cx).message_count();
+-                            let new_included = total.saturating_sub(index);
+-
+-                            let num_messages = if new_included >= total {
+-                                None
+-                            } else {
+-                                Some(new_included)
+-                            };
+-                            this.thread.update(cx, |thread, cx| {
+-                                thread.set_num_messages(num_messages, cx);
+-                            });
+-
+-                            if event.modifiers().control {
+-                                cx.emit(FocusedContextPanelEvent::ScrollToMessage {
+-                                    message_index: index,
+-                                    total_messages: total,
+-                                });
+-                            }
+-                        }),
+-                    )
+-            }))
++            .children(
++                messages
++                    .into_iter()
++                    .enumerate()
++                    .map(move |(msg_index, bar)| {
++                        let is_included = msg_index >= skip_count;
++                        let height_fraction =
++                            (bar.char_count as f32 / max_chars as f32).clamp(0.1, 1.0);
++                        let is_user = bar.role == Role::User;
++                        let bar_color = match (is_user, is_included) {
++                            (true, true) => user_color,
++                            (true, false) => dimmed_user,
++                            (false, true) => agent_color,
++                            (false, false) => dimmed_agent,
++                        };
++
++                        let role_label = if is_user { "User" } else { "Agent" };
++                        let included_label = if is_included { "Included" } else { "Excluded" };
++                        let tooltip_text: SharedString = format!(
++                            "{} · {} · ~{} chars\n{}",
++                            role_label, included_label, bar.char_count, bar.preview
++                        )
++                        .into();
++
++                        let entry_index = bar.entry_index;
++                        div()
++                            .id(ElementId::NamedInteger(
++                                "histogram-bar".into(),
++                                msg_index as u64,
++                            ))
++                            .flex_1()
++                            .h(histogram_height * height_fraction)
++                            .bg(bar_color)
++                            .rounded_t(px(1.0))
++                            .cursor(CursorStyle::PointingHand)
++                            .tooltip(Tooltip::text(tooltip_text))
++                            .on_click(cx.listener(
++                                move |this, event: &gpui::ClickEvent, _window, cx| {
++                                    let total = this.thread.read(cx).message_count();
++                                    let new_included = total.saturating_sub(msg_index);
++
++                                    let num_messages = if new_included >= total {
++                                        None
++                                    } else {
++                                        Some(new_included)
++                                    };
++                                    this.thread.update(cx, |thread, cx| {
++                                        thread.set_num_messages(num_messages, cx);
++                                    });
++
++                                    if event.modifiers().control {
++                                        cx.emit(FocusedContextPanelEvent::ScrollToEntry {
++                                            entry_index,
++                                        });
++                                    }
++                                },
++                            ))
++                    }),
++            )
+     }
+ }
+ 
+diff --git a/crates/agent_ui/src/acp/thread_view.rs b/crates/agent_ui/src/acp/thread_view.rs
+index a4718499c8..f04425aaf8 100644
+--- a/crates/agent_ui/src/acp/thread_view.rs
++++ b/crates/agent_ui/src/acp/thread_view.rs
+@@ -5880,25 +5880,9 @@ impl AcpThreadView {
+         cx: &mut Context<Self>,
+     ) {
+         match event {
+-            focused_context_panel::FocusedContextPanelEvent::ScrollToMessage {
+-                message_index,
+-                total_messages,
+-            } => {
+-                let Some(thread) = self.thread() else {
+-                    return;
+-                };
+-
+-                let total_entries = thread.read(cx).entries().len();
+-                if *total_messages == 0 || total_entries == 0 {
+-                    return;
+-                }
+-
+-                let fraction = *message_index as f64 / *total_messages as f64;
+-                let target_entry_index = (fraction * total_entries as f64).round() as usize;
+-                let target_entry_index = target_entry_index.min(total_entries.saturating_sub(1));
+-
++            focused_context_panel::FocusedContextPanelEvent::ScrollToEntry { entry_index } => {
+                 self.list_state.scroll_to(ListOffset {
+-                    item_ix: target_entry_index,
++                    item_ix: *entry_index,
+                     offset_in_item: px(0.0),
+                 });
+                 cx.notify();
+-- 
+2.51.0
+

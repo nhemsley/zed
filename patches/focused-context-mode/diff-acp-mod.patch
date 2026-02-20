@@ -1,0 +1,11 @@
+diff --git a/crates/agent_ui/src/acp.rs b/crates/agent_ui/src/acp.rs
+index 5c892f00f5..473fb29fed 100644
+--- a/crates/agent_ui/src/acp.rs
++++ b/crates/agent_ui/src/acp.rs
+@@ -1,5 +1,6 @@
+ mod config_options;
+ mod entry_view_state;
++mod focused_context_panel;
+ mod message_editor;
+ mod mode_selector;
+ mod model_selector;

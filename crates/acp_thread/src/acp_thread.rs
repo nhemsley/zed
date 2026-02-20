@@ -60,7 +60,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use std::{fmt::Display, mem, path::PathBuf, sync::Arc};
 use text::Bias;
-use settings::Settings;
+
 use ui::App;
 use util::{ResultExt, get_default_system_shell_preferring_bash, paths::PathStyle};
 use uuid::Uuid;
@@ -960,11 +960,9 @@ pub struct AcpThread {
     pending_terminal_output: HashMap<acp::TerminalId, Vec<Vec<u8>>>,
     pending_terminal_exit: HashMap<acp::TerminalId, acp::TerminalExitStatus>,
     had_error: bool,
-    /// When enabled, only sends recent num_messages entries to the LLM
-    focused_context_mode: bool,
-    /// How many entries back from the latest to include in context.
-    /// None means include all entries.
-    num_messages: Option<usize>,
+    /// When set, only messages from this index forward are sent to the LLM.
+    /// None means session mode (all messages included).
+    pinned_message_index: Option<usize>,
 }
 
 impl From<&AcpThread> for ActionLogTelemetry {
@@ -1201,8 +1199,7 @@ impl AcpThread {
             pending_terminal_output: HashMap::default(),
             pending_terminal_exit: HashMap::default(),
             had_error: false,
-            focused_context_mode: false,
-            num_messages: None,
+            pinned_message_index: None,
         }
     }
 
@@ -1234,56 +1231,39 @@ impl AcpThread {
         &self.entries
     }
 
-    /// Returns whether focused context mode (sliding context window) is enabled
+    /// Returns whether pin mode is active (pinned_message_index is set).
     pub fn focused_context_mode(&self) -> bool {
-        self.focused_context_mode
+        self.pinned_message_index.is_some()
     }
 
-    /// Sets focused context mode on or off.
-    /// When enabling, auto-caps num_messages at focused_context_message_limit if currently None.
-    pub fn set_focused_context_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        if enabled && self.num_messages.is_none() {
-            let limit = agent_settings::AgentSettings::get_global(cx).focused_context_message_limit;
-            let total = self.message_count();
-            if limit > 0 && total > limit {
-                self.num_messages = Some(limit);
-            }
-        }
-        self.focused_context_mode = enabled;
-        self.connection
-            .set_focused_context_mode(&self.session_id, enabled, cx);
-        if let Some(num_messages) = self.num_messages {
-            self.connection
-                .set_num_messages(&self.session_id, Some(num_messages), cx);
-        }
-        cx.notify();
+    /// Returns the pinned message index.
+    /// None means session mode (all messages). Some(index) means pin mode.
+    pub fn pinned_message_index(&self) -> Option<usize> {
+        self.pinned_message_index
     }
 
-    /// Restores focused context state without notifying the connection.
-    /// Used during initialization when the Thread already has these values from the database.
-    pub fn restore_focused_context_state(
+    /// Sets the pinned message index.
+    /// None means session mode (all messages). Some(index) means pin mode
+    /// (include messages from that index forward).
+    pub fn set_pinned_message_index(
         &mut self,
-        focused_context_mode: bool,
-        num_messages: Option<usize>,
+        pinned_message_index: Option<usize>,
         cx: &mut Context<Self>,
     ) {
-        self.focused_context_mode = focused_context_mode;
-        self.num_messages = num_messages;
+        self.pinned_message_index = pinned_message_index;
+        self.connection
+            .set_pinned_message_index(&self.session_id, pinned_message_index, cx);
         cx.notify();
     }
 
-    /// Returns the number of entries to include (reverse index from latest).
-    /// None means include all entries.
-    pub fn num_messages(&self) -> Option<usize> {
-        self.num_messages
-    }
-
-    /// Sets the number of entries to include (reverse index from latest).
-    /// None means include all entries.
-    pub fn set_num_messages(&mut self, num_messages: Option<usize>, cx: &mut Context<Self>) {
-        self.num_messages = num_messages;
-        self.connection
-            .set_num_messages(&self.session_id, num_messages, cx);
+    /// Restores pin state without notifying the connection.
+    /// Used during initialization when the Thread already has these values from the database.
+    pub fn restore_pinned_message_index(
+        &mut self,
+        pinned_message_index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pinned_message_index = pinned_message_index;
         cx.notify();
     }
 

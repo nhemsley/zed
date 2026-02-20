@@ -1,0 +1,1164 @@
+diff --git a/assets/icons/zed_focused_context.svg b/assets/icons/zed_focused_context.svg
+new file mode 100644
+index 0000000000..364345ff7e
+--- /dev/null
++++ b/assets/icons/zed_focused_context.svg
+@@ -0,0 +1,5 @@
++<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
++  <circle cx="3.5" cy="8" r="2.25" stroke="black" stroke-width="1.2"/>
++  <circle cx="8" cy="8" r="2.25" stroke="black" stroke-width="1.2"/>
++  <circle cx="12.5" cy="8" r="2.25" stroke="black" stroke-width="1.2"/>
++</svg>
+diff --git a/assets/settings/default.json b/assets/settings/default.json
+index 9e7737ff1c..c3b1ad9248 100644
+--- a/assets/settings/default.json
++++ b/assets/settings/default.json
+@@ -1144,6 +1144,11 @@
+     //
+     // Default: false
+     "show_turn_stats": false,
++    // When focused context mode is enabled, automatically cap the context window at this many
++    // messages. The user can still override via the slider. Set to 0 to disable auto-capping.
++    //
++    // Default: 100
++    "focused_context_message_limit": 100,
+   },
+   // Whether the screen sharing icon is shown in the os status bar.
+   "show_call_status_icon": true,
+diff --git a/crates/acp_thread/src/acp_thread.rs b/crates/acp_thread/src/acp_thread.rs
+index c26f4f218c..6cb9064d47 100644
+--- a/crates/acp_thread/src/acp_thread.rs
++++ b/crates/acp_thread/src/acp_thread.rs
+@@ -894,6 +894,11 @@ pub struct AcpThread {
+     terminals: HashMap<acp::TerminalId, Entity<Terminal>>,
+     pending_terminal_output: HashMap<acp::TerminalId, Vec<Vec<u8>>>,
+     pending_terminal_exit: HashMap<acp::TerminalId, acp::TerminalExitStatus>,
++    /// When enabled, only sends recent num_messages entries to the LLM
++    focused_context_mode: bool,
++    /// How many entries back from the latest to include in context.
++    /// None means include all entries.
++    num_messages: Option<usize>,
+ }
+ 
+ impl From<&AcpThread> for ActionLogTelemetry {
+@@ -1125,6 +1130,8 @@ impl AcpThread {
+             terminals: HashMap::default(),
+             pending_terminal_output: HashMap::default(),
+             pending_terminal_exit: HashMap::default(),
++            focused_context_mode: false,
++            num_messages: None,
+         }
+     }
+ 
+@@ -1152,6 +1159,72 @@ impl AcpThread {
+         &self.entries
+     }
+ 
++    /// Returns whether focused context mode (sliding context window) is enabled
++    pub fn focused_context_mode(&self) -> bool {
++        self.focused_context_mode
++    }
++
++    /// Sets focused context mode on or off.
++    /// When enabling, auto-caps num_messages at focused_context_message_limit if currently None.
++    pub fn set_focused_context_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
++        if enabled && self.num_messages.is_none() {
++            let limit = AgentSettings::get_global(cx).focused_context_message_limit;
++            let total = self.message_count();
++            if limit > 0 && total > limit {
++                self.num_messages = Some(limit);
++            }
++        }
++        self.focused_context_mode = enabled;
++        self.connection
++            .set_focused_context_mode(&self.session_id, enabled, cx);
++        if let Some(num_messages) = self.num_messages {
++            self.connection
++                .set_num_messages(&self.session_id, Some(num_messages), cx);
++        }
++        cx.notify();
++    }
++
++    /// Restores focused context state without notifying the connection.
++    /// Used during initialization when the Thread already has these values from the database.
++    pub fn restore_focused_context_state(
++        &mut self,
++        focused_context_mode: bool,
++        num_messages: Option<usize>,
++        cx: &mut Context<Self>,
++    ) {
++        self.focused_context_mode = focused_context_mode;
++        self.num_messages = num_messages;
++        cx.notify();
++    }
++
++    /// Returns the number of entries to include (reverse index from latest).
++    /// None means include all entries.
++    pub fn num_messages(&self) -> Option<usize> {
++        self.num_messages
++    }
++
++    /// Sets the number of entries to include (reverse index from latest).
++    /// None means include all entries.
++    pub fn set_num_messages(&mut self, num_messages: Option<usize>, cx: &mut Context<Self>) {
++        self.num_messages = num_messages;
++        self.connection
++            .set_num_messages(&self.session_id, num_messages, cx);
++        cx.notify();
++    }
++
++    /// Returns the total number of user and assistant message entries.
++    pub fn message_count(&self) -> usize {
++        self.entries
++            .iter()
++            .filter(|e| {
++                matches!(
++                    e,
++                    AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_)
++                )
++            })
++            .count()
++    }
++
+     pub fn session_id(&self) -> &acp::SessionId {
+         &self.session_id
+     }
+diff --git a/crates/acp_thread/src/connection.rs b/crates/acp_thread/src/connection.rs
+index 26b9d957be..679a71635d 100644
+--- a/crates/acp_thread/src/connection.rs
++++ b/crates/acp_thread/src/connection.rs
+@@ -94,6 +94,26 @@ pub trait AgentConnection {
+         None
+     }
+ 
++    /// Notifies the connection that focused context mode (context windowing) has been toggled.
++    /// Backends that build their own LLM requests should use this to filter messages.
++    fn set_focused_context_mode(
++        &self,
++        _session_id: &acp::SessionId,
++        _enabled: bool,
++        _cx: &mut App,
++    ) {
++    }
++
++    /// Notifies the connection that the number of messages to include has changed.
++    /// `None` means include all messages.
++    fn set_num_messages(
++        &self,
++        _session_id: &acp::SessionId,
++        _num_messages: Option<usize>,
++        _cx: &mut App,
++    ) {
++    }
++
+     fn into_any(self: Rc<Self>) -> Rc<dyn Any>;
+ }
+ 
+diff --git a/crates/agent/src/agent.rs b/crates/agent/src/agent.rs
+index e3c3ee1cd5..d1681cab7a 100644
+--- a/crates/agent/src/agent.rs
++++ b/crates/agent/src/agent.rs
+@@ -313,6 +313,8 @@ impl NativeAgent {
+         let project = thread.project.clone();
+         let action_log = thread.action_log.clone();
+         let prompt_capabilities_rx = thread.prompt_capabilities_rx.clone();
++        let focused_context_mode = thread.focused_context_mode();
++        let num_messages = thread.num_messages();
+         let acp_thread = cx.new(|cx| {
+             acp_thread::AcpThread::new(
+                 title,
+@@ -325,6 +327,12 @@ impl NativeAgent {
+             )
+         });
+ 
++        if focused_context_mode || num_messages.is_some() {
++            acp_thread.update(cx, |acp_thread, cx| {
++                acp_thread.restore_focused_context_state(focused_context_mode, num_messages, cx);
++            });
++        }
++
+         let registry = LanguageModelRegistry::read_global(cx);
+         let summarization_model = registry.thread_summary_model().map(|c| c.model);
+ 
+@@ -808,12 +816,24 @@ impl NativeAgent {
+         let Some(session) = self.sessions.get_mut(&id) else {
+             return;
+         };
++        let focused_context_mode = session
++            .acp_thread
++            .upgrade()
++            .map(|acp| acp.read(cx).focused_context_mode());
++        let num_messages = session
++            .acp_thread
++            .upgrade()
++            .and_then(|acp| acp.read(cx).num_messages());
+         let thread_store = self.thread_store.clone();
+         session.pending_save = cx.spawn(async move |_, cx| {
+             let Some(database) = database_future.await.map_err(|err| anyhow!(err)).log_err() else {
+                 return;
+             };
+-            let db_thread = db_thread.await;
++            let mut db_thread = db_thread.await;
++            if let Some(focused_context_mode) = focused_context_mode {
++                db_thread.focused_context_mode = Some(focused_context_mode);
++            }
++            db_thread.num_messages = num_messages;
+             database.save_thread(id, db_thread).await.log_err();
+             thread_store.update(cx, |store, cx| store.reload(cx));
+         });
+@@ -1349,6 +1369,37 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
+         Some(Rc::new(self.clone()) as Rc<dyn acp_thread::AgentTelemetry>)
+     }
+ 
++    fn set_focused_context_mode(&self, session_id: &acp::SessionId, enabled: bool, cx: &mut App) {
++        let thread = self
++            .0
++            .read(cx)
++            .sessions
++            .get(session_id)
++            .map(|session| session.thread.clone());
++        if let Some(thread) = thread {
++            thread.update(cx, |thread, cx| {
++                thread.set_focused_context_mode(enabled, cx)
++            });
++        }
++    }
++
++    fn set_num_messages(
++        &self,
++        session_id: &acp::SessionId,
++        num_messages: Option<usize>,
++        cx: &mut App,
++    ) {
++        let thread = self
++            .0
++            .read(cx)
++            .sessions
++            .get(session_id)
++            .map(|session| session.thread.clone());
++        if let Some(thread) = thread {
++            thread.update(cx, |thread, cx| thread.set_num_messages(num_messages, cx));
++        }
++    }
++
+     fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+         self
+     }
+diff --git a/crates/agent/src/db.rs b/crates/agent/src/db.rs
+index 3425997524..513d8ae12f 100644
+--- a/crates/agent/src/db.rs
++++ b/crates/agent/src/db.rs
+@@ -52,6 +52,10 @@ pub struct DbThread {
+     pub profile: Option<AgentProfileId>,
+     #[serde(default)]
+     pub imported: bool,
++    #[serde(default)]
++    pub focused_context_mode: Option<bool>,
++    #[serde(default)]
++    pub num_messages: Option<usize>,
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+@@ -93,6 +97,8 @@ impl SharedThread {
+             completion_mode: self.completion_mode,
+             profile: None,
+             imported: true,
++            focused_context_mode: None,
++            num_messages: None,
+         }
+     }
+ 
+@@ -267,6 +273,8 @@ impl DbThread {
+             completion_mode: thread.completion_mode,
+             profile: thread.profile,
+             imported: false,
++            focused_context_mode: None,
++            num_messages: None,
+         })
+     }
+ }
+@@ -561,6 +569,8 @@ mod tests {
+             completion_mode: None,
+             profile: None,
+             imported: false,
++            focused_context_mode: None,
++            num_messages: None,
+         }
+     }
+ 
+diff --git a/crates/agent/src/thread.rs b/crates/agent/src/thread.rs
+index 9a579b12e4..781847da1f 100644
+--- a/crates/agent/src/thread.rs
++++ b/crates/agent/src/thread.rs
+@@ -600,6 +600,11 @@ pub struct Thread {
+     messages: Vec<Message>,
+     user_store: Entity<UserStore>,
+     completion_mode: CompletionMode,
++    /// When enabled, only sends recent num_messages messages to the LLM
++    focused_context_mode: bool,
++    /// Reverse index: how many messages back from the latest to include in context.
++    /// None means include all messages.
++    num_messages: Option<usize>,
+     /// Holds the task that handles agent interaction until the end of the turn.
+     /// Survives across multiple requests as the model performs tool calls and
+     /// we run tools, report their results.
+@@ -659,6 +664,8 @@ impl Thread {
+             messages: Vec::new(),
+             user_store: project.read(cx).user_store(),
+             completion_mode: AgentSettings::get_global(cx).preferred_completion_mode,
++            focused_context_mode: false,
++            num_messages: None,
+             running_turn: None,
+             pending_message: None,
+             tools: BTreeMap::default(),
+@@ -860,6 +867,8 @@ impl Thread {
+             messages: db_thread.messages,
+             user_store: project.read(cx).user_store(),
+             completion_mode: db_thread.completion_mode.unwrap_or_default(),
++            focused_context_mode: db_thread.focused_context_mode.unwrap_or(false),
++            num_messages: db_thread.num_messages,
+             running_turn: None,
+             pending_message: None,
+             tools: BTreeMap::default(),
+@@ -900,6 +909,8 @@ impl Thread {
+             completion_mode: Some(self.completion_mode),
+             profile: Some(self.profile_id.clone()),
+             imported: self.imported,
++            focused_context_mode: Some(self.focused_context_mode),
++            num_messages: self.num_messages,
+         };
+ 
+         cx.background_spawn(async move {
+@@ -974,6 +985,42 @@ impl Thread {
+         self.completion_mode
+     }
+ 
++    /// Returns whether focused context mode (sliding context window) is enabled
++    pub fn focused_context_mode(&self) -> bool {
++        self.focused_context_mode
++    }
++
++    /// Sets focused context mode on or off.
++    /// Auto-cap logic is handled by AcpThread; this is a passive store
++    /// used by build_request_messages().
++    pub fn set_focused_context_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
++        self.focused_context_mode = enabled;
++        cx.notify();
++    }
++
++    /// Returns the number of messages to include (reverse index from latest).
++    /// None means include all messages.
++    pub fn num_messages(&self) -> Option<usize> {
++        self.num_messages
++    }
++
++    /// Returns the total number of messages in the thread.
++    pub fn message_count(&self) -> usize {
++        self.messages.len()
++    }
++
++    /// Returns a reference to the messages in the thread.
++    pub fn messages(&self) -> &[Message] {
++        &self.messages
++    }
++
++    /// Sets the number of messages to include (reverse index from latest).
++    /// None means include all messages.
++    pub fn set_num_messages(&mut self, num_messages: Option<usize>, cx: &mut Context<Self>) {
++        self.num_messages = num_messages;
++        cx.notify();
++    }
++
+     pub fn set_completion_mode(&mut self, mode: CompletionMode, cx: &mut Context<Self>) {
+         let old_usage = self.latest_token_usage();
+         self.completion_mode = mode;
+@@ -2041,7 +2088,6 @@ impl Thread {
+ 
+         log::debug!("Request includes {} tools", available_tools.len());
+         let messages = self.build_request_messages(available_tools, cx);
+-        log::debug!("Request will include {} messages", messages.len());
+ 
+         let request = LanguageModelRequest {
+             thread_id: Some(self.id.to_string()),
+@@ -2056,7 +2102,6 @@ impl Thread {
+             thinking_allowed: true,
+         };
+ 
+-        log::debug!("Completion request built successfully");
+         Ok(request)
+     }
+ 
+@@ -2143,11 +2188,6 @@ impl Thread {
+         available_tools: Vec<SharedString>,
+         cx: &App,
+     ) -> Vec<LanguageModelRequestMessage> {
+-        log::trace!(
+-            "Building request messages from {} thread messages",
+-            self.messages.len()
+-        );
+-
+         let system_prompt = SystemPromptTemplate {
+             project: self.project_context.read(cx),
+             available_tools,
+@@ -2162,8 +2202,20 @@ impl Thread {
+             cache: false,
+             reasoning_details: None,
+         }];
+-        for message in &self.messages {
+-            messages.extend(message.to_request());
++
++        if self.focused_context_mode {
++            let take_count = self.num_messages.unwrap_or(self.messages.len());
++            let total_count = self.messages.len();
++            let skip_count = total_count.saturating_sub(take_count);
++
++            for message in self.messages.iter().skip(skip_count) {
++                messages.extend(message.to_request());
++            }
++        } else {
++            // Original behavior: include all messages
++            for message in &self.messages {
++                messages.extend(message.to_request());
++            }
+         }
+ 
+         if let Some(last_message) = messages.last_mut() {
+diff --git a/crates/agent/src/thread_store.rs b/crates/agent/src/thread_store.rs
+index bba5cf2c2b..85cd67957f 100644
+--- a/crates/agent/src/thread_store.rs
++++ b/crates/agent/src/thread_store.rs
+@@ -144,6 +144,8 @@ mod tests {
+             completion_mode: None,
+             profile: None,
+             imported: false,
++            focused_context_mode: None,
++            num_messages: None,
+         }
+     }
+ 
+diff --git a/crates/agent_settings/src/agent_settings.rs b/crates/agent_settings/src/agent_settings.rs
+index eab9e59545..5a76ead1f3 100644
+--- a/crates/agent_settings/src/agent_settings.rs
++++ b/crates/agent_settings/src/agent_settings.rs
+@@ -32,6 +32,7 @@ pub struct AgentSettings {
+     pub inline_assistant_model: Option<LanguageModelSelection>,
+     pub inline_assistant_use_streaming_tools: bool,
+     pub commit_message_model: Option<LanguageModelSelection>,
++    pub focused_context_message_limit: usize,
+     pub thread_summary_model: Option<LanguageModelSelection>,
+     pub inline_alternatives: Vec<LanguageModelSelection>,
+     pub favorite_models: Vec<LanguageModelSelection>,
+@@ -288,6 +289,7 @@ impl Settings for AgentSettings {
+             use_modifier_to_send: agent.use_modifier_to_send.unwrap(),
+             message_editor_min_lines: agent.message_editor_min_lines.unwrap(),
+             show_turn_stats: agent.show_turn_stats.unwrap(),
++            focused_context_message_limit: agent.focused_context_message_limit.unwrap_or(100),
+             tool_permissions: compile_tool_permissions(agent.tool_permissions),
+         }
+     }
+diff --git a/crates/agent_ui/src/acp.rs b/crates/agent_ui/src/acp.rs
+index 5c892f00f5..473fb29fed 100644
+--- a/crates/agent_ui/src/acp.rs
++++ b/crates/agent_ui/src/acp.rs
+@@ -1,5 +1,6 @@
+ mod config_options;
+ mod entry_view_state;
++mod focused_context_panel;
+ mod message_editor;
+ mod mode_selector;
+ mod model_selector;
+diff --git a/crates/agent_ui/src/acp/focused_context_panel.rs b/crates/agent_ui/src/acp/focused_context_panel.rs
+new file mode 100644
+index 0000000000..22404695a9
+--- /dev/null
++++ b/crates/agent_ui/src/acp/focused_context_panel.rs
+@@ -0,0 +1,399 @@
++use acp_thread::{AcpThread, AgentThreadEntry, AssistantMessageChunk};
++use gpui::{
++    div, px, App, Context, CursorStyle, DragMoveEvent, Entity, EventEmitter, IntoElement,
++    MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
++};
++use language_model::Role;
++use ui::{
++    prelude::*, Color, Divider, DividerColor, IconButton, IconName, IconSize, Label, LabelSize,
++    Tooltip,
++};
++
++struct SliderDrag;
++
++pub enum FocusedContextPanelEvent {
++    ScrollToEntry { entry_index: usize },
++}
++
++pub struct FocusedContextPanel {
++    thread: Entity<AcpThread>,
++}
++
++impl EventEmitter<FocusedContextPanelEvent> for FocusedContextPanel {}
++
++impl FocusedContextPanel {
++    pub fn new(thread: Entity<AcpThread>, _cx: &mut Context<Self>) -> Self {
++        Self { thread }
++    }
++
++    fn effective_num_messages(&self, cx: &App) -> usize {
++        let thread = self.thread.read(cx);
++        let total = thread.message_count();
++        thread.num_messages().unwrap_or(total).min(total)
++    }
++
++    fn set_num_messages_from_fraction(&mut self, fraction: f32, cx: &mut Context<Self>) {
++        let total = self.thread.read(cx).message_count();
++        if total == 0 {
++            return;
++        }
++        let fraction = fraction.clamp(0.0, 1.0);
++        let value = ((fraction * total as f32).round() as usize)
++            .max(1)
++            .min(total);
++        let num_messages = if value >= total { None } else { Some(value) };
++        self.thread.update(cx, |thread, cx| {
++            thread.set_num_messages(num_messages, cx);
++        });
++    }
++
++    fn entry_char_count(entry: &AgentThreadEntry, cx: &App) -> u32 {
++        match entry {
++            AgentThreadEntry::UserMessage(msg) => msg.content.to_markdown(cx).len() as u32,
++            AgentThreadEntry::AssistantMessage(msg) => msg
++                .chunks
++                .iter()
++                .map(|chunk| match chunk {
++                    AssistantMessageChunk::Message { block }
++                    | AssistantMessageChunk::Thought { block } => {
++                        block.to_markdown(cx).len() as u32
++                    }
++                })
++                .sum(),
++            AgentThreadEntry::ToolCall(_) => 0,
++        }
++    }
++
++    fn estimate_entry_tokens(entry: &AgentThreadEntry, cx: &App) -> usize {
++        Self::entry_char_count(entry, cx) as usize / 4
++    }
++
++    fn entry_preview(entry: &AgentThreadEntry, max_words: usize, cx: &App) -> String {
++        let text = match entry {
++            AgentThreadEntry::UserMessage(msg) => msg.content.to_markdown(cx).to_string(),
++            AgentThreadEntry::AssistantMessage(msg) => msg
++                .chunks
++                .iter()
++                .map(|chunk| match chunk {
++                    AssistantMessageChunk::Message { block } => block.to_markdown(cx).to_string(),
++                    AssistantMessageChunk::Thought { block } => block.to_markdown(cx).to_string(),
++                })
++                .collect::<Vec<_>>()
++                .join(" "),
++            AgentThreadEntry::ToolCall(_) => "[tool call]".to_string(),
++        };
++        let trimmed = text.trim().replace('\n', " ");
++        if trimmed.is_empty() {
++            return "[no preview]".to_string();
++        }
++        let words: Vec<&str> = trimmed.split_whitespace().collect();
++        if words.len() > max_words {
++            format!("{}…", words[..max_words].join(" "))
++        } else {
++            trimmed
++        }
++    }
++
++    fn render_slider(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
++        let thread = self.thread.read(cx);
++        let total = thread.message_count();
++        let included = self.effective_num_messages(cx);
++        let fraction = if total == 0 {
++            1.0
++        } else {
++            included as f32 / total as f32
++        };
++
++        let entries = thread.entries();
++        let message_entries: Vec<&AgentThreadEntry> = entries
++            .iter()
++            .filter(|e| {
++                matches!(
++                    e,
++                    AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_)
++                )
++            })
++            .collect();
++
++        let total_tokens: usize = message_entries
++            .iter()
++            .map(|e| Self::estimate_entry_tokens(e, cx))
++            .sum();
++        let skip_count = total.saturating_sub(included);
++        let included_tokens: usize = message_entries
++            .iter()
++            .skip(skip_count)
++            .map(|e| Self::estimate_entry_tokens(e, cx))
++            .sum();
++
++        let format_tokens = |tokens: usize| -> String {
++            if tokens >= 1000 {
++                format!("~{}k", (tokens + 500) / 1000)
++            } else {
++                format!("~{}", tokens)
++            }
++        };
++
++        let label_text: SharedString = if total == 0 {
++            "No messages".into()
++        } else if included >= total {
++            format!("{} / {} ({})", included, total, format_tokens(total_tokens)).into()
++        } else {
++            format!(
++                "{} / {} ({} / {})",
++                included,
++                total,
++                format_tokens(included_tokens),
++                format_tokens(total_tokens)
++            )
++            .into()
++        };
++
++        let track_height = px(6.0);
++        let thumb_size = px(14.0);
++
++        let theme = cx.theme();
++        let track_bg = theme.colors().border;
++        let fill_color = theme.colors().icon_accent;
++        let thumb_color = theme.colors().icon_accent;
++        let thumb_border = theme.colors().border;
++
++        div()
++            .id("focused-context-slider")
++            .w_full()
++            .flex()
++            .flex_row()
++            .items_center()
++            .gap_2()
++            .child(
++                div().w(px(115.0)).flex_shrink_0().child(
++                    Label::new(label_text)
++                        .size(LabelSize::Small)
++                        .color(Color::Muted),
++                ),
++            )
++            .child(
++                div()
++                    .id("focused-context-slider-track-area")
++                    .flex_1()
++                    .h(thumb_size + px(4.0))
++                    .flex()
++                    .items_center()
++                    .cursor_pointer()
++                    .on_mouse_down(MouseButton::Left, |_, window, _cx| {
++                        window.prevent_default();
++                    })
++                    .on_drag(SliderDrag, |_, _, _window, cx| cx.new(|_cx| gpui::Empty))
++                    .on_drag_move::<SliderDrag>(cx.listener(
++                        move |this, event: &DragMoveEvent<SliderDrag>, _window, cx| {
++                            let bounds = event.bounds;
++                            let relative_x_from_right =
++                                bounds.origin.x + bounds.size.width - event.event.position.x;
++                            let frac = relative_x_from_right / bounds.size.width;
++                            this.set_num_messages_from_fraction(frac, cx);
++                        },
++                    ))
++                    .child(
++                        div()
++                            .w_full()
++                            .h(track_height)
++                            .rounded(track_height / 2.0)
++                            .bg(track_bg)
++                            .relative()
++                            .child(
++                                div()
++                                    .absolute()
++                                    .right_0()
++                                    .top_0()
++                                    .h_full()
++                                    .rounded(track_height / 2.0)
++                                    .bg(fill_color)
++                                    .w(gpui::relative(fraction)),
++                            )
++                            .child(
++                                div()
++                                    .absolute()
++                                    .top(-(thumb_size - track_height) / 2.0)
++                                    .right(gpui::relative(fraction))
++                                    .mr(-(thumb_size / 2.0))
++                                    .size(thumb_size)
++                                    .rounded(thumb_size / 2.0)
++                                    .bg(thumb_color)
++                                    .border_1()
++                                    .border_color(thumb_border)
++                                    .shadow_sm(),
++                            ),
++                    ),
++            )
++            .child(
++                IconButton::new("focused-context-reset", IconName::RotateCcw)
++                    .icon_size(IconSize::Small)
++                    .icon_color(Color::Muted)
++                    .tooltip(Tooltip::text("Include all messages"))
++                    .on_click(cx.listener(|this, _event, _window, cx| {
++                        this.thread.update(cx, |thread, cx| {
++                            thread.set_num_messages(None, cx);
++                        });
++                    })),
++            )
++    }
++
++    fn render_histogram(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
++        let thread = self.thread.read(cx);
++        let total = thread.message_count();
++        let included = self.effective_num_messages(cx);
++        let skip_count = total.saturating_sub(included);
++
++        let theme = cx.theme();
++        let user_color = theme.colors().icon_accent;
++        let agent_color = theme.colors().icon_muted;
++        let dimmed_user = user_color.opacity(0.25);
++        let dimmed_agent = agent_color.opacity(0.25);
++
++        let histogram_height = px(40.0);
++        let bar_gap = px(1.0);
++
++        struct HistogramBar {
++            role: Role,
++            char_count: u32,
++            preview: SharedString,
++            entry_index: usize,
++        }
++
++        let messages: Vec<HistogramBar> = thread
++            .entries()
++            .iter()
++            .enumerate()
++            .filter(|(_, e)| {
++                matches!(
++                    e,
++                    AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_)
++                )
++            })
++            .map(|(entry_index, entry)| {
++                let role = match entry {
++                    AgentThreadEntry::UserMessage(_) => Role::User,
++                    AgentThreadEntry::AssistantMessage(_) => Role::Assistant,
++                    _ => Role::User,
++                };
++                HistogramBar {
++                    role,
++                    char_count: Self::entry_char_count(entry, cx),
++                    preview: Self::entry_preview(entry, 20, cx).into(),
++                    entry_index,
++                }
++            })
++            .collect();
++
++        let max_chars = messages
++            .iter()
++            .map(|m| m.char_count)
++            .max()
++            .unwrap_or(1)
++            .max(1);
++
++        div()
++            .w_full()
++            .h(histogram_height)
++            .flex()
++            .flex_row()
++            .items_end()
++            .gap(bar_gap)
++            .overflow_x_hidden()
++            .justify_end()
++            .children(
++                messages
++                    .into_iter()
++                    .enumerate()
++                    .map(move |(msg_index, bar)| {
++                        let is_included = msg_index >= skip_count;
++                        let height_fraction =
++                            (bar.char_count as f32 / max_chars as f32).clamp(0.1, 1.0);
++                        let is_user = bar.role == Role::User;
++                        let bar_color = match (is_user, is_included) {
++                            (true, true) => user_color,
++                            (true, false) => dimmed_user,
++                            (false, true) => agent_color,
++                            (false, false) => dimmed_agent,
++                        };
++
++                        let role_label = if is_user { "User" } else { "Agent" };
++                        let included_label = if is_included { "Included" } else { "Excluded" };
++                        let tooltip_text: SharedString = format!(
++                            "{} · {} · ~{} chars\n{}",
++                            role_label, included_label, bar.char_count, bar.preview
++                        )
++                        .into();
++
++                        let entry_index = bar.entry_index;
++                        div()
++                            .id(ElementId::NamedInteger(
++                                "histogram-bar".into(),
++                                msg_index as u64,
++                            ))
++                            .flex_1()
++                            .h(histogram_height * height_fraction)
++                            .bg(bar_color)
++                            .rounded_t(px(1.0))
++                            .cursor(CursorStyle::PointingHand)
++                            .tooltip(Tooltip::text(tooltip_text))
++                            .on_click(cx.listener(
++                                move |this, event: &gpui::ClickEvent, _window, cx| {
++                                    let total = this.thread.read(cx).message_count();
++                                    let new_included = total.saturating_sub(msg_index);
++
++                                    let num_messages = if new_included >= total {
++                                        None
++                                    } else {
++                                        Some(new_included)
++                                    };
++                                    this.thread.update(cx, |thread, cx| {
++                                        thread.set_num_messages(num_messages, cx);
++                                    });
++
++                                    if event.modifiers().control {
++                                        cx.emit(FocusedContextPanelEvent::ScrollToEntry {
++                                            entry_index,
++                                        });
++                                    }
++                                },
++                            ))
++                    }),
++            )
++    }
++}
++
++impl Render for FocusedContextPanel {
++    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
++        let thread = self.thread.read(cx);
++        let focused_context_mode = thread.focused_context_mode();
++        let has_messages = thread.message_count() > 0;
++
++        if !focused_context_mode || !has_messages {
++            return div().into_any();
++        }
++
++        v_flex()
++            .w_full()
++            .px_2()
++            .py_1()
++            .gap_1()
++            .border_t_1()
++            .border_color(cx.theme().colors().border)
++            .bg(cx.theme().colors().panel_background)
++            .child(
++                h_flex()
++                    .gap_1()
++                    .items_center()
++                    .child(
++                        Label::new("Context Window")
++                            .size(LabelSize::XSmall)
++                            .color(Color::Muted),
++                    )
++                    .child(Divider::horizontal().color(DividerColor::Border)),
++            )
++            .child(self.render_histogram(window, cx))
++            .child(self.render_slider(window, cx))
++            .into_any()
++    }
++}
+diff --git a/crates/agent_ui/src/acp/thread_view.rs b/crates/agent_ui/src/acp/thread_view.rs
+index c7cb6860e4..f04425aaf8 100644
+--- a/crates/agent_ui/src/acp/thread_view.rs
++++ b/crates/agent_ui/src/acp/thread_view.rs
+@@ -60,6 +60,7 @@ use zed_actions::assistant::OpenRulesLibrary;
+ 
+ use super::config_options::ConfigOptionsView;
+ use super::entry_view_state::EntryViewState;
++use super::focused_context_panel;
+ use crate::acp::AcpModelSelectorPopover;
+ use crate::acp::ModeSelector;
+ use crate::acp::entry_view_state::{EntryViewEvent, ViewEvent};
+@@ -318,6 +319,8 @@ pub struct AcpThreadView {
+     model_selector: Option<Entity<AcpModelSelectorPopover>>,
+     config_options_view: Option<Entity<ConfigOptionsView>>,
+     profile_selector: Option<Entity<ProfileSelector>>,
++    focused_context_panel: Option<Entity<focused_context_panel::FocusedContextPanel>>,
++    _focused_context_subscription: Option<Subscription>,
+     notifications: Vec<WindowHandle<AgentNotification>>,
+     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
+     thread_retry_status: Option<RetryStatus>,
+@@ -493,6 +496,8 @@ impl AcpThreadView {
+             model_selector: None,
+             config_options_view: None,
+             profile_selector: None,
++            focused_context_panel: None,
++            _focused_context_subscription: None,
+             notifications: Vec::new(),
+             notification_subscriptions: HashMap::default(),
+             list_state: list_state,
+@@ -783,6 +788,20 @@ impl AcpThreadView {
+                             })
+                         });
+ 
++                        this.focused_context_panel = this.thread().map(|thread| {
++                            cx.new(|cx| {
++                                focused_context_panel::FocusedContextPanel::new(thread.clone(), cx)
++                            })
++                        });
++                        this._focused_context_subscription =
++                            this.focused_context_panel.as_ref().map(|panel| {
++                                cx.subscribe_in(
++                                    panel,
++                                    window,
++                                    Self::handle_focused_context_panel_event,
++                                )
++                            });
++
+                         this.message_editor.focus_handle(cx).focus(window, cx);
+ 
+                         cx.notify();
+@@ -2320,6 +2339,38 @@ impl AcpThreadView {
+             .detach_and_log_err(cx);
+     }
+ 
++    fn set_context_from_entry(&mut self, entry_ix: usize, cx: &mut Context<Self>) {
++        let Some(thread) = self.thread() else {
++            return;
++        };
++
++        let entries = thread.read(cx).entries();
++        let total = thread.read(cx).message_count();
++        if total == 0 {
++            return;
++        }
++
++        // Count UserMessage/AssistantMessage entries before entry_ix
++        let mut message_index = 0;
++        for (i, entry) in entries.iter().enumerate() {
++            if i >= entry_ix {
++                break;
++            }
++            match entry {
++                AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_) => {
++                    message_index += 1;
++                }
++                AgentThreadEntry::ToolCall(_) => {}
++            }
++        }
++
++        let num_messages_from_here = total.saturating_sub(message_index).max(1);
++
++        thread.update(cx, |thread, cx| {
++            thread.set_num_messages(Some(num_messages_from_here), cx);
++        });
++    }
++
+     fn render_entry(
+         &self,
+         entry_ix: usize,
+@@ -2408,33 +2459,53 @@ impl AcpThreadView {
+                         })
+                     }))
+                     .child(
+-                        div()
+-                            .relative()
++                        h_flex()
++                            .gap_2()
++                            .items_center()
+                             .child(
+                                 div()
+-                                    .py_3()
+-                                    .px_2()
+-                                    .rounded_md()
+-                                    .shadow_md()
+-                                    .bg(cx.theme().colors().editor_background)
+                                     .border_1()
+-                                    .when(is_indented, |this| {
+-                                        this.py_2().px_2().shadow_sm()
+-                                    })
+-                                    .when(editing && !editor_focus, |this| this.border_dashed())
+                                     .border_color(cx.theme().colors().border)
+-                                    .map(|this|{
+-                                        if editing && editor_focus {
+-                                            this.border_color(focus_border)
+-                                        } else if message.id.is_some() {
+-                                            this.hover(|s| s.border_color(focus_border.opacity(0.8)))
+-                                        } else {
+-                                            this
+-                                        }
+-                                    })
+-                                    .text_xs()
+-                                    .child(editor.clone().into_any_element())
++                                    .rounded_md()
++                                    .child(
++                                        IconButton::new(("context-from-here", entry_ix), IconName::ArrowRight)
++                                            .icon_size(IconSize::Small)
++                                            .icon_color(Color::Muted)
++                                            .tooltip(Tooltip::text("Set context window to start from this message"))
++                                            .on_click(cx.listener(move |this, _, _window, cx| {
++                                                this.set_context_from_entry(entry_ix, cx);
++                                            }))
++                                    )
+                             )
++                            .child(
++                                div()
++                                    .flex_1()
++                                    .relative()
++                                    .child(
++                                        div()
++                                            .py_3()
++                                            .px_2()
++                                            .rounded_md()
++                                            .shadow_md()
++                                            .bg(cx.theme().colors().editor_background)
++                                            .border_1()
++                                            .when(is_indented, |this| {
++                                                this.py_2().px_2().shadow_sm()
++                                            })
++                                            .when(editing && !editor_focus, |this| this.border_dashed())
++                                            .border_color(cx.theme().colors().border)
++                                            .map(|this|{
++                                                if editing && editor_focus {
++                                                    this.border_color(focus_border)
++                                                } else if message.id.is_some() {
++                                                    this.hover(|s| s.border_color(focus_border.opacity(0.8)))
++                                                } else {
++                                                    this
++                                                }
++                                            })
++                                            .text_xs()
++                                            .child(editor.clone().into_any_element())
++                                    )
+                             .when(editor_focus, |this| {
+                                 let base_container = h_flex()
+                                     .absolute()
+@@ -2511,7 +2582,8 @@ impl AcpThreadView {
+                                             )
+                                     )
+                                 }
+-                            }),
++                            })
++                            )
+                     )
+                     .into_any()
+             }
+@@ -5133,6 +5205,7 @@ impl AcpThreadView {
+                             .gap_0p5()
+                             .child(self.render_add_context_button(cx))
+                             .child(self.render_follow_toggle(cx))
++                            .children(self.render_focused_context_mode_toggle(cx))
+                             .children(self.render_burn_mode_toggle(cx)),
+                     )
+                     .child(
+@@ -5304,6 +5377,44 @@ impl AcpThreadView {
+         Some(())
+     }
+ 
++    fn render_focused_context_mode_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
++        let thread = self.thread()?;
++        let focused_context_mode_enabled = thread.read(cx).focused_context_mode();
++
++        Some(
++            IconButton::new("focused-context-mode", IconName::ZedFocusedContext)
++                .icon_size(IconSize::Small)
++                .icon_color(Color::Muted)
++                .toggle_state(focused_context_mode_enabled)
++                .selected_icon_color(Color::Accent)
++                .on_click(cx.listener(|this, _event, _window, cx| {
++                    this.toggle_focused_context_mode(cx);
++                }))
++                .tooltip(move |_window, cx| {
++                    Tooltip::with_meta(
++                        if focused_context_mode_enabled {
++                            "Focused Context (On)"
++                        } else {
++                            "Focused Context (Off)"
++                        },
++                        None,
++                        "Limits context to recent messages only",
++                        cx,
++                    )
++                })
++                .into_any_element(),
++        )
++    }
++
++    fn toggle_focused_context_mode(&mut self, cx: &mut Context<Self>) {
++        if let Some(thread) = self.thread() {
++            thread.update(cx, |thread, cx| {
++                let current = thread.focused_context_mode();
++                thread.set_focused_context_mode(!current, cx);
++            });
++        }
++    }
++
+     fn render_burn_mode_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+         let thread = self.as_native_thread(cx)?.read(cx);
+ 
+@@ -5761,6 +5872,24 @@ impl AcpThreadView {
+         cx.notify();
+     }
+ 
++    fn handle_focused_context_panel_event(
++        &mut self,
++        _panel: &Entity<focused_context_panel::FocusedContextPanel>,
++        event: &focused_context_panel::FocusedContextPanelEvent,
++        _window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        match event {
++            focused_context_panel::FocusedContextPanelEvent::ScrollToEntry { entry_index } => {
++                self.list_state.scroll_to(ListOffset {
++                    item_ix: *entry_index,
++                    offset_in_item: px(0.0),
++                });
++                cx.notify();
++            }
++        }
++    }
++
+     fn scroll_to_most_recent_user_prompt(&mut self, cx: &mut Context<Self>) {
+         let Some(thread) = self.thread() else {
+             return;
+@@ -7103,6 +7232,7 @@ impl Render for AcpThreadView {
+                 }
+                 _ => this,
+             })
++            .children(self.focused_context_panel.clone())
+             .children(self.render_thread_retry_status_callout(window, cx))
+             .when(self.show_codex_windows_warning, |this| {
+                 this.child(self.render_codex_windows_warning(cx))
+diff --git a/crates/icons/src/icons.rs b/crates/icons/src/icons.rs
+index 23ae7a6d92..57a62c60e6 100644
+--- a/crates/icons/src/icons.rs
++++ b/crates/icons/src/icons.rs
+@@ -262,6 +262,7 @@ pub enum IconName {
+     ZedAgent,
+     ZedAgentTwo,
+     ZedAssistant,
++    ZedFocusedContext,
+     ZedBurnMode,
+     ZedBurnModeOn,
+     ZedPredict,
+diff --git a/crates/settings/src/settings_content/agent.rs b/crates/settings/src/settings_content/agent.rs
+index c152e0545e..058e138028 100644
+--- a/crates/settings/src/settings_content/agent.rs
++++ b/crates/settings/src/settings_content/agent.rs
+@@ -126,6 +126,11 @@ pub struct AgentSettingsContent {
+     ///
+     /// Default: false
+     pub show_turn_stats: Option<bool>,
++    /// When focused context mode is enabled, automatically cap the context window at this many
++    /// messages. The user can still override via the slider. Set to 0 to disable auto-capping.
++    ///
++    /// Default: 100
++    pub focused_context_message_limit: Option<usize>,
+     /// Per-tool permission rules for granular control over which tool actions require confirmation.
+     ///
+     /// This setting only applies to the native Zed agent. External agent servers (Claude Code, Gemini CLI, etc.)

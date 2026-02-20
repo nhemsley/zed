@@ -151,22 +151,13 @@ pub trait AgentConnection {
         None
     }
 
-    /// Notifies the connection that focused context mode (context windowing) has been toggled.
-    /// Backends that build their own LLM requests should use this to filter messages.
-    fn set_focused_context_mode(
+    /// Notifies the connection that the pinned message index has changed.
+    /// `None` means session mode (all messages). `Some(index)` means pin mode
+    /// (include messages from that index forward).
+    fn set_pinned_message_index(
         &self,
         _session_id: &acp::SessionId,
-        _enabled: bool,
-        _cx: &mut App,
-    ) {
-    }
-
-    /// Notifies the connection that the number of messages to include has changed.
-    /// `None` means include all messages.
-    fn set_num_messages(
-        &self,
-        _session_id: &acp::SessionId,
-        _num_messages: Option<usize>,
+        _pinned_message_index: Option<usize>,
         _cx: &mut App,
     ) {
     }

@@ -1,0 +1,12 @@
+diff --git a/crates/icons/src/icons.rs b/crates/icons/src/icons.rs
+index 23ae7a6d92..57a62c60e6 100644
+--- a/crates/icons/src/icons.rs
++++ b/crates/icons/src/icons.rs
+@@ -262,6 +262,7 @@ pub enum IconName {
+     ZedAgent,
+     ZedAgentTwo,
+     ZedAssistant,
++    ZedFocusedContext,
+     ZedBurnMode,
+     ZedBurnModeOn,
+     ZedPredict,

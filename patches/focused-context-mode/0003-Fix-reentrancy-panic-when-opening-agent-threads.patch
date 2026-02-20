@@ -1,0 +1,55 @@
+From e9d8a54e54c02713d28c7e5c89fa5f0adcdbf35b Mon Sep 17 00:00:00 2001
+From: Nicholas Hemsley <nick.hems@gmail.com>
+Date: Thu, 12 Feb 2026 20:40:17 +0800
+Subject: [PATCH 3/4] Fix reentrancy panic when opening agent threads
+
+Move set_focused_context_mode and set_num_messages calls outside
+the cx.new() closure to avoid reading NativeAgent while it's being
+updated, which was causing a panic when clicking on agent threads.
+---
+ crates/agent/src/agent.rs | 20 ++++++++++++--------
+ 1 file changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/crates/agent/src/agent.rs b/crates/agent/src/agent.rs
+index c600df1ef6..f3dde4f23d 100644
+--- a/crates/agent/src/agent.rs
++++ b/crates/agent/src/agent.rs
+@@ -316,7 +316,7 @@ impl NativeAgent {
+         let focused_context_mode = thread.focused_context_mode();
+         let num_messages = thread.num_messages();
+         let acp_thread = cx.new(|cx| {
+-            let mut acp_thread = acp_thread::AcpThread::new(
++            acp_thread::AcpThread::new(
+                 title,
+                 connection,
+                 project.clone(),
+@@ -324,15 +324,19 @@ impl NativeAgent {
+                 session_id.clone(),
+                 prompt_capabilities_rx,
+                 cx,
+-            );
+-            if focused_context_mode {
++            )
++        });
++
++        if focused_context_mode {
++            acp_thread.update(cx, |acp_thread, cx| {
+                 acp_thread.set_focused_context_mode(true, cx);
+-            }
+-            if let Some(num) = num_messages {
++            });
++        }
++        if let Some(num) = num_messages {
++            acp_thread.update(cx, |acp_thread, cx| {
+                 acp_thread.set_num_messages(Some(num), cx);
+-            }
+-            acp_thread
+-        });
++            });
++        }
+ 
+         let registry = LanguageModelRegistry::read_global(cx);
+         let summarization_model = registry.thread_summary_model().map(|c| c.model);
+-- 
+2.51.0
+
