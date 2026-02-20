@@ -257,9 +257,10 @@ impl FocusedContextPanel {
                                 display_index as u64,
                             ))
                             .flex_1()
-                            .h(histogram_height * height_fraction)
-                            .bg(bar_color)
-                            .rounded_t(px(1.0))
+                            .h(histogram_height)
+                            .flex()
+                            .flex_col()
+                            .justify_end()
                             .cursor(CursorStyle::PointingHand)
                             .tooltip(Tooltip::text(tooltip_text))
                             .on_hover(cx.listener(
@@ -293,6 +294,13 @@ impl FocusedContextPanel {
                                     }
                                 },
                             ))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .h(histogram_height * height_fraction)
+                                    .bg(bar_color)
+                                    .rounded_t(px(1.0)),
+                            )
                     }),
             )
     }
