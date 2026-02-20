@@ -275,6 +275,7 @@ pub enum IconName {
     ZedAgent,
     ZedAgentTwo,
     ZedAssistant,
+    ZedContextTimeline,
     ZedPredict,
     ZedPredictDisabled,
     ZedPredictDown,

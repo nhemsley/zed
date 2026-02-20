@@ -60,6 +60,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use std::{fmt::Display, mem, path::PathBuf, sync::Arc};
 use text::Bias;
+
 use ui::App;
 use util::{ResultExt, get_default_system_shell_preferring_bash, paths::PathStyle};
 use uuid::Uuid;
@@ -953,12 +954,20 @@ pub struct AcpThread {
     connection: Rc<dyn AgentConnection>,
     session_id: acp::SessionId,
     token_usage: Option<TokenUsage>,
+    /// Cumulative input token count at each user message, in message order.
+    /// Each time token usage is updated (after a user message gets a response),
+    /// the current `input_tokens` is appended. On truncation the vec is trimmed
+    /// to match the remaining user message count.
+    token_boundaries: Vec<u64>,
     prompt_capabilities: acp::PromptCapabilities,
     _observe_prompt_capabilities: Task<anyhow::Result<()>>,
     terminals: HashMap<acp::TerminalId, Entity<Terminal>>,
     pending_terminal_output: HashMap<acp::TerminalId, Vec<Vec<u8>>>,
     pending_terminal_exit: HashMap<acp::TerminalId, acp::TerminalExitStatus>,
     had_error: bool,
+    /// When set, only messages from this index forward are sent to the LLM.
+    /// None means session mode (all messages included).
+    pinned_message_index: Option<usize>,
 }
 
 impl From<&AcpThread> for ActionLogTelemetry {
@@ -1189,12 +1198,14 @@ impl AcpThread {
             connection,
             session_id,
             token_usage: None,
+            token_boundaries: Vec::new(),
             prompt_capabilities,
             _observe_prompt_capabilities: task,
             terminals: HashMap::default(),
             pending_terminal_output: HashMap::default(),
             pending_terminal_exit: HashMap::default(),
             had_error: false,
+            pinned_message_index: None,
         }
     }
 
@@ -1224,6 +1235,55 @@ impl AcpThread {
 
     pub fn entries(&self) -> &[AgentThreadEntry] {
         &self.entries
+    }
+
+    /// Returns whether pin mode is active (pinned_message_index is set).
+    pub fn context_timeline_mode(&self) -> bool {
+        self.pinned_message_index.is_some()
+    }
+
+    /// Returns the pinned message index.
+    /// None means session mode (all messages). Some(index) means pin mode.
+    pub fn pinned_message_index(&self) -> Option<usize> {
+        self.pinned_message_index
+    }
+
+    /// Sets the pinned message index.
+    /// None means session mode (all messages). Some(index) means pin mode
+    /// (include messages from that index forward).
+    pub fn set_pinned_message_index(
+        &mut self,
+        pinned_message_index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pinned_message_index = pinned_message_index;
+        self.connection
+            .set_pinned_message_index(&self.session_id, pinned_message_index, cx);
+        cx.notify();
+    }
+
+    /// Restores pin state without notifying the connection.
+    /// Used during initialization when the Thread already has these values from the database.
+    pub fn restore_pinned_message_index(
+        &mut self,
+        pinned_message_index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pinned_message_index = pinned_message_index;
+        cx.notify();
+    }
+
+    /// Returns the total number of user and assistant message entries.
+    pub fn message_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_)
+                )
+            })
+            .count()
     }
 
     pub fn session_id(&self) -> &acp::SessionId {
@@ -1258,6 +1318,10 @@ impl AcpThread {
 
     pub fn token_usage(&self) -> Option<&TokenUsage> {
         self.token_usage.as_ref()
+    }
+
+    pub fn token_boundaries(&self) -> &[u64] {
+        &self.token_boundaries
     }
 
     pub fn has_pending_edit_tool_calls(&self) -> bool {
@@ -1484,6 +1548,19 @@ impl AcpThread {
     }
 
     pub fn update_token_usage(&mut self, usage: Option<TokenUsage>, cx: &mut Context<Self>) {
+        if let Some(ref usage) = usage {
+            let user_message_count = self
+                .entries
+                .iter()
+                .filter(|e| matches!(e, AgentThreadEntry::UserMessage(_)))
+                .count();
+            // Append the cumulative input_tokens if we have a new user message
+            // that doesn't have a boundary yet. Trim if messages were removed.
+            if user_message_count > self.token_boundaries.len() {
+                self.token_boundaries.push(usage.input_tokens);
+            }
+            self.token_boundaries.truncate(user_message_count);
+        }
         self.token_usage = usage;
         cx.emit(AcpThreadEvent::TokenUsageUpdated);
     }

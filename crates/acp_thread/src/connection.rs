@@ -151,6 +151,17 @@ pub trait AgentConnection {
         None
     }
 
+    /// Notifies the connection that the pinned message index has changed.
+    /// `None` means session mode (all messages). `Some(index)` means pin mode
+    /// (include messages from that index forward).
+    fn set_pinned_message_index(
+        &self,
+        _session_id: &acp::SessionId,
+        _pinned_message_index: Option<usize>,
+        _cx: &mut App,
+    ) {
+    }
+
     fn into_any(self: Rc<Self>) -> Rc<dyn Any>;
 }
 

@@ -868,6 +868,9 @@ pub struct Thread {
     summary: Option<SharedString>,
     messages: Vec<Message>,
     user_store: Entity<UserStore>,
+    /// When set, only messages from this index forward are sent to the LLM.
+    /// None means session mode (all messages included).
+    pinned_message_index: Option<usize>,
     /// Holds the task that handles agent interaction until the end of the turn.
     /// Survives across multiple requests as the model performs tool calls and
     /// we run tools, report their results.
@@ -966,6 +969,7 @@ impl Thread {
             summary: None,
             messages: Vec::new(),
             user_store: project.read(cx).user_store(),
+            pinned_message_index: None,
             running_turn: None,
             has_queued_message: false,
             pending_message: None,
@@ -1005,6 +1009,50 @@ impl Thread {
     /// Returns true if this thread was imported from a shared thread.
     pub fn is_imported(&self) -> bool {
         self.imported
+    }
+
+    /// Returns whether pin mode is active (pinned_message_index is set).
+    pub fn context_timeline_mode(&self) -> bool {
+        self.pinned_message_index.is_some()
+    }
+
+    /// Returns the pinned message index.
+    /// None means session mode (all messages). Some(index) means pin mode.
+    pub fn pinned_message_index(&self) -> Option<usize> {
+        self.pinned_message_index
+    }
+
+    /// Returns the total number of messages in the thread.
+    pub fn message_count(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Returns a reference to the messages in the thread.
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    /// Sets the pinned message index, snapping to the nearest User message
+    /// at or before the given index. Only user messages are valid pin targets.
+    /// None means session mode (all messages). Some(index) means pin mode
+    /// (include messages from that index forward).
+    pub fn set_pinned_message_index(&mut self, pinned_message_index: Option<usize>, cx: &mut Context<Self>) {
+        self.pinned_message_index = pinned_message_index.and_then(|index| {
+            self.snap_to_user_message(index)
+        });
+        cx.notify();
+    }
+
+    /// Returns the index of the nearest User message at or before `index`,
+    /// or None if no User message exists at or before that point.
+    fn snap_to_user_message(&self, index: usize) -> Option<usize> {
+        let index = index.min(self.messages.len().saturating_sub(1));
+        for i in (0..=index).rev() {
+            if matches!(self.messages.get(i), Some(Message::User(_))) {
+                return Some(i);
+            }
+        }
+        None
     }
 
     pub fn replay(
@@ -1195,6 +1243,7 @@ impl Thread {
             summary: db_thread.detailed_summary,
             messages: db_thread.messages,
             user_store: project.read(cx).user_store(),
+            pinned_message_index: db_thread.pinned_message_index,
             running_turn: None,
             has_queued_message: false,
             pending_message: None,
@@ -1239,6 +1288,7 @@ impl Thread {
             }),
             profile: Some(self.profile_id.clone()),
             imported: self.imported,
+            pinned_message_index: self.pinned_message_index,
             subagent_context: self.subagent_context.clone(),
             git_worktree_info: self.git_worktree_info.clone(),
         };
@@ -2617,8 +2667,15 @@ impl Thread {
             cache: false,
             reasoning_details: None,
         }];
-        for message in &self.messages {
-            messages.extend(message.to_request());
+
+        if let Some(pinned_index) = self.pinned_message_index {
+            for message in self.messages.iter().skip(pinned_index) {
+                messages.extend(message.to_request());
+            }
+        } else {
+            for message in &self.messages {
+                messages.extend(message.to_request());
+            }
         }
 
         if let Some(last_message) = messages.last_mut() {
