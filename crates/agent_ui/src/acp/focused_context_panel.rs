@@ -278,10 +278,10 @@ impl FocusedContextPanel {
                             ))
                             .on_click(cx.listener(
                                 move |this, event: &gpui::ClickEvent, _window, cx| {
-                                    let new_pinned = if clicked_message_index == 0 {
-                                        None
-                                    } else {
-                                        Some(clicked_message_index)
+                                    let snapped = this.snap_to_user_message_index(clicked_message_index, cx);
+                                    let new_pinned = match snapped {
+                                        Some(0) | None => None,
+                                        some => some,
                                     };
                                     this.thread.update(cx, |thread, cx| {
                                         thread.set_pinned_message_index(new_pinned, cx);
@@ -327,7 +327,7 @@ impl Render for FocusedContextPanel {
                 h_flex()
                     .w_full()
                     .gap_2()
-                    .items_end()
+                    .items_center()
                     .child(self.render_status(window, cx))
                     .child(self.render_histogram(window, cx)),
             )
