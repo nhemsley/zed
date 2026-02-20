@@ -77,7 +77,7 @@ impl FocusedContextPanel {
         }
     }
 
-    /// Given a message_index (from the histogram), find the nearest user message
+    /// Given a message_index (from the context timeline), find the nearest user message
     /// at or before it. This mirrors the snap logic in Thread::snap_to_user_message
     /// but operates on AcpThread entries.
     fn snap_to_user_message_index(&self, message_index: usize, cx: &App) -> Option<usize> {
@@ -142,7 +142,7 @@ impl FocusedContextPanel {
             }))
     }
 
-    fn render_histogram(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_context_timeline(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let thread = self.thread.read(cx);
         let pinned_index = thread.pinned_message_index();
 
@@ -153,10 +153,10 @@ impl FocusedContextPanel {
         let dimmed_agent = agent_color.opacity(0.25);
         let highlight_color = theme.colors().icon_accent.opacity(0.6);
 
-        let histogram_height = px(40.0);
+        let timeline_height = px(40.0);
         let bar_gap = px(1.0);
 
-        struct HistogramBar {
+        struct TimelineBar {
             role: Role,
             char_count: u32,
             preview: SharedString,
@@ -170,7 +170,7 @@ impl FocusedContextPanel {
             .and_then(|idx| self.snap_to_user_message_index(idx, cx));
 
         let mut message_counter = 0usize;
-        let messages: Vec<HistogramBar> = thread
+        let messages: Vec<TimelineBar> = thread
             .entries()
             .iter()
             .enumerate()
@@ -187,7 +187,7 @@ impl FocusedContextPanel {
                     _ => Role::User,
                 };
                 let is_hover_target = hover_snap_index == Some(message_counter);
-                let bar = HistogramBar {
+                let bar = TimelineBar {
                     role,
                     char_count: Self::entry_char_count(entry, cx),
                     preview: Self::entry_preview(entry, 20, cx).into(),
@@ -209,7 +209,7 @@ impl FocusedContextPanel {
 
         div()
             .flex_1()
-            .h(histogram_height)
+            .h(timeline_height)
             .flex()
             .flex_row()
             .items_end()
@@ -253,11 +253,11 @@ impl FocusedContextPanel {
                         let hover_message_index = bar.message_index;
                         div()
                             .id(ElementId::NamedInteger(
-                                "histogram-bar".into(),
+                                "timeline-bar".into(),
                                 display_index as u64,
                             ))
                             .flex_1()
-                            .h(histogram_height)
+                            .h(timeline_height)
                             .flex()
                             .flex_col()
                             .justify_end()
@@ -297,7 +297,7 @@ impl FocusedContextPanel {
                             .child(
                                 div()
                                     .w_full()
-                                    .h(histogram_height * height_fraction)
+                                    .h(timeline_height * height_fraction)
                                     .bg(bar_color)
                                     .rounded_t(px(1.0)),
                             )
@@ -329,7 +329,7 @@ impl Render for FocusedContextPanel {
                     .gap_2()
                     .items_center()
                     .child(self.render_status(window, cx))
-                    .child(self.render_histogram(window, cx)),
+                    .child(self.render_context_timeline(window, cx)),
             )
             .into_any()
     }
