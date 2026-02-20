@@ -204,6 +204,7 @@ impl FocusedContextPanel {
 
                         let entry_index = bar.entry_index;
                         let clicked_message_index = bar.message_index;
+                        let bar_is_user = is_user;
                         div()
                             .id(ElementId::NamedInteger(
                                 "histogram-bar".into(),
@@ -213,10 +214,15 @@ impl FocusedContextPanel {
                             .h(histogram_height * height_fraction)
                             .bg(bar_color)
                             .rounded_t(px(1.0))
-                            .cursor(CursorStyle::PointingHand)
+                            .when(bar_is_user, |el| {
+                                el.cursor(CursorStyle::PointingHand)
+                            })
                             .tooltip(Tooltip::text(tooltip_text))
                             .on_click(cx.listener(
                                 move |this, event: &gpui::ClickEvent, _window, cx| {
+                                    if !bar_is_user {
+                                        return;
+                                    }
                                     let new_pinned = if clicked_message_index == 0 {
                                         None
                                     } else {

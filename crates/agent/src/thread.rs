@@ -1021,12 +1021,27 @@ impl Thread {
         &self.messages
     }
 
-    /// Sets the pinned message index.
+    /// Sets the pinned message index, snapping to the nearest User message
+    /// at or before the given index. Only user messages are valid pin targets.
     /// None means session mode (all messages). Some(index) means pin mode
     /// (include messages from that index forward).
     pub fn set_pinned_message_index(&mut self, pinned_message_index: Option<usize>, cx: &mut Context<Self>) {
-        self.pinned_message_index = pinned_message_index;
+        self.pinned_message_index = pinned_message_index.and_then(|index| {
+            self.snap_to_user_message(index)
+        });
         cx.notify();
+    }
+
+    /// Returns the index of the nearest User message at or before `index`,
+    /// or None if no User message exists at or before that point.
+    fn snap_to_user_message(&self, index: usize) -> Option<usize> {
+        let index = index.min(self.messages.len().saturating_sub(1));
+        for i in (0..=index).rev() {
+            if matches!(self.messages.get(i), Some(Message::User(_))) {
+                return Some(i);
+            }
+        }
+        None
     }
 
     pub fn replay(
