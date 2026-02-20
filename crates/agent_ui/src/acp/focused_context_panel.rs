@@ -12,13 +12,17 @@ pub enum FocusedContextPanelEvent {
 
 pub struct FocusedContextPanel {
     thread: Entity<AcpThread>,
+    hovered_message_index: Option<usize>,
 }
 
 impl EventEmitter<FocusedContextPanelEvent> for FocusedContextPanel {}
 
 impl FocusedContextPanel {
     pub fn new(thread: Entity<AcpThread>, _cx: &mut Context<Self>) -> Self {
-        Self { thread }
+        Self {
+            thread,
+            hovered_message_index: None,
+        }
     }
 
     fn effective_included_count(&self, cx: &App) -> usize {
@@ -73,6 +77,35 @@ impl FocusedContextPanel {
         }
     }
 
+    /// Given a message_index (from the histogram), find the nearest user message
+    /// at or before it. This mirrors the snap logic in Thread::snap_to_user_message
+    /// but operates on AcpThread entries.
+    fn snap_to_user_message_index(&self, message_index: usize, cx: &App) -> Option<usize> {
+        let thread = self.thread.read(cx);
+        let mut counter = 0usize;
+        let mut last_user_index_at_or_before = None;
+
+        for entry in thread.entries().iter() {
+            match entry {
+                AgentThreadEntry::UserMessage(_) => {
+                    if counter <= message_index {
+                        last_user_index_at_or_before = Some(counter);
+                    }
+                    counter += 1;
+                }
+                AgentThreadEntry::AssistantMessage(_) => {
+                    counter += 1;
+                }
+                AgentThreadEntry::ToolCall(_) => {}
+            }
+            if counter > message_index + 1 {
+                break;
+            }
+        }
+
+        last_user_index_at_or_before
+    }
+
     fn render_status(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let thread = self.thread.read(cx);
         let total = thread.message_count();
@@ -118,6 +151,7 @@ impl FocusedContextPanel {
         let agent_color = theme.colors().icon_muted;
         let dimmed_user = user_color.opacity(0.25);
         let dimmed_agent = agent_color.opacity(0.25);
+        let highlight_color = theme.colors().icon_accent.opacity(0.6);
 
         let histogram_height = px(40.0);
         let bar_gap = px(1.0);
@@ -128,7 +162,12 @@ impl FocusedContextPanel {
             preview: SharedString,
             entry_index: usize,
             message_index: usize,
+            is_hover_target: bool,
         }
+
+        let hover_snap_index = self
+            .hovered_message_index
+            .and_then(|idx| self.snap_to_user_message_index(idx, cx));
 
         let mut message_counter = 0usize;
         let messages: Vec<HistogramBar> = thread
@@ -147,12 +186,14 @@ impl FocusedContextPanel {
                     AgentThreadEntry::AssistantMessage(_) => Role::Assistant,
                     _ => Role::User,
                 };
+                let is_hover_target = hover_snap_index == Some(message_counter);
                 let bar = HistogramBar {
                     role,
                     char_count: Self::entry_char_count(entry, cx),
                     preview: Self::entry_preview(entry, 20, cx).into(),
                     entry_index,
                     message_index: message_counter,
+                    is_hover_target,
                 };
                 message_counter += 1;
                 bar
@@ -187,11 +228,16 @@ impl FocusedContextPanel {
                         let height_fraction =
                             (bar.char_count as f32 / max_chars as f32).clamp(0.1, 1.0);
                         let is_user = bar.role == Role::User;
-                        let bar_color = match (is_user, is_included) {
-                            (true, true) => user_color,
-                            (true, false) => dimmed_user,
-                            (false, true) => agent_color,
-                            (false, false) => dimmed_agent,
+
+                        let bar_color = if bar.is_hover_target {
+                            highlight_color
+                        } else {
+                            match (is_user, is_included) {
+                                (true, true) => user_color,
+                                (true, false) => dimmed_user,
+                                (false, true) => agent_color,
+                                (false, false) => dimmed_agent,
+                            }
                         };
 
                         let role_label = if is_user { "User" } else { "Agent" };
@@ -204,7 +250,7 @@ impl FocusedContextPanel {
 
                         let entry_index = bar.entry_index;
                         let clicked_message_index = bar.message_index;
-                        let bar_is_user = is_user;
+                        let hover_message_index = bar.message_index;
                         div()
                             .id(ElementId::NamedInteger(
                                 "histogram-bar".into(),
@@ -214,15 +260,23 @@ impl FocusedContextPanel {
                             .h(histogram_height * height_fraction)
                             .bg(bar_color)
                             .rounded_t(px(1.0))
-                            .when(bar_is_user, |el| {
-                                el.cursor(CursorStyle::PointingHand)
-                            })
+                            .cursor(CursorStyle::PointingHand)
                             .tooltip(Tooltip::text(tooltip_text))
+                            .on_hover(cx.listener(
+                                move |this, hovered: &bool, _window, cx| {
+                                    let new_value = if *hovered {
+                                        Some(hover_message_index)
+                                    } else {
+                                        None
+                                    };
+                                    if this.hovered_message_index != new_value {
+                                        this.hovered_message_index = new_value;
+                                        cx.notify();
+                                    }
+                                },
+                            ))
                             .on_click(cx.listener(
                                 move |this, event: &gpui::ClickEvent, _window, cx| {
-                                    if !bar_is_user {
-                                        return;
-                                    }
                                     let new_pinned = if clicked_message_index == 0 {
                                         None
                                     } else {
