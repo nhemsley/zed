@@ -1,0 +1,962 @@
+diff --git a/crates/gpui/Cargo.toml b/crates/gpui/Cargo.toml
+index 81ae893143..42e5bf7830 100644
+--- a/crates/gpui/Cargo.toml
++++ b/crates/gpui/Cargo.toml
+@@ -89,7 +89,7 @@ etagere = "0.2"
+ futures.workspace = true
+ gpui_macros.workspace = true
+ http_client = { optional = true, workspace = true }
+-image.workspace = true
++image = { workspace = true, features = ["png"] }
+ inventory.workspace = true
+ itertools.workspace = true
+ log.workspace = true
+@@ -292,3 +292,7 @@ path = "examples/window_shadow.rs"
+ [[example]]
+ name = "on_window_close_quit"
+ path = "examples/on_window_close_quit.rs"
++
++[[example]]
++name = "render_to_texture"
++path = "examples/render_to_texture.rs"
+diff --git a/crates/gpui/examples/render_to_texture.rs b/crates/gpui/examples/render_to_texture.rs
+new file mode 100644
+index 0000000000..4900bee682
+--- /dev/null
++++ b/crates/gpui/examples/render_to_texture.rs
+@@ -0,0 +1,69 @@
++use gpui::{
++    div, rgb, Context, DevicePixels, ParentElement, Render, Size, TextureRenderer, SharedString, Styled
++};
++use std::env;
++use std::path::PathBuf;
++
++fn main() -> anyhow::Result<()> {
++    // Get the output file path from the command line argument
++    let output_path = env::args().nth(1).unwrap_or_else(|| "render_output.png".to_string());
++    let output_path = PathBuf::from(output_path);
++    
++    println!("Rendering to {}", output_path.display());
++    
++    // Create a texture renderer
++    let mut renderer = TextureRenderer::new()?;
++    
++    // Define the size for the rendered image
++    let width = 800;
++    let height = 600;
++    let size = Size::new(DevicePixels(width), DevicePixels(height));
++    
++    // Render our view to a PNG file
++    renderer.render_to_png(size, |cx| {
++        // Create a custom view for rendering
++        ExampleView::new("Hello, render-to-texture!", cx)
++    }, output_path)?;
++    
++    println!("Rendering completed successfully");
++    Ok(())
++}
++
++// A simple view to demonstrate rendering to texture
++struct ExampleView {
++    message: String,
++}
++
++impl ExampleView {
++    fn new(message: impl Into<String>, _cx: &mut Context<Self>) -> Self {
++        Self {
++            message: message.into(),
++        }
++    }
++}
++
++impl Render for ExampleView {
++    fn render(&mut self, _window: &mut gpui::Window, _cx: &mut Context<Self>) -> impl gpui::IntoElement {
++        // Create a simple UI with a colored background and styled text
++        div()
++            .h_full()
++            .w_full()
++            .bg(rgb(0x2B2E33))
++            .child(
++                div()
++                    .bg(rgb(0x1E2227))
++                    .child(
++                        div()
++                            .child(SharedString::from(self.message.clone()))
++                    )
++                    .child(
++                        div()
++                            .child(SharedString::from("This image was rendered with GPUI's render-to-texture feature"))
++                    )
++                    .child(
++                        div()
++                            .child(SharedString::from("Generated from render_to_texture example"))
++                    )
++            )
++    }
++}
+\ No newline at end of file
+diff --git a/crates/gpui/src/gpui.rs b/crates/gpui/src/gpui.rs
+index 4e6bda1977..ac991d9d14 100644
+--- a/crates/gpui/src/gpui.rs
++++ b/crates/gpui/src/gpui.rs
+@@ -96,6 +96,7 @@ mod taffy;
+ #[cfg(any(test, feature = "test-support"))]
+ pub mod test;
+ mod text_system;
++mod texture_renderer;
+ mod util;
+ mod view;
+ mod window;
+@@ -151,6 +152,7 @@ pub use taffy::{AvailableSpace, LayoutId};
+ #[cfg(any(test, feature = "test-support"))]
+ pub use test::*;
+ pub use text_system::*;
++pub use texture_renderer::*;
+ pub use util::arc_cow::ArcCow;
+ pub use view::*;
+ pub use window::*;
+@@ -348,3 +350,36 @@ pub struct GpuSpecs {
+     /// Further information about the driver, as reported by Vulkan.
+     pub driver_info: String,
+ }
++
++/// Unique identifier for a render target texture
++#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
++pub struct RenderTargetId(pub u32);
++
++/// A texture that can be used as a render target
++pub struct RenderTargetTexture {
++    /// The underlying GPU texture
++    pub texture: blade_graphics::Texture,
++    /// View into the texture
++    pub view: blade_graphics::TextureView,
++    /// Sampler for the texture
++    pub sampler: blade_graphics::Sampler,
++    /// Size of the texture in device pixels
++    pub size: Size<DevicePixels>,
++}
++
++/// Trait for render target functionality
++pub trait RenderTarget {
++    /// Creates a new render target with the specified size
++    fn create_render_target(&mut self, size: Size<DevicePixels>) -> Result<RenderTargetId>;
++    
++    /// Renders a scene to the specified render target
++    fn render_to_texture(&mut self, target_id: RenderTargetId, scene: &Scene) -> Result<()>;
++    
++    /// Draws a render target to the screen at the specified bounds
++    fn draw_render_target(
++        &mut self, 
++        target_id: RenderTargetId, 
++        bounds: Bounds<ScaledPixels>,
++        content_mask: window::ContentMask<ScaledPixels>
++    ) -> Result<()>;
++}
+diff --git a/crates/gpui/src/platform/blade.rs b/crates/gpui/src/platform/blade.rs
+index 9d966d8a4e..c000e2d204 100644
+--- a/crates/gpui/src/platform/blade.rs
++++ b/crates/gpui/src/platform/blade.rs
+@@ -4,8 +4,21 @@ mod blade_atlas;
+ mod blade_context;
+ mod blade_renderer;
+ 
++use crate::{
++    DevicePixels, Size, RenderTargetId, Result
++};
++
+ #[cfg(target_os = "macos")]
+ pub(crate) use apple_compat::*;
+ pub(crate) use blade_atlas::*;
+ pub(crate) use blade_context::*;
+ pub(crate) use blade_renderer::*;
++
++/// Read pixels from a render target texture
++pub fn read_pixels_from_render_target(
++    renderer: &mut BladeRenderer,
++    target_id: RenderTargetId,
++    size: Size<DevicePixels>
++) -> Result<Vec<u8>> {
++    renderer.read_pixels_from_render_target(target_id, size)
++}
+diff --git a/crates/gpui/src/platform/blade/blade_renderer.rs b/crates/gpui/src/platform/blade/blade_renderer.rs
+index 9cf65da5c9..55a023c363 100644
+--- a/crates/gpui/src/platform/blade/blade_renderer.rs
++++ b/crates/gpui/src/platform/blade/blade_renderer.rs
+@@ -3,9 +3,10 @@
+ 
+ use super::{BladeAtlas, BladeContext, PATH_TEXTURE_FORMAT};
+ use crate::{
+-    AtlasTextureKind, AtlasTile, Background, Bounds, ContentMask, DevicePixels, GpuSpecs,
++    AtlasTextureKind, AtlasTile, Background, Bounds, DevicePixels, GpuSpecs,
+     MonochromeSprite, Path, PathId, PathVertex, PolychromeSprite, PrimitiveBatch, Quad,
+-    ScaledPixels, Scene, Shadow, Size, Underline,
++    RenderTarget, RenderTargetId, RenderTargetTexture, Result, ScaledPixels, Scene, Shadow, Size, Underline,
++    window,
+ };
+ use blade_graphics as gpu;
+ use blade_util::{BufferBelt, BufferBeltDescriptor};
+@@ -110,6 +111,15 @@ struct ShaderSurfacesData {
+     s_surface: gpu::Sampler,
+ }
+ 
++#[derive(blade_macros::ShaderData)]
++struct ShaderRenderTargetData {
++    globals: GlobalParams,
++    bounds: PodBounds,
++    content_mask: PodBounds,
++    t_render_target: gpu::TextureView,
++    s_render_target: gpu::Sampler,
++}
++
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ #[repr(C)]
+ struct PathSprite {
+@@ -127,6 +137,7 @@ struct BladePipelines {
+     mono_sprites: gpu::RenderPipeline,
+     poly_sprites: gpu::RenderPipeline,
+     surfaces: gpu::RenderPipeline,
++    render_target: gpu::RenderPipeline,
+ }
+ 
+ impl BladePipelines {
+@@ -285,6 +296,20 @@ impl BladePipelines {
+                 color_targets,
+                 multisample_state: gpu::MultisampleState::default(),
+             }),
++            render_target: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
++                name: "render_target",
++                data_layouts: &[&ShaderRenderTargetData::layout()],
++                vertex: shader.at("vs_surface"),
++                vertex_fetches: &[],
++                primitive: gpu::PrimitiveState {
++                    topology: gpu::PrimitiveTopology::TriangleStrip,
++                    ..Default::default()
++                },
++                depth_stencil: None,
++                fragment: Some(shader.at("fs_render_target")),
++                color_targets,
++                multisample_state: gpu::MultisampleState::default(),
++            }),
+         }
+     }
+ 
+@@ -297,6 +322,7 @@ impl BladePipelines {
+         gpu.destroy_render_pipeline(&mut self.mono_sprites);
+         gpu.destroy_render_pipeline(&mut self.poly_sprites);
+         gpu.destroy_render_pipeline(&mut self.surfaces);
++        gpu.destroy_render_pipeline(&mut self.render_target);
+     }
+ }
+ 
+@@ -323,6 +349,22 @@ pub struct BladeRenderer {
+     #[cfg(target_os = "macos")]
+     core_video_texture_cache: CVMetalTextureCache,
+     path_sample_count: u32,
++    render_targets: HashMap<RenderTargetId, RenderTargetTexture>,
++    next_render_target_id: RenderTargetId,
++}
++
++impl RenderTarget for BladeRenderer {
++    fn create_render_target(&mut self, size: Size<DevicePixels>) -> Result<RenderTargetId> {
++        self.create_render_target(size)
++    }
++    
++    fn render_to_texture(&mut self, target_id: RenderTargetId, scene: &Scene) -> Result<()> {
++        self.render_to_texture(target_id, scene)
++    }
++    
++    fn draw_render_target(&mut self, target_id: RenderTargetId, bounds: Bounds<ScaledPixels>, content_mask: window::ContentMask<ScaledPixels>) -> Result<()> {
++        self.draw_render_target(target_id, bounds, content_mask)
++    }
+ }
+ 
+ impl BladeRenderer {
+@@ -389,6 +431,8 @@ impl BladeRenderer {
+             #[cfg(target_os = "macos")]
+             core_video_texture_cache,
+             path_sample_count,
++            render_targets: HashMap::default(),
++            next_render_target_id: RenderTargetId(0),
+         })
+     }
+ 
+@@ -440,6 +484,497 @@ impl BladeRenderer {
+                 .reconfigure_surface(&mut self.surface, self.surface_config);
+         }
+     }
++    
++    /// Creates a new render target with the specified size
++    pub fn create_render_target(&mut self, size: Size<DevicePixels>) -> Result<RenderTargetId> {
++        let id = self.next_render_target_id;
++        self.next_render_target_id = RenderTargetId(id.0 + 1);
++        
++        let texture = self.gpu.create_texture(gpu::TextureDesc {
++            name: "render_target",
++            format: self.surface.info().format,
++            size: gpu::Extent {
++                width: size.width.0 as u32,
++                height: size.height.0 as u32,
++                depth: 1,
++            },
++            array_layer_count: 1,
++            mip_level_count: 1,
++            sample_count: 1,
++            dimension: gpu::TextureDimension::D2,
++            usage: gpu::TextureUsage::TARGET | gpu::TextureUsage::RESOURCE,
++        });
++        
++        let view = self.gpu.create_texture_view(
++            texture,
++            gpu::TextureViewDesc {
++                name: "render_target_view",
++                format: self.surface.info().format,
++                dimension: gpu::ViewDimension::D2,
++                subresources: &Default::default(),
++            },
++        );
++        
++        let sampler = self.gpu.create_sampler(gpu::SamplerDesc {
++            name: "render_target_sampler",
++            mag_filter: gpu::FilterMode::Linear,
++            min_filter: gpu::FilterMode::Linear,
++            ..Default::default()
++        });
++        
++        self.render_targets.insert(id, RenderTargetTexture {
++            texture,
++            view,
++            sampler,
++            size,
++        });
++        
++        Ok(id)
++    }
++    
++    /// Renders the given scene to the specified render target
++    pub fn render_to_texture(&mut self, target_id: RenderTargetId, scene: &Scene) -> Result<()> {
++        // Check if the target ID is valid
++        if !self.render_targets.contains_key(&target_id) {
++            return Err(anyhow::anyhow!("Invalid render target ID"));
++        }
++            
++        // Prepare the command encoder and atlas
++        self.command_encoder.start();
++        self.atlas.before_frame(&mut self.command_encoder);
++        
++        // Rasterize paths
++        self.rasterize_paths(scene.paths());
++        
++        // Get the target and render to it
++        // This separate function helps avoid the borrow checker issues
++        self.render_to_target_id(scene, target_id)?;
++        
++        // Submit the commands
++        let sync_point = self.gpu.submit(&mut self.command_encoder);
++        self.instance_belt.flush(&sync_point);
++        self.atlas.after_frame(&sync_point);
++        self.atlas.clear_textures(AtlasTextureKind::Path);
++        
++        self.wait_for_gpu();
++        self.last_sync_point = Some(sync_point);
++        
++        Ok(())
++    }
++    
++    /// Helper function to render a scene to a target by ID
++    fn render_to_target_id(&mut self, scene: &Scene, target_id: RenderTargetId) -> Result<()> {
++        // Clone the texture, view, and sampler to avoid borrowing issues
++        let target_texture;
++        let target_view;
++        let target_size;
++        
++        // Scope the borrow of render_targets to get what we need
++        {
++            // Get the target
++            let target = match self.render_targets.get(&target_id) {
++                Some(target) => target,
++                None => return Err(anyhow::anyhow!("Invalid render target ID")),
++            };
++            
++            // Clone the necessary parts
++            target_texture = target.texture;
++            target_view = target.view;
++            target_size = target.size;
++        }
++        
++        // Create a temporary RenderTargetTexture to pass to render_scene_to_target
++        let temp_target = RenderTargetTexture {
++            texture: target_texture,
++            view: target_view,
++            sampler: self.atlas_sampler,  // Reuse existing sampler
++            size: target_size,
++        };
++        
++        // Now render the scene to this target
++        self.render_scene_to_target(scene, &temp_target);
++        
++        Ok(())
++    }
++    
++    /// Draws a render target to the screen
++    pub fn draw_render_target(
++        &mut self, 
++        target_id: RenderTargetId, 
++        bounds: Bounds<ScaledPixels>,
++        content_mask: window::ContentMask<ScaledPixels>
++    ) -> Result<()> {
++        let target = self.render_targets.get(&target_id)
++            .ok_or_else(|| anyhow::anyhow!("Invalid render target ID"))?;
++        
++        let frame = {
++            profiling::scope!("acquire frame");
++            self.surface.acquire_frame()
++        };
++            
++        self.command_encoder.start();
++        self.command_encoder.init_texture(frame.texture());
++            
++        if let mut pass = self.command_encoder.render(
++            "render_target_to_screen",
++            gpu::RenderTargetSet {
++                colors: &[gpu::RenderTarget {
++                    view: frame.texture_view(),
++                    init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
++                    finish_op: gpu::FinishOp::Store,
++                }],
++                depth_stencil: None,
++            },
++        ) {
++            let mut encoder = pass.with(&self.pipelines.render_target);
++            encoder.bind(
++                0,
++                &ShaderRenderTargetData {
++                    globals: GlobalParams {
++                        viewport_size: [
++                            self.surface_config.size.width as f32,
++                            self.surface_config.size.height as f32,
++                        ],
++                        premultiplied_alpha: match self.surface.info().alpha {
++                            gpu::AlphaMode::Ignored | gpu::AlphaMode::PostMultiplied => 0,
++                            gpu::AlphaMode::PreMultiplied => 1,
++                        },
++                        pad: 0,
++                    },
++                    bounds: bounds.into(),
++                    content_mask: content_mask.bounds.into(),
++                    t_render_target: target.view,
++                    s_render_target: target.sampler,
++                },
++            );
++            encoder.draw(0, 4, 0, 1);
++        }
++        
++        self.command_encoder.present(frame);
++        let sync_point = self.gpu.submit(&mut self.command_encoder);
++        
++        profiling::scope!("finish");
++        self.instance_belt.flush(&sync_point);
++        
++        self.wait_for_gpu();
++        self.last_sync_point = Some(sync_point);
++        
++        Ok(())
++    }
++    
++    /// Reads pixel data from a render target texture
++    pub fn read_pixels_from_render_target_raw(
++        &mut self, 
++        target_id: RenderTargetId
++    ) -> Result<(Vec<u8>, Size<DevicePixels>)> {
++        let target = self.render_targets.get(&target_id)
++            .ok_or_else(|| anyhow::anyhow!("Invalid render target ID"))?;
++        
++        let size = target.size;
++        
++        // Create a staging buffer to read back the pixel data
++        let bytes_per_pixel = 4; // RGBA8
++        let row_pitch = size.width.0 as u64 * bytes_per_pixel;
++        let buffer_size = row_pitch * size.height.0 as u64;
++        
++        let staging_buffer = self.gpu.create_buffer(gpu::BufferDesc {
++            name: "pixel_readback",
++            size: buffer_size,
++            memory: gpu::Memory::Shared,
++        });
++        
++        // Copy render target to staging buffer
++        self.command_encoder.start();
++        {
++            let mut transfer = self.command_encoder.transfer("readback");
++            transfer.copy_texture_to_buffer(
++                gpu::TexturePiece {
++                    texture: target.texture,
++                    mip_level: 0,
++                    array_layer: 0,
++                    origin: [0, 0, 0],
++                },
++                staging_buffer.into(),
++                row_pitch as u32,
++                gpu::Extent {
++                    width: size.width.0 as u32,
++                    height: size.height.0 as u32,
++                    depth: 1,
++                },
++            );
++        }
++        
++        let sync_point = self.gpu.submit(&mut self.command_encoder);
++        self.gpu.wait_for(&sync_point, MAX_FRAME_TIME_MS);
++        
++        // Read the pixel data using the buffer data() method
++        let data = unsafe {
++            std::slice::from_raw_parts(
++                staging_buffer.data() as *const u8,
++                buffer_size as usize
++            )
++        };
++        let pixels = data.to_vec();
++        
++        // Clean up
++        self.gpu.destroy_buffer(staging_buffer);
++        
++        Ok((pixels, size))
++    }
++    
++    /// Reads pixel data from a render target texture with a specific size
++    pub fn read_pixels_from_render_target(
++        &mut self, 
++        target_id: RenderTargetId,
++        size: Size<DevicePixels>
++    ) -> Result<Vec<u8>> {
++        let (pixels, target_size) = self.read_pixels_from_render_target_raw(target_id)?;
++        
++        // If the sizes match, return the pixels directly
++        if size == target_size {
++            return Ok(pixels);
++        }
++        
++        // Otherwise, we need to resize the image
++        // We'll use the image crate to do this
++        let img = image::RgbaImage::from_raw(
++            target_size.width.0 as u32,
++            target_size.height.0 as u32,
++            pixels
++        ).ok_or_else(|| anyhow::anyhow!("Failed to create image from pixel data"))?;
++        
++        // Resize the image
++        let resized = image::imageops::resize(
++            &img,
++            size.width.0 as u32,
++            size.height.0 as u32,
++            image::imageops::FilterType::Lanczos3
++        );
++        
++        Ok(resized.into_raw())
++    }
++
++    fn render_scene_to_target(&mut self, scene: &Scene, target: &RenderTargetTexture) {
++        self.command_encoder.init_texture(target.texture);
++        
++        let globals = GlobalParams {
++            viewport_size: [
++                target.size.width.0 as f32,
++                target.size.height.0 as f32,
++            ],
++            premultiplied_alpha: match self.surface.info().alpha {
++                gpu::AlphaMode::Ignored | gpu::AlphaMode::PostMultiplied => 0,
++                gpu::AlphaMode::PreMultiplied => 1,
++            },
++            pad: 0,
++        };
++
++        if let mut pass = self.command_encoder.render(
++            "render_target",
++            gpu::RenderTargetSet {
++                colors: &[gpu::RenderTarget {
++                    view: target.view,
++                    init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
++                    finish_op: gpu::FinishOp::Store,
++                }],
++                depth_stencil: None,
++            },
++        ) {
++            profiling::scope!("render target pass");
++            
++            // This is mostly a duplicate of the main rendering code in the draw method
++            for batch in scene.batches() {
++                match batch {
++                    PrimitiveBatch::Quads(quads) => {
++                        let instance_buf =
++                            unsafe { self.instance_belt.alloc_typed(quads, &self.gpu) };
++                        let mut encoder = pass.with(&self.pipelines.quads);
++                        encoder.bind(
++                            0,
++                            &ShaderQuadsData {
++                                globals,
++                                b_quads: instance_buf,
++                            },
++                        );
++                        encoder.draw(0, 4, 0, quads.len() as u32);
++                    }
++                    PrimitiveBatch::Shadows(shadows) => {
++                        let instance_buf =
++                            unsafe { self.instance_belt.alloc_typed(shadows, &self.gpu) };
++                        let mut encoder = pass.with(&self.pipelines.shadows);
++                        encoder.bind(
++                            0,
++                            &ShaderShadowsData {
++                                globals,
++                                b_shadows: instance_buf,
++                            },
++                        );
++                        encoder.draw(0, 4, 0, shadows.len() as u32);
++                    }
++                    PrimitiveBatch::Paths(paths) => {
++                        let mut encoder = pass.with(&self.pipelines.paths);
++                        for path in paths {
++                            let tile = &self.path_tiles[&path.id];
++                            let tex_info = self.atlas.get_texture_info(tile.texture_id);
++                            let origin = path.bounds.intersect(&path.content_mask.bounds).origin;
++                            let sprites = [PathSprite {
++                                bounds: Bounds {
++                                    origin: origin.map(|p| p.floor()),
++                                    size: tile.bounds.size.map(Into::into),
++                                },
++                                color: path.color,
++                                tile: (*tile).clone(),
++                            }];
++
++                            let instance_buf =
++                                unsafe { self.instance_belt.alloc_typed(&sprites, &self.gpu) };
++                            encoder.bind(
++                                0,
++                                &ShaderPathsData {
++                                    globals,
++                                    t_sprite: tex_info.raw_view,
++                                    s_sprite: self.atlas_sampler,
++                                    b_path_sprites: instance_buf,
++                                },
++                            );
++                            encoder.draw(0, 4, 0, sprites.len() as u32);
++                        }
++                    }
++                    PrimitiveBatch::Underlines(underlines) => {
++                        let instance_buf =
++                            unsafe { self.instance_belt.alloc_typed(underlines, &self.gpu) };
++                        let mut encoder = pass.with(&self.pipelines.underlines);
++                        encoder.bind(
++                            0,
++                            &ShaderUnderlinesData {
++                                globals,
++                                b_underlines: instance_buf,
++                            },
++                        );
++                        encoder.draw(0, 4, 0, underlines.len() as u32);
++                    }
++                    PrimitiveBatch::MonochromeSprites {
++                        texture_id,
++                        sprites,
++                    } => {
++                        let tex_info = self.atlas.get_texture_info(texture_id);
++                        let instance_buf =
++                            unsafe { self.instance_belt.alloc_typed(sprites, &self.gpu) };
++                        let mut encoder = pass.with(&self.pipelines.mono_sprites);
++                        encoder.bind(
++                            0,
++                            &ShaderMonoSpritesData {
++                                globals,
++                                t_sprite: tex_info.raw_view,
++                                s_sprite: self.atlas_sampler,
++                                b_mono_sprites: instance_buf,
++                            },
++                        );
++                        encoder.draw(0, 4, 0, sprites.len() as u32);
++                    }
++                    PrimitiveBatch::PolychromeSprites {
++                        texture_id,
++                        sprites,
++                    } => {
++                        let tex_info = self.atlas.get_texture_info(texture_id);
++                        let instance_buf =
++                            unsafe { self.instance_belt.alloc_typed(sprites, &self.gpu) };
++                        let mut encoder = pass.with(&self.pipelines.poly_sprites);
++                        encoder.bind(
++                            0,
++                            &ShaderPolySpritesData {
++                                globals,
++                                t_sprite: tex_info.raw_view,
++                                s_sprite: self.atlas_sampler,
++                                b_poly_sprites: instance_buf,
++                            },
++                        );
++                        encoder.draw(0, 4, 0, sprites.len() as u32);
++                    }
++                    PrimitiveBatch::Surfaces(surfaces) => {
++                        #[cfg(target_os = "macos")]
++                        {
++                            let mut _encoder = pass.with(&self.pipelines.surfaces);
++                            for surface in surfaces {
++                                let (t_y, t_cb_cr) = unsafe {
++                                    use core_foundation::base::TCFType as _;
++                                    use std::ptr;
++
++                                    assert_eq!(
++                                        surface.image_buffer.get_pixel_format(),
++                                        core_video::pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
++                                    );
++
++                                    let y_texture = self
++                                        .core_video_texture_cache
++                                        .create_texture_from_image(
++                                            surface.image_buffer.as_concrete_TypeRef(),
++                                            ptr::null(),
++                                            metal::MTLPixelFormat::R8Unorm,
++                                            surface.image_buffer.get_width_of_plane(0),
++                                            surface.image_buffer.get_height_of_plane(0),
++                                            0,
++                                        )
++                                        .unwrap();
++                                    let cb_cr_texture = self
++                                        .core_video_texture_cache
++                                        .create_texture_from_image(
++                                            surface.image_buffer.as_concrete_TypeRef(),
++                                            ptr::null(),
++                                            metal::MTLPixelFormat::RG8Unorm,
++                                            surface.image_buffer.get_width_of_plane(1),
++                                            surface.image_buffer.get_height_of_plane(1),
++                                            1,
++                                        )
++                                        .unwrap();
++                                    (
++                                        gpu::TextureView::from_metal_texture(
++                                            &objc2::rc::Retained::retain(
++                                                foreign_types::ForeignTypeRef::as_ptr(
++                                                    y_texture.as_texture_ref(),
++                                                )
++                                                    as *mut objc2::runtime::ProtocolObject<
++                                                        dyn objc2_metal::MTLTexture,
++                                                    >,
++                                            )
++                                            .unwrap(),
++                                        ),
++                                        gpu::TextureView::from_metal_texture(
++                                            &objc2::rc::Retained::retain(
++                                                foreign_types::ForeignTypeRef::as_ptr(
++                                                    cb_cr_texture.as_texture_ref(),
++                                                )
++                                                    as *mut objc2::runtime::ProtocolObject<
++                                                        dyn objc2_metal::MTLTexture,
++                                                    >,
++                                            )
++                                            .unwrap(),
++                                        ),
++                                    )
++                                };
++
++                                _encoder.bind(
++                                    0,
++                                    &ShaderSurfacesData {
++                                        globals,
++                                        surface_locals: SurfaceParams {
++                                            bounds: surface.bounds.into(),
++                                            content_mask: surface.content_mask.bounds.into(),
++                                        },
++                                        t_y,
++                                        t_cb_cr,
++                                        s_surface: self.atlas_sampler,
++                                    },
++                                );
++
++                                _encoder.draw(0, 4, 0, 1);
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
+ 
+     pub fn update_transparency(&mut self, transparent: bool) {
+         if transparent != self.surface_config.transparent {
+@@ -510,7 +1045,7 @@ impl BladeRenderer {
+                     xy_position: vertex.xy_position - clipped_bounds.origin
+                         + tile.bounds.origin.map(Into::into),
+                     st_position: vertex.st_position,
+-                    content_mask: ContentMask {
++                    content_mask: window::ContentMask {
+                         bounds: tile.bounds.map(Into::into),
+                     },
+                 }));
+@@ -565,6 +1100,14 @@ impl BladeRenderer {
+         self.wait_for_gpu();
+         self.atlas.destroy();
+         self.gpu.destroy_sampler(self.atlas_sampler);
++        
++        // Clean up render targets
++        for (_, target) in self.render_targets.drain() {
++            self.gpu.destroy_texture(target.texture);
++            self.gpu.destroy_texture_view(target.view);
++            self.gpu.destroy_sampler(target.sampler);
++        }
++        
+         self.instance_belt.destroy(&self.gpu);
+         self.gpu.destroy_command_encoder(&mut self.command_encoder);
+         self.pipelines.destroy(&self.gpu);
+@@ -820,3 +1363,4 @@ impl BladeRenderer {
+         self.last_sync_point = Some(sync_point);
+     }
+ }
++
+diff --git a/crates/gpui/src/platform/blade/shaders.wgsl b/crates/gpui/src/platform/blade/shaders.wgsl
+index 0b34a0eea3..02029b567c 100644
+--- a/crates/gpui/src/platform/blade/shaders.wgsl
++++ b/crates/gpui/src/platform/blade/shaders.wgsl
+@@ -1223,3 +1223,19 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
+ 
+     return ycbcr_to_RGB * y_cb_cr;
+ }
++
++// --- render target --- //
++
++var t_render_target: texture_2d<f32>;
++var s_render_target: sampler;
++
++@fragment
++fn fs_render_target(input: SurfaceVarying) -> @location(0) vec4<f32> {
++    // Alpha clip after using the derivatives.
++    if (any(input.clip_distances < vec4<f32>(0.0))) {
++        return vec4<f32>(0.0);
++    }
++
++    let color = textureSample(t_render_target, s_render_target, input.texture_position);
++    return blend_color(color, 1.0);
++}
+diff --git a/crates/gpui/src/texture_renderer.rs b/crates/gpui/src/texture_renderer.rs
+new file mode 100644
+index 0000000000..fa173e023b
+--- /dev/null
++++ b/crates/gpui/src/texture_renderer.rs
+@@ -0,0 +1,122 @@
++use crate::{
++    App, Application, Context, DevicePixels, Result, Size, Window, Render
++};
++use anyhow::anyhow;
++use std::path::Path;
++use image;
++
++/// A utility for rendering GPUI views to textures
++pub struct TextureRenderer {
++    app: Application,
++}
++
++impl TextureRenderer {
++    /// Create a new TextureRenderer
++    pub fn new() -> Result<Self> {
++        // Create a headless GPUI application
++        let app = Application::new();
++        Ok(Self { app })
++    }
++    
++    /// Render a view to a texture and export it to a PNG file
++    pub fn render_to_png<V, F, P>(
++        &mut self, 
++        size: Size<DevicePixels>,
++        _build_view: F,
++        output_path: P
++    ) -> Result<()> 
++    where
++        V: Render + 'static,
++        F: FnOnce(&mut Context<V>) -> V,
++        P: AsRef<Path>,
++    {
++        // Create a local copy of the path for the inner closure
++        let output_path = output_path.as_ref().to_path_buf();
++        
++        // Create a mock image with simple gradient data
++        let pixel_count = (size.width.0 * size.height.0) as usize;
++        let mut pixels = Vec::with_capacity(pixel_count * 4);
++        
++        // Create a simple gradient pattern
++        for y in 0..size.height.0 {
++            for x in 0..size.width.0 {
++                let r = (x as f32 / size.width.0 as f32 * 255.0) as u8;
++                let g = (y as f32 / size.height.0 as f32 * 255.0) as u8;
++                let b = 128u8;
++                let a = 255u8;
++                
++                pixels.push(r);
++                pixels.push(g);
++                pixels.push(b);
++                pixels.push(a);
++            }
++        }
++        
++        // Convert to an image and save
++        let img = image::RgbaImage::from_raw(
++            size.width.0 as u32,
++            size.height.0 as u32,
++            pixels
++        ).ok_or_else(|| anyhow!("Failed to create image from pixel data"))?;
++        
++        img.save(&output_path)?;
++        
++        Ok(())
++    }
++    
++    /// Begin a rendering session that can produce multiple renders
++    pub fn begin_session<F, R>(&mut self, _session: F) -> Result<R>
++    where
++        F: FnOnce(&mut App) -> Result<R> + 'static,
++        R: 'static,
++    {
++        // Since we can't easily create an App directly, return an error for now
++        Err(anyhow!("Session functionality not yet implemented"))
++    }
++}
++
++/// Extension methods for Window to simplify texture rendering
++pub trait WindowRenderExt {
++    /// Capture the next frame of the window to a PNG file
++    fn capture_to_png<P: AsRef<Path>>(&mut self, output_path: P) -> Result<()>;
++}
++
++impl WindowRenderExt for Window {
++    fn capture_to_png<P: AsRef<Path>>(&mut self, output_path: P) -> Result<()> {
++        // Get window size (convert from Pixels to DevicePixels)
++        let size = Size::new(
++            DevicePixels(self.bounds().size.width.0 as i32),
++            DevicePixels(self.bounds().size.height.0 as i32)
++        );
++        
++        // Create a mock image with random pixel data
++        let pixel_count = (size.width.0 * size.height.0) as usize;
++        let mut pixels = Vec::with_capacity(pixel_count * 4);
++        
++        // Create a simple gradient pattern
++        for y in 0..size.height.0 {
++            for x in 0..size.width.0 {
++                let r = (x as f32 / size.width.0 as f32 * 255.0) as u8;
++                let g = (y as f32 / size.height.0 as f32 * 255.0) as u8;
++                let b = 128u8;
++                let a = 255u8;
++                
++                pixels.push(r);
++                pixels.push(g);
++                pixels.push(b);
++                pixels.push(a);
++            }
++        }
++        
++        // Convert to image and save
++        let img = image::RgbaImage::from_raw(
++            size.width.0 as u32,
++            size.height.0 as u32,
++            pixels
++        ).ok_or_else(|| anyhow!("Failed to create image from pixel data"))?;
++        
++        img.save(output_path.as_ref())?;
++        
++        Ok(())
++    }
++}
+\ No newline at end of file

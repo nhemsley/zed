@@ -1,0 +1,5119 @@
+diff --git a/crates/gpui/Cargo.toml b/crates/gpui/Cargo.toml
+index 40376f476b..154beabd86 100644
+--- a/crates/gpui/Cargo.toml
++++ b/crates/gpui/Cargo.toml
+@@ -29,6 +29,7 @@ test-support = [
+ inspector = ["gpui_macros/inspector"]
+ leak-detection = ["backtrace"]
+ runtime_shaders = []
++render-to-texture = []
+ macos-blade = [
+     "blade-graphics",
+     "blade-macros",
+@@ -334,3 +335,7 @@ path = "examples/grid_layout.rs"
+ [[example]]
+ name = "mouse_pressure"
+ path = "examples/mouse_pressure.rs"
++
++[[example]]
++name = "render_to_texture"
++path = "examples/render_to_texture.rs"
+diff --git a/crates/gpui/examples/render_to_texture.rs b/crates/gpui/examples/render_to_texture.rs
+new file mode 100644
+index 0000000000..df95b493e1
+--- /dev/null
++++ b/crates/gpui/examples/render_to_texture.rs
+@@ -0,0 +1,132 @@
++//! Render-to-Texture Example
++//!
++//! This example demonstrates rendering primitives to an offscreen texture
++//! and saving the result to a PNG file.
++//!
++//! Run with: cargo run -p gpui --example render_to_texture --features render-to-texture
++
++fn main() {
++    #[cfg(feature = "render-to-texture")]
++    render_to_texture_example::run();
++
++    #[cfg(not(feature = "render-to-texture"))]
++    {
++        eprintln!("This example requires the 'render-to-texture' feature.");
++        eprintln!(
++            "Run with: cargo run -p gpui --example render_to_texture --features render-to-texture"
++        );
++        std::process::exit(1);
++    }
++}
++
++#[cfg(feature = "render-to-texture")]
++mod render_to_texture_example {
++    use gpui::{
++        App, Application, Bounds, Context, DevicePixels, Window, WindowBounds, WindowOptions, fill,
++        point, prelude::*, px, rgb, size,
++    };
++
++    struct RenderToTextureTest;
++
++    impl Render for RenderToTextureTest {
++        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
++            gpui::Empty
++        }
++    }
++
++    pub fn run() {
++        Application::new().run(|cx: &mut App| {
++            let bounds = Bounds::centered(None, size(px(100.), px(100.)), cx);
++            cx.open_window(
++                WindowOptions {
++                    window_bounds: Some(WindowBounds::Windowed(bounds)),
++                    focus: false,
++                    show: false,
++                    ..Default::default()
++                },
++                |window, cx| {
++                    render_to_png(window);
++                    cx.new(|_| RenderToTextureTest)
++                },
++            )
++            .unwrap();
++
++            cx.quit();
++        });
++    }
++
++    fn render_to_png(window: &mut Window) {
++        let max_size = size(DevicePixels(1024), DevicePixels(1024));
++
++        let Some(mut offscreen) = window.create_offscreen_renderer(max_size) else {
++            eprintln!("❌ Failed to create offscreen renderer");
++            return;
++        };
++
++        // Create a 256x256 texture
++        let texture_size = size(DevicePixels(256), DevicePixels(256));
++        let texture = offscreen.create_texture(texture_size);
++
++        // Build a scene with colored boxes
++        let mut ctx = window.create_offscreen_render_context(size(px(256.0), px(256.0)));
++
++        // Dark background
++        ctx.paint_quad(fill(
++            Bounds::new(point(px(0.0), px(0.0)), size(px(256.0), px(256.0))),
++            rgb(0x1a1a2e),
++        ));
++
++        // Red box (top-left)
++        ctx.paint_quad(
++            fill(
++                Bounds::new(point(px(20.0), px(20.0)), size(px(80.0), px(80.0))),
++                gpui::red(),
++            )
++            .corner_radii(px(8.0)),
++        );
++
++        // Green box (center)
++        ctx.paint_quad(
++            fill(
++                Bounds::new(point(px(88.0), px(88.0)), size(px(80.0), px(80.0))),
++                gpui::green(),
++            )
++            .corner_radii(px(8.0)),
++        );
++
++        // Blue box (bottom-right)
++        ctx.paint_quad(
++            fill(
++                Bounds::new(point(px(156.0), px(156.0)), size(px(80.0), px(80.0))),
++                gpui::blue(),
++            )
++            .corner_radii(px(8.0)),
++        );
++
++        // Render scene to texture
++        let scene = ctx.take_scene();
++        offscreen.draw_scene_to_texture(&scene, texture.id);
++
++        // Read back and save to PNG
++        match offscreen.read_texture(texture.id) {
++            Ok(data) => {
++                let path = "render_to_texture_output.png";
++                match image::save_buffer(
++                    path,
++                    data.as_bytes(),
++                    data.width,
++                    data.height,
++                    image::ColorType::Rgba8,
++                ) {
++                    Ok(()) => println!("✅ Saved: {}", path),
++                    Err(e) => eprintln!("❌ Failed to save PNG: {}", e),
++                }
++            }
++            Err(e) => eprintln!("❌ Failed to read texture: {}", e),
++        }
++
++        // Cleanup
++        offscreen.destroy_texture(texture.id);
++        offscreen.destroy();
++    }
++}
+diff --git a/crates/gpui/research/gpui-blade-rendering-pipeline.md b/crates/gpui/research/gpui-blade-rendering-pipeline.md
+new file mode 100644
+index 0000000000..c834de235f
+--- /dev/null
++++ b/crates/gpui/research/gpui-blade-rendering-pipeline.md
+@@ -0,0 +1,342 @@
++# GPUI-to-Blade Rendering Pipeline
++
++This document traces the code paths from GPUI's high-level rendering API down to the Blade GPU renderer, identifying what would need to be separated to enable direct render-to-texture without the Window/App context overhead.
++
++---
++
++## Overview: The Rendering Pipeline
++
++```
++┌─────────────────────────────────────────────────────────────────────────┐
++│                           GPUI Layer                                    │
++│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                 │
++│  │   Element   │───▶│   Window    │───▶│    Frame    │                 │
++│  │  .paint()   │    │  .draw()    │    │   .scene    │                 │
++│  └─────────────┘    └─────────────┘    └─────────────┘                 │
++│         │                  │                  │                         │
++│         ▼                  ▼                  ▼                         │
++│  paint_quad()        draw_roots()      Scene::insert_primitive()       │
++│  paint_path()        present()         Scene::batches()                │
++│  paint_glyph()                                                          │
++└─────────────────────────────────────────────────────────────────────────┘
++                                │
++                                ▼
++┌─────────────────────────────────────────────────────────────────────────┐
++│                        Platform Layer                                   │
++│  ┌──────────────────────┐                                               │
++│  │   PlatformWindow     │◀─── trait with fn draw(&self, scene: &Scene) │
++│  │   (trait)            │                                               │
++│  └──────────────────────┘                                               │
++│            │                                                            │
++│            ├── WaylandWindow ──▶ BladeRenderer::draw()                 │
++│            ├── X11Window ──────▶ BladeRenderer::draw()                 │
++│            ├── MacWindow ──────▶ MetalRenderer (similar)               │
++│            └── TexturedSurfaceWindow ──▶ render_scene_to_texture()     │
++└─────────────────────────────────────────────────────────────────────────┘
++                                │
++                                ▼
++┌─────────────────────────────────────────────────────────────────────────┐
++│                          Blade Layer                                    │
++│  ┌─────────────────────────────────────────────────────────────────┐   │
++│  │                      BladeRenderer                               │   │
++│  │  - gpu: Arc<gpu::Context>                                        │   │
++│  │  - surface: gpu::Surface (for window) OR texture (for offscreen)│   │
++│  │  - pipelines: BladePipelines                                     │   │
++│  │  - atlas: Arc<BladeAtlas>                                        │   │
++│  │  - command_encoder: gpu::CommandEncoder                          │   │
++│  └─────────────────────────────────────────────────────────────────┘   │
++│                              │                                          │
++│                              ▼                                          │
++│            BladeRenderer::draw(scene: &Scene)                          │
++│                    │                                                    │
++│                    ├── Quads ──────▶ quads pipeline                    │
++│                    ├── Shadows ────▶ shadows pipeline                  │
++│                    ├── Paths ──────▶ path_rasterization + paths        │
++│                    ├── Underlines ─▶ underlines pipeline               │
++│                    ├── MonoSprites ▶ mono_sprites pipeline (glyphs)    │
++│                    ├── PolySprites ▶ poly_sprites pipeline (images)    │
++│                    └── Surfaces ───▶ surfaces pipeline (video)         │
++└─────────────────────────────────────────────────────────────────────────┘
++```
++
++---
++
++## Layer 1: GPUI Elements and Window
++
++### Element Paint Methods
++
++**File:** `vendor/zed/crates/gpui/src/window.rs`
++
++These methods are called during the paint phase and add primitives to the Scene:
++
++| Method | Lines | What It Does |
++|--------|-------|--------------|
++| `Window::paint_quad()` | L2995-3013 | Adds a `Quad` primitive (rectangles, backgrounds, borders) |
++| `Window::paint_path()` | L3016-3031 | Adds a `Path` primitive (vector shapes) |
++| `Window::paint_underline()` | L3033-3066 | Adds an `Underline` primitive |
++| `Window::paint_strikethrough()` | L3068-3101 | Adds an `Underline` primitive (reused) |
++| `Window::paint_glyph()` | L3104-3164 | Adds a `MonochromeSprite` (text glyph) |
++| `Window::paint_emoji()` | L3166-3219 | Adds a `PolychromeSprite` (emoji) |
++| `Window::paint_svg()` | L3221-3285 | Adds a `MonochromeSprite` (SVG icon) |
++| `Window::paint_image()` | L3287-3337 | Adds a `PolychromeSprite` (image) |
++| `Window::paint_surface()` | L3339-3355 | Adds a `PaintSurface` (video frame, macOS only) |
++| `Window::paint_layer()` | L2938-2960 | Pushes/pops a layer for z-ordering |
++| `Window::paint_shadows()` | L2962-2993 | Adds `Shadow` primitives |
++
++### Example: paint_quad Implementation
++
++```rust
++// vendor/zed/crates/gpui/src/window.rs L2995-3013
++pub fn paint_quad(&mut self, quad: PaintQuad) {
++    self.invalidator.debug_assert_paint();
++
++    let scale_factor = self.scale_factor();
++    let content_mask = self.content_mask();
++    let opacity = self.element_opacity();
++    
++    // Adds directly to the Frame's Scene
++    self.next_frame.scene.insert_primitive(Quad {
++        order: 0,
++        bounds: quad.bounds.scale(scale_factor),
++        content_mask: content_mask.scale(scale_factor),
++        background: quad.background.opacity(opacity),
++        border_color: quad.border_color.opacity(opacity),
++        corner_radii: quad.corner_radii.scale(scale_factor),
++        border_widths: quad.border_widths.scale(scale_factor),
++        border_style: quad.border_style,
++    });
++}
++```
++
++**Dependencies on Window:**
++- `self.scale_factor()` - display scale
++- `self.content_mask()` - clipping bounds
++- `self.element_opacity()` - opacity stack
++- `self.next_frame.scene` - the Scene to add to
++
++---
++
++## Layer 2: Window Draw and Present
++
++**File:** `vendor/zed/crates/gpui/src/window.rs`
++
++### Window::draw() (L2064-2135)
++
++The main draw entry point - called once per frame:
++
++```rust
++pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
++    self.invalidate_entities();
++    cx.entities.clear_accessed();
++    
++    // ... input handler management ...
++    
++    if !cx.mode.skip_drawing() {
++        self.draw_roots(cx);  // <-- Layout and paint all elements
++    }
++    
++    // ... frame finishing, focus handling ...
++    
++    self.needs_present.set(true);
++    ArenaClearNeeded
++}
++```
++
++### Window::present() (L2160-2164)
++
++Actually sends the scene to the GPU:
++
++```rust
++fn present(&self) {
++    self.platform_window.draw(&self.rendered_frame.scene);  // <-- KEY: Scene goes to platform
++    self.needs_present.set(false);
++    profiling::finish_frame!();
++}
++```
++
++### Window::draw_roots() (L2165-2210)
++
++Orchestrates the element tree rendering:
++
++```rust
++fn draw_roots(&mut self, cx: &mut App) {
++    self.invalidator.set_phase(DrawPhase::Prepaint);
++    
++    // Layout all root elements
++    let mut root_element = self.root.as_ref().unwrap().clone().into_any();
++    root_element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
++    
++    // Handle deferred draws, tooltips, etc.
++    self.prepaint_deferred_draws(&sorted_deferred_draws, cx);
++    
++    self.invalidator.set_phase(DrawPhase::Paint);
++    
++    // Paint all elements
++    root_element.paint(self, cx);
++    self.paint_deferred_draws(&sorted_deferred_draws, cx);
++}
++```
++
++---
++
++## Layer 3: Platform Window Trait
++
++**File:** `vendor/zed/crates/gpui/src/platform.rs` (L488-590)
++
++```rust
++pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
++    // ... many methods for window management ...
++    
++    /// THE KEY METHOD: Sends a Scene to the GPU for rendering
++    fn draw(&self, scene: &Scene);
++    
++    fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
++    fn gpu_specs(&self) -> Option<GpuSpecs>;
++    // ...
++}
++```
++
++### Implementations:
++
++| Platform | File | How draw() Works |
++|----------|------|------------------|
++| Wayland | `platform/linux/wayland/window.rs` L1292-1297 | `state.renderer.draw(scene)` → BladeRenderer |
++| X11 | `platform/linux/x11/window.rs` | Same pattern |
++| macOS | `platform/mac/window.rs` | MetalRenderer (similar structure) |
++| TexturedSurface | `platform/linux/textured_surface/window.rs` L367-373 | `state.render_scene_to_texture(scene)` |
++
++---
++
++## Layer 4: Blade Renderer
++
++**File:** `vendor/zed/crates/gpui/src/platform/blade/blade_renderer.rs`
++
++### BladeRenderer Structure (L328-345)
++
++```rust
++pub struct BladeRenderer {
++    gpu: Arc<gpu::Context>,
++    surface: gpu::Surface,              // Window surface (for presentation)
++    surface_config: gpu::SurfaceConfig,
++    command_encoder: gpu::CommandEncoder,
++    last_sync_point: Option<gpu::SyncPoint>,
++    pipelines: BladePipelines,          // All GPU shader pipelines
++    instance_belt: BufferBelt,          // GPU buffer allocation
++    atlas: Arc<BladeAtlas>,             // Texture atlas for sprites
++    atlas_sampler: gpu::Sampler,
++    path_intermediate_texture: gpu::Texture,      // For path MSAA
++    path_intermediate_texture_view: gpu::TextureView,
++    path_intermediate_msaa_texture: Option<gpu::Texture>,
++    path_intermediate_msaa_texture_view: Option<gpu::TextureView>,
++    rendering_parameters: RenderingParameters,
++}
++```
++
++### BladeRenderer::draw() (L644-919)
++
++The core GPU rendering method - **this is what we want to reuse**:
++
++```rust
++pub fn draw(&mut self, scene: &Scene) {
++    self.command_encoder.start();
++    self.atlas.before_frame(&mut self.command_encoder);
++
++    // 1. Acquire frame from surface (WINDOW-SPECIFIC)
++    let frame = self.surface.acquire_frame();
++    self.command_encoder.init_texture(frame.texture());
++
++    let globals = GlobalParams {
++        viewport_size: [width, height],
++        premultiplied_alpha: /* ... */,
++        pad: 0,
++    };
++
++    // 2. Begin render pass targeting the frame
++    let mut pass = self.command_encoder.render(
++        "main",
++        gpu::RenderTargetSet {
++            colors: &[gpu::RenderTarget {
++                view: frame.texture_view(),  // <-- TARGET: window surface
++                init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
++                finish_op: gpu::FinishOp::Store,
++            }],
++            depth_stencil: None,
++        },
++    );
++
++    // 3. Process each primitive batch
++    for batch in scene.batches() {
++        match batch {
++            PrimitiveBatch::Quads(quads) => {
++                let instance_buf = unsafe { self.instance_belt.alloc_typed(quads, &self.gpu) };
++                let mut encoder = pass.with(&self.pipelines.quads);
++                encoder.bind(0, &ShaderQuadsData { globals, b_quads: instance_buf });
++                encoder.draw(0, 4, 0, quads.len() as u32);
++            }
++            PrimitiveBatch::Shadows(shadows) => { /* similar */ }
++            PrimitiveBatch::Paths(paths) => {
++                // Paths require intermediate texture for MSAA
++                drop(pass);
++                self.draw_paths_to_intermediate(paths, width, height);
++                pass = self.command_encoder.render(/* resume main pass */);
++                // ... composite paths from intermediate
++            }
++            PrimitiveBatch::Underlines(underlines) => { /* similar */ }
++            PrimitiveBatch::MonochromeSprites { texture_id, sprites } => { /* similar */ }
++            PrimitiveBatch::PolychromeSprites { texture_id, sprites } => { /* similar */ }
++            PrimitiveBatch::Surfaces(surfaces) => { /* macOS video */ }
++        }
++    }
++    drop(pass);
++
++    // 4. Present to window (WINDOW-SPECIFIC)
++    self.command_encoder.present(frame);
++    let sync_point = self.gpu.submit(&mut self.command_encoder);
++    
++    // 5. Cleanup
++    self.instance_belt.flush(&sync_point);
++    self.atlas.after_frame(&sync_point);
++    self.wait_for_gpu();
++}
++```
++
++---
++
++## Layer 5: Scene and Primitives
++
++**File:** `vendor/zed/crates/gpui/src/scene.rs`
++
++### Scene Structure (L24-35)
++
++```rust
++pub(crate) struct Scene {
++    pub(crate) paint_operations: Vec<PaintOperation>,
++    primitive_bounds: BoundsTree<ScaledPixels>,
++    layer_stack: Vec<DrawOrder>,
++    pub(crate) shadows: Vec<Shadow>,
++    pub(crate) quads: Vec<Quad>,
++    pub(crate) paths: Vec<Path<ScaledPixels>>,
++    pub(crate) underlines: Vec<Underline>,
++    pub(crate) monochrome_sprites: Vec<MonochromeSprite>,
++    pub(crate) polychrome_sprites: Vec<PolychromeSprite>,
++    pub(crate) surfaces: Vec<PaintSurface>,
++}
++```
++
++### PrimitiveBatch Enum (L435-449)
++
++What the renderer iterates over:
++
++```rust
++pub(crate) enum PrimitiveBatch<'a> {
++    Shadows(&'a [Shadow]),
++    Quads(&'a [Quad]),
++    Paths(&'a [Path<ScaledPixels>]),
++    Underlines(&'a [Underline]),
++    MonochromeSprites { texture_id: AtlasTextureId, sprites: &'a [MonochromeSprite] },
++    PolychromeSprites { texture_id: AtlasTextureId, sprites: &'a [PolychromeSprite] },
++    Surfaces(&'a [PaintSurface]),
++}
++```
++
++---
+diff --git a/crates/gpui/research/offscreen-render-context.md b/crates/gpui/research/offscreen-render-context.md
+new file mode 100644
+index 0000000000..d3ff6b98b2
+--- /dev/null
++++ b/crates/gpui/research/offscreen-render-context.md
+@@ -0,0 +1,494 @@
++# OffscreenRenderContext Design
++
++This document outlines the design for `OffscreenRenderContext`, a minimal rendering context that can render GPUI elements to textures without requiring a full `Window` infrastructure.
++
++---
++
++## Goals
++
++1. **Render elements to textures** for use cases like infinite canvas thumbnails
++2. **Minimal dependencies** - only what's needed for text rendering and basic primitives
++3. **Share GPU resources** with the main window renderer (atlas, pipelines)
++4. **No Window overhead** - no focus, hit testing, input handlers, etc.
++
++---
++
++## Architecture Overview
++
++```
++┌─────────────────────────────────────────────────────────────────────────┐
++│                    OffscreenRenderContext                               │
++│  ┌─────────────────────────────────────────────────────────────────┐   │
++│  │  Minimal Element Rendering                                       │   │
++│  │  - scale_factor: f32                                             │   │
++│  │  - viewport_size: Size<Pixels>                                   │   │
++│  │  - content_mask: ContentMask<Pixels>                             │   │
++│  │  - scene: Scene                                                  │   │
++│  └─────────────────────────────────────────────────────────────────┘   │
++│                              │                                          │
++│  ┌─────────────────────────────────────────────────────────────────┐   │
++│  │  Layout & Text (shared/borrowed)                                 │   │
++│  │  - layout_engine: TaffyLayoutEngine                              │   │
++│  │  - text_system: Arc<WindowTextSystem>                            │   │
++│  │  - sprite_atlas: Arc<dyn PlatformAtlas>                          │   │
++│  └─────────────────────────────────────────────────────────────────┘   │
++│                              │                                          │
++│                              ▼                                          │
++│  ┌─────────────────────────────────────────────────────────────────┐   │
++│  │  Output: Scene                                                   │   │
++│  │  - Contains all primitives (Quads, MonochromeSprites, etc.)      │   │
++│  │  - Ready to pass to BladeOffscreenRenderer                       │   │
++│  └─────────────────────────────────────────────────────────────────┘   │
++└─────────────────────────────────────────────────────────────────────────┘
++                                │
++                                ▼
++┌─────────────────────────────────────────────────────────────────────────┐
++│                    BladeOffscreenRenderer                               │
++│  - draw_to_texture(&scene, texture_id)                                  │
++│  - Uses shared GPU resources (pipelines, atlas)                         │
++└─────────────────────────────────────────────────────────────────────────┘
++```
++
++---
++
++## Comparison: Window vs OffscreenRenderContext
++
++| Feature | Window | OffscreenRenderContext |
++|---------|--------|------------------------|
++| Scale factor | ✅ From display | ✅ Provided at creation |
++| Viewport size | ✅ From window | ✅ Provided at creation |
++| Content mask | ✅ Stack-based | ✅ Simple (full viewport) |
++| Scene | ✅ In Frame | ✅ Owned directly |
++| Layout engine | ✅ TaffyLayoutEngine | ✅ Own instance |
++| Text system | ✅ WindowTextSystem | ✅ Shared Arc |
++| Sprite atlas | ✅ From platform | ✅ Shared Arc |
++| Focus handling | ✅ Full | ❌ Not needed |
++| Hit testing | ✅ Full | ❌ Not needed |
++| Input handlers | ✅ Full | ❌ Not needed |
++| Element state | ✅ Persistent | ⚠️ Transient only |
++| Deferred draws | ✅ Tooltips, etc. | ❌ Not needed |
++
++---
++
++## Required Components
++
++### 1. Scene (needs to be accessible)
++
++Currently `pub(crate)`. Options:
++- Make `Scene` public (simple)
++- Keep internal, provide accessor methods
++
++```rust
++// Current: gpui/src/scene.rs
++pub(crate) struct Scene { ... }
++
++// Option A: Make public
++pub struct Scene { ... }
++
++// Option B: Keep internal, expose via OffscreenRenderContext
++impl OffscreenRenderContext {
++    pub(crate) fn scene(&self) -> &Scene { &self.scene }
++}
++```
++
++### 2. Text System Access
++
++`WindowTextSystem` wraps `TextSystem` and provides caching:
++
++```rust
++// gpui/src/text_system.rs
++pub struct WindowTextSystem {
++    line_layout_cache: LineLayoutCache,
++    text_system: Arc<TextSystem>,
++}
++```
++
++For offscreen rendering, we can either:
++- Share the Window's `WindowTextSystem` (if rendering from window context)
++- Create a new one (for standalone rendering)
++
++### 3. Sprite Atlas
++
++The atlas is already `Arc<dyn PlatformAtlas>` and shared:
++
++```rust
++// From BladeRenderer
++pub fn sprite_atlas(&self) -> &Arc<BladeAtlas> {
++    &self.shared.atlas
++}
++```
++
++This is used for caching rasterized glyphs. The offscreen renderer already has access to it.
++
++### 4. Layout Engine
++
++`TaffyLayoutEngine` is relatively lightweight:
++
++```rust
++// gpui/src/taffy.rs
++pub(crate) struct TaffyLayoutEngine(taffy::TaffyTree<()>);
++```
++
++Each `OffscreenRenderContext` can have its own instance.
++
++---
++
++## Proposed API
++
++### OffscreenRenderContext Structure
++
++```rust
++/// A minimal rendering context for offscreen element rendering.
++/// 
++/// This provides the essential infrastructure to render GPUI elements
++/// to a Scene without the full Window overhead.
++#[cfg(feature = "render-to-texture")]
++pub struct OffscreenRenderContext {
++    // Rendering parameters
++    scale_factor: f32,
++    viewport_size: Size<Pixels>,
++    
++    // Content mask stack (for clipping)
++    content_mask_stack: Vec<ContentMask<Pixels>>,
++    
++    // Opacity stack
++    opacity_stack: Vec<f32>,
++    
++    // The scene being built
++    scene: Scene,
++    
++    // Layout engine (owned)
++    layout_engine: TaffyLayoutEngine,
++    
++    // Text system (shared)
++    text_system: Arc<WindowTextSystem>,
++    
++    // Sprite atlas for glyph caching (shared)
++    sprite_atlas: Arc<dyn PlatformAtlas>,
++}
++```
++
++### Creation
++
++```rust
++impl OffscreenRenderContext {
++    /// Create a new offscreen render context.
++    /// 
++    /// # Arguments
++    /// * `viewport_size` - Size of the rendering viewport in logical pixels
++    /// * `scale_factor` - Display scale factor (e.g., 2.0 for retina)
++    /// * `text_system` - Shared text system for shaping and rasterizing text
++    /// * `sprite_atlas` - Shared sprite atlas for caching glyphs
++    pub fn new(
++        viewport_size: Size<Pixels>,
++        scale_factor: f32,
++        text_system: Arc<WindowTextSystem>,
++        sprite_atlas: Arc<dyn PlatformAtlas>,
++    ) -> Self {
++        let content_mask = ContentMask {
++            bounds: Bounds {
++                origin: Point::zero(),
++                size: viewport_size,
++            },
++        };
++        
++        Self {
++            scale_factor,
++            viewport_size,
++            content_mask_stack: vec![content_mask],
++            opacity_stack: vec![1.0],
++            scene: Scene::default(),
++            layout_engine: TaffyLayoutEngine::new(),
++            text_system,
++            sprite_atlas,
++        }
++    }
++}
++```
++
++### Paint Methods (Simplified from Window)
++
++```rust
++impl OffscreenRenderContext {
++    /// Current scale factor
++    pub fn scale_factor(&self) -> f32 {
++        self.scale_factor
++    }
++    
++    /// Current content mask (for clipping)
++    pub fn content_mask(&self) -> ContentMask<Pixels> {
++        self.content_mask_stack.last().cloned().unwrap_or_default()
++    }
++    
++    /// Current opacity
++    pub fn element_opacity(&self) -> f32 {
++        self.opacity_stack.iter().product()
++    }
++    
++    /// Access the text system
++    pub fn text_system(&self) -> &Arc<WindowTextSystem> {
++        &self.text_system
++    }
++    
++    /// Paint a quad (rectangle with background, border, etc.)
++    pub fn paint_quad(&mut self, quad: PaintQuad) {
++        let scale_factor = self.scale_factor();
++        let content_mask = self.content_mask();
++        let opacity = self.element_opacity();
++        
++        self.scene.insert_primitive(Quad {
++            order: 0,
++            bounds: quad.bounds.scale(scale_factor),
++            content_mask: content_mask.scale(scale_factor),
++            background: quad.background.opacity(opacity),
++            border_color: quad.border_color.opacity(opacity),
++            corner_radii: quad.corner_radii.scale(scale_factor),
++            border_widths: quad.border_widths.scale(scale_factor),
++            border_style: quad.border_style,
++        });
++    }
++    
++    /// Paint a text glyph
++    pub fn paint_glyph(
++        &mut self,
++        origin: Point<Pixels>,
++        font_id: FontId,
++        glyph_id: GlyphId,
++        font_size: Pixels,
++        color: Hsla,
++    ) -> Result<()> {
++        let scale_factor = self.scale_factor();
++        let glyph_origin = origin.scale(scale_factor);
++        
++        let subpixel_variant = Point {
++            x: (glyph_origin.x.0.fract() * SUBPIXEL_VARIANTS_X as f32).floor() as u8,
++            y: (glyph_origin.y.0.fract() * SUBPIXEL_VARIANTS_Y as f32).floor() as u8,
++        };
++        
++        let params = RenderGlyphParams {
++            font_id,
++            glyph_id,
++            font_size,
++            subpixel_variant,
++            scale_factor,
++            is_emoji: false,
++        };
++        
++        let raster_bounds = self.text_system.raster_bounds(&params)?;
++        if !raster_bounds.is_zero() {
++            let tile = self.sprite_atlas.get_or_insert_with(
++                &params.clone().into(),
++                &mut || {
++                    let (size, bytes) = self.text_system.rasterize_glyph(&params)?;
++                    Ok(Some((size, Cow::Owned(bytes))))
++                },
++            )?.expect("Callback only errors or returns Some");
++            
++            let bounds = Bounds {
++                origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),
++                size: tile.bounds.size.map(Into::into),
++            };
++            let content_mask = self.content_mask().scale(scale_factor);
++            let opacity = self.element_opacity();
++            
++            self.scene.insert_primitive(MonochromeSprite {
++                order: 0,
++                pad: 0,
++                bounds,
++                content_mask,
++                color: color.opacity(opacity),
++                tile,
++                transformation: TransformationMatrix::unit(),
++            });
++        }
++        Ok(())
++    }
++    
++    /// Get the built scene (consumes self or returns reference)
++    pub fn into_scene(self) -> Scene {
++        self.scene
++    }
++    
++    pub fn scene(&self) -> &Scene {
++        &self.scene
++    }
++    
++    /// Clear the scene for reuse
++    pub fn clear(&mut self) {
++        self.scene.clear();
++        self.layout_engine.clear();
++    }
++}
++```
++
++### Element Rendering
++
++For rendering elements, we need a simplified version of the layout/prepaint/paint flow:
++
++```rust
++impl OffscreenRenderContext {
++    /// Render an element to this context's scene.
++    /// 
++    /// This performs layout, prepaint, and paint phases.
++    pub fn render_element<E: IntoElement>(
++        &mut self,
++        element: E,
++        available_space: Size<AvailableSpace>,
++        cx: &mut App,
++    ) {
++        let mut element = element.into_any_element();
++        
++        // Layout phase
++        let layout_id = element.request_layout(self, cx);
++        self.layout_engine.compute_layout(layout_id, available_space);
++        
++        // Prepaint phase  
++        let bounds = self.layout_engine.layout_bounds(layout_id);
++        element.prepaint(bounds.origin, self, cx);
++        
++        // Paint phase
++        element.paint(self, cx);
++    }
++}
++```
++
++**Note:** This requires elements to accept a trait or generic context rather than specifically `&mut Window`. This is a larger refactor.
++
++---
++
++## Implementation Strategy
++
++### Phase 1: Scene Accessibility
++
++1. Make `Scene` public (or provide controlled access)
++2. Ensure `Scene::insert_primitive()` is accessible
++3. Test that `BladeOffscreenRenderer::draw_to_texture()` works with a manually-built Scene
++
++### Phase 2: OffscreenRenderContext Basics
++
++1. Create `OffscreenRenderContext` struct with:
++   - Basic paint methods (`paint_quad`, `paint_glyph`)
++   - Text system integration
++   - Atlas sharing
++
++2. Test rendering simple primitives:
++   ```rust
++   let mut ctx = OffscreenRenderContext::new(...);
++   ctx.paint_quad(PaintQuad { ... });
++   let scene = ctx.into_scene();
++   offscreen_renderer.draw_to_texture(&scene, texture_id);
++   ```
++
++### Phase 3: Element Integration (Future)
++
++Options for making elements renderable to `OffscreenRenderContext`:
++
++**Option A: Trait Abstraction**
++```rust
++trait RenderContext {
++    fn scale_factor(&self) -> f32;
++    fn paint_quad(&mut self, quad: PaintQuad);
++    fn paint_glyph(&mut self, ...);
++    // etc.
++}
++
++impl RenderContext for Window { ... }
++impl RenderContext for OffscreenRenderContext { ... }
++```
++
++**Option B: Enum Dispatch**
++```rust
++enum AnyRenderContext<'a> {
++    Window(&'a mut Window),
++    Offscreen(&'a mut OffscreenRenderContext),
++}
++```
++
++**Option C: Keep Separate**
++- Elements paint to Window only
++- Manual Scene building for offscreen
++- Higher-level helpers for common cases
++
++---
++
++## Usage Example
++
++```rust
++// Create offscreen renderer from window
++let mut offscreen_renderer = window.create_offscreen_renderer(
++    size(DevicePixels(1024), DevicePixels(1024))
++)?;
++
++// Create texture
++let texture_info = offscreen_renderer.create_texture(
++    size(DevicePixels(256), DevicePixels(256))
++);
++
++// Create render context (borrowing shared resources)
++let mut render_ctx = OffscreenRenderContext::new(
++    size(px(256.0), px(256.0)),
++    window.scale_factor(),
++    window.text_system().clone(),
++    window.sprite_atlas().clone(),
++);
++
++// Paint primitives
++render_ctx.paint_quad(PaintQuad {
++    bounds: Bounds::new(point(px(10.0), px(10.0)), size(px(100.0), px(50.0))),
++    background: blue().into(),
++    ..Default::default()
++});
++
++// Render text
++let line = render_ctx.text_system().shape_line("Hello", px(16.0), &runs, None);
++line.paint(&mut render_ctx, point(px(20.0), px(30.0)), px(16.0))?;
++
++// Get scene and render to texture
++let scene = render_ctx.into_scene();
++offscreen_renderer.draw_scene_to_texture(&scene, texture_info.id);
++
++// Use texture_info.id in your canvas...
++```
++
++---
++
++## Dependencies Summary
++
++| Component | Source | Sharing |
++|-----------|--------|---------|
++| `Scene` | Created fresh | Owned |
++| `TaffyLayoutEngine` | Created fresh | Owned |
++| `WindowTextSystem` | From Window or new | `Arc` shared |
++| `PlatformAtlas` | From BladeRenderer | `Arc` shared |
++| GPU pipelines | From BladeRenderer | `Arc` shared (via offscreen renderer) |
++
++---
++
++## Open Questions
++
++1. **Element State**: Should `OffscreenRenderContext` support persistent element state? For thumbnails, probably not needed.
++
++2. **ShapedLine Painting**: `ShapedLine::paint()` currently takes `&mut Window`. Need to either:
++   - Add overload taking `&mut OffscreenRenderContext`
++   - Create trait abstraction
++   - Manually iterate glyphs
++
++3. **Text Style Stack**: Window maintains `text_style_stack`. For simple thumbnails, can use explicit styles.
++
++4. **Content Mask Stack**: Needed for clipping. Include in OffscreenRenderContext.
++
++5. **Where to Put It**: 
++   - `gpui/src/offscreen_render_context.rs`?
++   - `gpui/src/platform/offscreen_render_context.rs`?
++   - Feature-gated under `render-to-texture`
++
++---
++
++## Next Steps
++
++1. [ ] Make `Scene` accessible for offscreen rendering
++2. [ ] Implement basic `OffscreenRenderContext` with `paint_quad`
++3. [ ] Add text rendering support (`paint_glyph`)
++4. [ ] Create integration test rendering to texture
++5. [ ] Document API and add to example
++6. [ ] (Future) Consider element abstraction for direct element rendering
+\ No newline at end of file
+diff --git a/crates/gpui/research/render-to-texture-methodology.md b/crates/gpui/research/render-to-texture-methodology.md
+new file mode 100644
+index 0000000000..07d3d7a258
+--- /dev/null
++++ b/crates/gpui/research/render-to-texture-methodology.md
+@@ -0,0 +1,816 @@
++# Render-to-Texture Methodology
++
++## Goal
++
++Enable rendering of GPUI Elements directly to GPU textures, going through the full layout → prepaint → paint pipeline. This is useful for:
++
++- Caching canvas items as textures for efficient zoom/pan
++- Generating thumbnails
++- Offscreen rendering for image export
++- Any scenario where you want GPUI rendering to a texture instead of a window
++
++## Design Principles
++
++1. **Minimize changes to GPUI** - Work with existing structures, don't fork
++2. **Reuse existing rendering code** - BladeRenderer already does 95% of what we need
++3. **Use the full Element pipeline** - Layout → Prepaint → Paint for proper rendering
++4. **Share GPU resources** - Use the same atlas, pipelines, and GPU context as the main renderer
++
++---
++
++## Current Architecture
++
++### Rendering Pipeline Overview
++
++```
++┌─────────────────────────────────────────────────────────────────────────┐
++│                           GPUI Layer                                    │
++│  ┌─────────────────┐    ┌─────────────┐    ┌─────────────┐             │
++│  │     Element     │───▶│   Window    │───▶│    Frame    │             │
++│  │ request_layout()│    │   .draw()   │    │   .scene    │             │
++│  │   prepaint()    │    │ draw_roots()│    │             │             │
++│  │    paint()      │    │  present()  │    │             │             │
++│  └─────────────────┘    └─────────────┘    └─────────────┘             │
++└─────────────────────────────────────────────────────────────────────────┘
++                                │
++                                ▼
++┌─────────────────────────────────────────────────────────────────────────┐
++│                        Platform Layer                                   │
++│  ┌──────────────────────┐                                               │
++│  │   PlatformWindow     │◀─── trait with fn draw(&self, scene: &Scene) │
++│  │   (trait)            │                                               │
++│  └──────────────────────┘                                               │
++│            │                                                            │
++│            ├── WaylandWindow ──▶ BladeRenderer::draw()                 │
++│            ├── X11Window ──────▶ BladeRenderer::draw()                 │
++│            └── MacWindow ──────▶ MetalRenderer (similar)               │
++└─────────────────────────────────────────────────────────────────────────┘
++                                │
++                                ▼
++┌─────────────────────────────────────────────────────────────────────────┐
++│                          Blade Layer                                    │
++│  ┌─────────────────────────────────────────────────────────────────┐   │
++│  │                      BladeRenderer                               │   │
++│  │  - gpu: Arc<gpu::Context>                                        │   │
++│  │  - surface: gpu::Surface (window surface)                        │   │
++│  │  - pipelines: BladePipelines                                     │   │
++│  │  - atlas: Arc<BladeAtlas>                                        │   │
++│  │  - command_encoder: gpu::CommandEncoder                          │   │
++│  └─────────────────────────────────────────────────────────────────┘   │
++└─────────────────────────────────────────────────────────────────────────┘
++```
++
++### Element Lifecycle
++
++The `Element` trait defines three phases:
++
++```rust
++pub trait Element: 'static + IntoElement {
++    type RequestLayoutState: 'static;
++    type PrepaintState: 'static;
++
++    // Phase 1: Request layout from Taffy, returns LayoutId
++    fn request_layout(&mut self, ...) -> (LayoutId, Self::RequestLayoutState);
++    
++    // Phase 2: After layout, commit bounds for hitboxes
++    fn prepaint(&mut self, bounds: Bounds<Pixels>, ...) -> Self::PrepaintState;
++    
++    // Phase 3: Actually paint to the Scene
++    fn paint(&mut self, bounds: Bounds<Pixels>, ...);
++}
++```
++
++### Window::draw_roots() Flow (L2167-2240)
++
++```rust
++fn draw_roots(&mut self, cx: &mut App) {
++    self.invalidator.set_phase(DrawPhase::Prepaint);
++    
++    // 1. Layout and prepaint root element
++    let mut root_element = self.root.as_ref().unwrap().clone().into_any();
++    root_element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
++    
++    // 2. Handle deferred draws (tooltips, etc.)
++    self.prepaint_deferred_draws(&sorted_deferred_draws, cx);
++    
++    // 3. Paint phase
++    self.invalidator.set_phase(DrawPhase::Paint);
++    root_element.paint(self, cx);
++    self.paint_deferred_draws(&sorted_deferred_draws, cx);
++}
++```
++
++### AnyElement::prepaint_as_root() (L639-651)
++
++```rust
++pub fn prepaint_as_root(
++    &mut self,
++    origin: Point<Pixels>,
++    available_space: Size<AvailableSpace>,
++    window: &mut Window,
++    cx: &mut App,
++) -> Option<FocusHandle> {
++    // First: perform layout
++    self.layout_as_root(available_space, window, cx);
++    // Then: prepaint at the given origin
++    window.with_absolute_element_offset(origin, |window| self.prepaint(window, cx))
++}
++```
++
++### BladeRenderer::draw() (L644-919)
++
++The current method implicitly uses `self.surface`:
++
++```rust
++pub fn draw(&mut self, scene: &Scene) {
++    // 1. Acquire frame from window surface
++    let frame = self.surface.acquire_frame();
++    
++    // 2. Get viewport size from surface config
++    let viewport_size = [
++        self.surface_config.size.width as f32,
++        self.surface_config.size.height as f32,
++    ];
++    
++    // 3. Get alpha mode from surface
++    let premultiplied_alpha = match self.surface.info().alpha { ... };
++    
++    // 4. Render to frame.texture_view()
++    let mut pass = self.command_encoder.render(..., frame.texture_view(), ...);
++    
++    // 5. Process all batches (quads, shadows, paths, sprites, etc.)
++    for batch in scene.batches() { ... }
++    
++    // 6. Present to window
++    self.command_encoder.present(frame);
++}
++```
++
++### Surface-Specific Code Points in BladeRenderer
++
++| Line | Code | Purpose |
++|------|------|---------|
++| L650-652 | `self.surface.acquire_frame()` | Get window frame |
++| L656-657 | `self.surface_config.size` | Viewport dimensions |
++| L658 | `self.surface.info().alpha` | Alpha blending mode |
++| L670 | `frame.texture_view()` | Render target |
++| L718 | `frame.texture_view()` | Resume after paths |
++| L910 | `present(frame)` | Display on window |
++
++**Key insight:** The batch processing loop (L679-907) is completely target-agnostic. It just needs a texture view and viewport size.
++
++---
++
++## Key Data Structures
++
++### Window (L833-894)
++
++```rust
++pub struct Window {
++    pub(crate) platform_window: Box<dyn PlatformWindow>,
++    sprite_atlas: Arc<dyn PlatformAtlas>,
++    text_system: Arc<WindowTextSystem>,
++    layout_engine: Option<TaffyLayoutEngine>,
++    
++    // Rendering context
++    scale_factor: f32,
++    pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
++    pub(crate) element_opacity: f32,
++    pub(crate) element_offset_stack: Vec<Point<Pixels>>,
++    
++    // Frames
++    pub(crate) rendered_frame: Frame,
++    pub(crate) next_frame: Frame,
++    
++    // ... other fields
++}
++```
++
++### Frame (L675-696)
++
++```rust
++pub(crate) struct Frame {
++    pub(crate) scene: Scene,           // <-- The primitives go here
++    pub(crate) hitboxes: Vec<Hitbox>,
++    pub(crate) dispatch_tree: DispatchTree,
++    pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
++    // ... other frame state
++}
++```
++
++### Scene (L24-35)
++
++```rust
++pub(crate) struct Scene {
++    pub(crate) paint_operations: Vec<PaintOperation>,
++    primitive_bounds: BoundsTree<ScaledPixels>,
++    layer_stack: Vec<DrawOrder>,
++    pub(crate) shadows: Vec<Shadow>,
++    pub(crate) quads: Vec<Quad>,
++    pub(crate) paths: Vec<Path<ScaledPixels>>,
++    pub(crate) underlines: Vec<Underline>,
++    pub(crate) monochrome_sprites: Vec<MonochromeSprite>,
++    pub(crate) polychrome_sprites: Vec<PolychromeSprite>,
++    pub(crate) surfaces: Vec<PaintSurface>,
++}
++```
++
++### Paint Methods on Window
++
++| Method | Lines | What It Does |
++|--------|-------|--------------|
++| `paint_quad()` | L2997-3013 | Adds a `Quad` primitive |
++| `paint_path()` | L3018-3030 | Adds a `Path` primitive |
++| `paint_shadows()` | L2964-2986 | Adds `Shadow` primitives |
++| `paint_glyph()` | L3106-3158 | Adds a `MonochromeSprite` (text) |
++| `paint_image()` | L3289-3335 | Adds a `PolychromeSprite` (image) |
++
++All paint methods require:
++- `self.scale_factor()` - display scale
++- `self.content_mask()` - clipping bounds  
++- `self.element_opacity()` - opacity stack
++- `self.next_frame.scene` - the Scene to add to
++
++---
++
++## Proposed Changes
++
++### Phase 1: Refactor BladeRenderer (Low Risk)
++
++#### 1.1 Extract `draw_to_target()` as Private Method
++
++```rust
++impl BladeRenderer {
++    /// Render a scene to a specific target (internal implementation)
++    fn draw_to_target(
++        &mut self,
++        scene: &Scene,
++        target_view: gpu::TextureView,
++        viewport_size: [f32; 2],
++        premultiplied_alpha: bool,
++    ) -> gpu::SyncPoint {
++        self.command_encoder.start();
++        self.atlas.before_frame(&mut self.command_encoder);
++
++        let globals = GlobalParams {
++            viewport_size,
++            premultiplied_alpha: if premultiplied_alpha { 1 } else { 0 },
++            pad: 0,
++        };
++
++        let mut pass = self.command_encoder.render(
++            "main",
++            gpu::RenderTargetSet {
++                colors: &[gpu::RenderTarget {
++                    view: target_view,
++                    init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
++                    finish_op: gpu::FinishOp::Store,
++                }],
++                depth_stencil: None,
++            },
++        );
++
++        // Existing batch processing loop (unchanged)
++        for batch in scene.batches() {
++            match batch {
++                PrimitiveBatch::Quads(quads) => { /* unchanged */ }
++                PrimitiveBatch::Shadows(shadows) => { /* unchanged */ }
++                PrimitiveBatch::Paths(paths) => {
++                    drop(pass);
++                    self.draw_paths_to_intermediate(paths, viewport_size[0], viewport_size[1]);
++                    // Resume with saved target_view
++                    pass = self.command_encoder.render(
++                        "main",
++                        gpu::RenderTargetSet {
++                            colors: &[gpu::RenderTarget {
++                                view: target_view,  // Use passed-in view
++                                init_op: gpu::InitOp::Load,
++                                finish_op: gpu::FinishOp::Store,
++                            }],
++                            depth_stencil: None,
++                        },
++                    );
++                    // ... rest of paths handling
++                }
++                // ... other batches unchanged ...
++            }
++        }
++        
++        drop(pass);
++        
++        let sync_point = self.gpu.submit(&mut self.command_encoder);
++        self.instance_belt.flush(&sync_point);
++        self.atlas.after_frame(&sync_point);
++        
++        sync_point
++    }
++}
++```
++
++#### 1.2 Refactor `draw()` to Use `draw_to_target()`
++
++```rust
++impl BladeRenderer {
++    /// Render to window surface (existing behavior, refactored)
++    pub fn draw(&mut self, scene: &Scene) {
++        let frame = {
++            profiling::scope!("acquire frame");
++            self.surface.acquire_frame()
++        };
++        self.command_encoder.start();
++        self.command_encoder.init_texture(frame.texture());
++        
++        let viewport_size = [
++            self.surface_config.size.width as f32,
++            self.surface_config.size.height as f32,
++        ];
++        let premultiplied_alpha = matches!(
++            self.surface.info().alpha,
++            gpu::AlphaMode::PreMultiplied
++        );
++        
++        let sync_point = self.draw_to_target(
++            scene,
++            frame.texture_view(),
++            viewport_size,
++            premultiplied_alpha,
++        );
++        
++        self.command_encoder.start();
++        self.command_encoder.present(frame);
++        self.gpu.submit(&mut self.command_encoder);
++        
++        self.wait_for_gpu();
++        self.last_sync_point = Some(sync_point);
++    }
++}
++```
++
++#### 1.3 Add `draw_to_texture()` Public Method
++
++```rust
++impl BladeRenderer {
++    /// Render to an offscreen texture (NEW)
++    pub fn draw_to_texture(
++        &mut self,
++        scene: &Scene,
++        texture_view: gpu::TextureView,
++        size: Size<DevicePixels>,
++    ) -> gpu::SyncPoint {
++        let viewport_size = [size.width.0 as f32, size.height.0 as f32];
++        
++        self.draw_to_target(
++            scene,
++            texture_view,
++            viewport_size,
++            true, // Offscreen textures typically use premultiplied alpha
++        )
++    }
++}
++```
++
++#### 1.4 Add Texture Creation Helper
++
++```rust
++impl BladeRenderer {
++    /// Create an offscreen render target texture
++    pub fn create_render_texture(
++        &self, 
++        size: Size<DevicePixels>
++    ) -> (gpu::Texture, gpu::TextureView) {
++        let texture = self.gpu.create_texture(gpu::TextureDesc {
++            name: "offscreen_render_target",
++            format: gpu::TextureFormat::Bgra8UnormSrgb,
++            size: gpu::Extent {
++                width: size.width.0 as u32,
++                height: size.height.0 as u32,
++                depth: 1,
++            },
++            array_layer_count: 1,
++            mip_level_count: 1,
++            sample_count: 1,
++            dimension: gpu::TextureDimension::D2,
++            usage: gpu::TextureUsage::TARGET | gpu::TextureUsage::COPY,
++            external: None,
++        });
++        
++        let view = self.gpu.create_texture_view(
++            texture,
++            gpu::TextureViewDesc {
++                name: "offscreen_render_target_view",
++                format: gpu::TextureFormat::Bgra8UnormSrgb,
++                dimension: gpu::ViewDimension::D2,
++                subresources: &Default::default(),
++            },
++        );
++        
++        (texture, view)
++    }
++    
++    /// Get access to the GPU context for advanced usage
++    pub fn gpu(&self) -> &Arc<gpu::Context> {
++        &self.gpu
++    }
++}
++```
++
++---
++
++### Phase 2: Add Window Methods for Isolated Scene Building
++
++#### 2.1 Add `render_element_to_scene()`
++
++This method renders an element through the full pipeline but to an isolated Scene:
++
++```rust
++impl Window {
++    /// Render an element tree to a Scene, performing layout, prepaint, and paint.
++    /// Returns the scene and the computed size of the element.
++    pub fn render_element_to_scene(
++        &mut self,
++        element: impl IntoElement,
++        available_space: Size<AvailableSpace>,
++        cx: &mut App,
++    ) -> (Scene, Size<Pixels>) {
++        // 1. Save current scene state
++        let saved_scene = std::mem::take(&mut self.next_frame.scene);
++        
++        // 2. Save and reset content mask to full coverage
++        let saved_content_mask = std::mem::take(&mut self.content_mask_stack);
++        
++        // 3. Convert to AnyElement
++        let mut any_element = element.into_element().into_any();
++        
++        // 4. Layout the element
++        let size = any_element.layout_as_root(available_space, self, cx);
++        
++        // 5. Set up content mask for the element's bounds
++        self.content_mask_stack.push(ContentMask {
++            bounds: Bounds {
++                origin: Point::default(),
++                size,
++            },
++        });
++        
++        // 6. Prepaint (at origin 0,0)
++        self.invalidator.set_phase(DrawPhase::Prepaint);
++        any_element.prepaint_at(Point::default(), self, cx);
++        
++        // 7. Paint
++        self.invalidator.set_phase(DrawPhase::Paint);
++        any_element.paint(self, cx);
++        
++        // 8. Finish the scene (sorts primitives by draw order)
++        self.next_frame.scene.finish();
++        
++        // 9. Extract the scene and restore state
++        let scene = std::mem::replace(&mut self.next_frame.scene, saved_scene);
++        self.content_mask_stack = saved_content_mask;
++        
++        (scene, size)
++    }
++}
++```
++
++#### 2.2 Add `render_element_to_texture()` (Higher-Level API)
++
++```rust
++impl Window {
++    /// Render an element tree to a texture.
++    /// 
++    /// This performs the full layout → prepaint → paint pipeline
++    /// on the given element, then renders the resulting Scene to a texture.
++    pub fn render_element_to_texture(
++        &mut self,
++        element: impl IntoElement,
++        available_space: Size<AvailableSpace>,
++        cx: &mut App,
++    ) -> Result<RenderToTextureResult> {
++        // 1. Build the scene
++        let (scene, size) = self.render_element_to_scene(element, available_space, cx);
++        
++        // 2. Calculate device pixel size
++        let device_size = Size {
++            width: DevicePixels((size.width.0 * self.scale_factor) as i32),
++            height: DevicePixels((size.height.0 * self.scale_factor) as i32),
++        };
++        
++        // 3. Render to texture via platform window
++        let texture_id = self.platform_window.render_scene_to_texture(&scene, device_size)?;
++        
++        Ok(RenderToTextureResult {
++            texture_id,
++            size,
++            device_size,
++        })
++    }
++}
++
++pub struct RenderToTextureResult {
++    pub texture_id: TextureId,
++    pub size: Size<Pixels>,
++    pub device_size: Size<DevicePixels>,
++}
++```
++
++---
++
++### Phase 3: Expose Renderer Through PlatformWindow
++
++#### 3.1 Add to `PlatformWindow` Trait
++
++```rust
++// In platform.rs
++pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
++    // ... existing methods ...
++    
++    /// Render a scene to a new texture, returning a texture ID
++    fn render_scene_to_texture(
++        &self,
++        scene: &Scene,
++        size: Size<DevicePixels>,
++    ) -> Result<TextureId>;
++    
++    /// Optional: Direct renderer access for advanced usage
++    fn with_renderer<R>(&self, f: impl FnOnce(&mut dyn Renderer) -> R) -> Option<R> {
++        None
++    }
++}
++```
++
++#### 3.2 Implement for Wayland/X11
++
++```rust
++// In platform/linux/wayland/window.rs
++impl PlatformWindow for WaylandWindow {
++    fn render_scene_to_texture(
++        &self,
++        scene: &Scene,
++        size: Size<DevicePixels>,
++    ) -> Result<TextureId> {
++        let mut state = self.0.borrow_mut();
++        
++        // Create texture
++        let (texture, view) = state.renderer.create_render_texture(size);
++        
++        // Render scene to texture
++        let _sync_point = state.renderer.draw_to_texture(scene, view, size);
++        
++        // Register texture for later use (e.g., in atlas or texture registry)
++        let texture_id = state.register_render_texture(texture, view, size);
++        
++        Ok(texture_id)
++    }
++}
++```
++
++---
++
++### Phase 4: Texture Compositing
++
++After rendering to a texture, we need to draw it back in the main scene.
++
++#### Option A: Use Existing PolychromeSprite
++
++Register the texture in the atlas and use as a `PolychromeSprite`:
++
++```rust
++// Add to atlas with a custom key type
++pub enum AtlasKey {
++    Glyph(RenderGlyphParams),
++    Svg(RenderSvgParams),
++    Image(RenderImageParams),
++    RenderTexture(TextureId),  // NEW
++}
++```
++
++#### Option B: Add TextureQuad Primitive
++
++Create a new primitive type for raw texture rendering:
++
++```rust
++pub(crate) struct TextureQuad {
++    pub order: DrawOrder,
++    pub bounds: Bounds<ScaledPixels>,
++    pub content_mask: ContentMask<ScaledPixels>,
++    pub texture_view: gpu::TextureView,
++    pub corner_radii: Corners<ScaledPixels>,
++    pub opacity: f32,
++}
++```
++
++This would require:
++1. Adding to `Primitive` enum
++2. Adding to `PrimitiveBatch` enum
++3. Adding rendering logic in `BladeRenderer::draw()`
++4. Adding corresponding shader code
++
++#### Option C: Paint Helper Method
++
++Add a convenience method to Window:
++
++```rust
++impl Window {
++    pub fn paint_rendered_texture(
++        &mut self,
++        texture_id: TextureId,
++        bounds: Bounds<Pixels>,
++        corner_radii: Corners<Pixels>,
++    ) -> Result<()> {
++        // Use the texture as a PolychromeSprite
++        let tile = self.sprite_atlas.get_render_texture(texture_id)?;
++        
++        self.next_frame.scene.insert_primitive(PolychromeSprite {
++            order: 0,
++            pad: 0,
++            grayscale: false,
++            opacity: self.element_opacity(),
++            bounds: bounds.scale(self.scale_factor()),
++            content_mask: self.content_mask().scale(self.scale_factor()),
++            corner_radii: corner_radii.scale(self.scale_factor()),
++            tile,
++        });
++        
++        Ok(())
++    }
++}
++```
++
++---
++
++## Usage Pattern for Infinite Canvas
++
++```rust
++impl InfiniteCanvas {
++    fn render_item_to_texture(
++        &mut self,
++        item: &CanvasItem,
++        window: &mut Window,
++        cx: &mut App,
++    ) -> Result<CachedTexture> {
++        // 1. Build the element for this item
++        let element = item.render(cx);
++        
++        // 2. Render to texture through the full pipeline
++        let result = window.render_element_to_texture(
++            element,
++            item.available_space(),
++            cx,
++        )?;
++        
++        Ok(CachedTexture {
++            texture_id: result.texture_id,
++            size: result.size,
++            device_size: result.device_size,
++        })
++    }
++    
++    fn paint_cached_item(
++        &self,
++        cached: &CachedTexture,
++        transform: TransformationMatrix,
++        window: &mut Window,
++    ) -> Result<()> {
++        // Calculate transformed bounds
++        let bounds = transform.apply(Bounds {
++            origin: Point::default(),
++            size: cached.size,
++        });
++        
++        // Paint the cached texture
++        window.paint_rendered_texture(
++            cached.texture_id,
++            bounds,
++            Corners::default(),
++        )
++    }
++}
++```
++
++---
++
++## Challenges and Solutions
++
++### Challenge 1: Accessing the Renderer
++
++The `BladeRenderer` is owned by the platform window implementation (e.g., `WaylandWindowState`), not directly accessible from `Window`.
++
++**Solution:** Add `render_scene_to_texture()` method to `PlatformWindow` trait, delegating to the internal renderer.
++
++### Challenge 2: Building a Scene Without Full Window Context
++
++The `paint_*` methods on `Window` add to `self.next_frame.scene` and use window state.
++
++**Solution:** The `render_element_to_scene()` method temporarily swaps out the scene, allowing isolated rendering while reusing all the Window infrastructure.
++
++### Challenge 3: Text and Images Require Atlas
++
++Glyphs and images are stored in the `BladeAtlas`. The atlas is shared across frames.
++
++**Solution:** Since we're rendering through Window, the atlas is already available. The `render_element_to_scene()` method uses the same atlas as normal rendering.
++
++### Challenge 4: Element State Isolation
++
++Elements may have state (hover, focus, etc.) that depends on the window context.
++
++**Solution:** For render-to-texture, we're rendering a "snapshot" - element state is based on whatever is current when rendering. For canvas items, this is typically the "rest" state.
++
++### Challenge 5: Deferred Draws
++
++Tooltips, menus, etc. use deferred draws that may not make sense for texture rendering.
++
++**Solution:** The `render_element_to_scene()` method doesn't process deferred draws - those are window-level concepts.
++
++### Challenge 6: Content Mask Handling
++
++The content mask determines clipping bounds.
++
++**Solution:** Set up a content mask matching the element's bounds before painting, then restore the original.
++
++---
++
++## Implementation Plan
++
++### Phase 1: Refactor BladeRenderer (Low Risk)
++
++1. Extract `draw_to_target()` as private method
++2. Reimplement `draw()` to call `draw_to_target()`
++3. **Test:** Verify all existing rendering still works
++4. Add `draw_to_texture()` public method
++5. Add `create_render_texture()` helper
++
++### Phase 2: Add Window Scene Building Methods
++
++1. Add `render_element_to_scene()` method
++2. **Test:** Verify elements render correctly to isolated scenes
++3. Test with simple shapes (quads, paths)
++4. Test with text (requires atlas)
++5. Test with images (requires atlas)
++
++### Phase 3: Expose Through PlatformWindow
++
++1. Add `render_scene_to_texture()` to `PlatformWindow` trait
++2. Implement for Wayland
++3. Implement for X11
++4. Add `Window::render_element_to_texture()` high-level API
++5. **Test:** End-to-end texture rendering
++
++### Phase 4: Texture Compositing
++
++1. Choose approach (PolychromeSprite vs TextureQuad)
++2. Implement texture registration in atlas
++3. Add `Window::paint_rendered_texture()` helper
++4. **Test:** Round-trip rendering (element → texture → display)
++
++### Phase 5: Integration
++
++1. Integrate with infinite canvas
++2. Add texture caching/invalidation logic
++3. Performance optimization
++4. **Test:** Canvas with many cached items
++
++---
++
++## File Changes Summary
++
++| File | Changes |
++|------|---------|
++| `platform/blade/blade_renderer.rs` | Add `draw_to_target()`, `draw_to_texture()`, `create_render_texture()`, `gpu()` |
++| `platform.rs` | Add `render_scene_to_texture()` to `PlatformWindow` trait |
++| `platform/linux/wayland/window.rs` | Implement `render_scene_to_texture()` |
++| `platform/linux/x11/window.rs` | Implement `render_scene_to_texture()` |
++| `window.rs` | Add `render_element_to_scene()`, `render_element_to_texture()`, `paint_rendered_texture()` |
++| `scene.rs` | Possibly add `TextureQuad` primitive (Phase 4, Option B) |
++| `platform/blade/blade_atlas.rs` | Add render texture registration (Phase 4) |
++
++---
++
++## Testing Strategy
++
++### Unit Tests
++
++1. **BladeRenderer refactor:** Ensure `draw()` produces identical output after refactor
++2. **Scene building:** Verify `render_element_to_scene()` produces valid scenes
++3. **Texture creation:** Verify textures are created with correct format and size
++
++### Integration Tests
++
++1. **Simple elements:** Render div, text, images to texture
++2. **Complex elements:** Nested layouts, transforms
++3. **Round-trip:** Render to texture, then display texture
++
++### Visual Tests
++
++1. **Comparison:** Rendered texture should match direct rendering
++2. **Scaling:** Test at different scale factors
++3. **Clipping:** Verify content masks work correctly
++
++---
++
++## References
++
++- `gpui/src/platform/blade/blade_renderer.rs` - Main renderer (L644-919)
++- `gpui/src/window.rs` - Window struct (L833-894), draw methods (L2066-2240), paint methods (L2964-3370)
++- `gpui/src/scene.rs` - Scene and primitives (L24-35, L435-449)
++- `gpui/src/element.rs` - Element trait (L51-100), AnyElement (L572-651)
++- `gpui/src/platform.rs` - PlatformWindow trait (L480-590), PlatformAtlas (L832-839)
+\ No newline at end of file
+diff --git a/crates/gpui/research/rtt-option-offscreen-renderer.md b/crates/gpui/research/rtt-option-offscreen-renderer.md
+new file mode 100644
+index 0000000000..af019e0910
+--- /dev/null
++++ b/crates/gpui/research/rtt-option-offscreen-renderer.md
+@@ -0,0 +1,673 @@
++# Render-to-Texture: OffscreenRenderer Approach
++
++## Overview
++
++This document details the approach of creating a separate `BladeOffscreenRenderer` that shares expensive GPU resources with the main `BladeRenderer` while maintaining its own per-instance state for safe concurrent/reentrant rendering.
++
++## Problem: BladeRenderer is Not Reentrant
++
++The current `BladeRenderer` has several stateful components that prevent reentrant calls:
++
++| Component | Issue |
++|-----------|-------|
++| `command_encoder` | Only one recording session at a time |
++| `instance_belt` | Allocation tracking, `flush()` timing sensitive |
++| `path_intermediate_texture` | Shared temp render target for path MSAA |
++| `last_sync_point` | Would be overwritten in nested calls |
++
++If we call `draw_to_texture()` during a `draw()` call (e.g., from a paint callback), the state would be corrupted.
++
++## Solution: Separate OffscreenRenderer
++
++Create a lightweight `BladeOffscreenRenderer` that:
++- **Shares** expensive resources with the main renderer
++- **Has its own** per-instance state for isolation
++- **Reuses** the exact same rendering logic
++
++---
++
++## Resource Analysis
++
++### Shareable Resources (Expensive)
++
++| Resource | Type | Notes |
++|----------|------|-------|
++| `gpu` | `Arc<gpu::Context>` | Already Arc, thread-safe |
++| `pipelines` | `BladePipelines` | Needs to be wrapped in Arc |
++| `atlas` | `Arc<BladeAtlas>` | Already Arc, has internal Mutex |
++| `atlas_sampler` | `gpu::Sampler` | Stateless GPU resource |
++| `rendering_parameters` | `RenderingParameters` | Small, can clone or share |
++
++### Per-Instance Resources (Cheap)
++
++| Resource | Cost | Notes |
++|----------|------|-------|
++| `command_encoder` | Cheap | Just a GPU handle |
++| `instance_belt` | Cheap | Starts empty, grows on demand |
++| `path_intermediate_texture` | Moderate | GPU allocation, sized to target |
++| `path_intermediate_msaa_texture` | Moderate | Optional, for MSAA paths |
++
++### Not Needed for Offscreen
++
++| Resource | Why |
++|----------|-----|
++| `surface` | Only for window presentation |
++| `surface_config` | Only for window |
++| `last_sync_point` | Optional, for sync tracking |
++
++---
++
++## Proposed Structures
++
++### SharedRenderResources
++
++Extract shared resources into a separate struct:
++
++```rust
++/// GPU resources that can be shared between renderers.
++/// These are expensive to create and should be reused.
++pub struct SharedRenderResources {
++    pub gpu: Arc<gpu::Context>,
++    pub pipelines: Arc<BladePipelines>,
++    pub atlas: Arc<BladeAtlas>,
++    pub atlas_sampler: gpu::Sampler,
++    pub rendering_parameters: RenderingParameters,
++}
++
++impl SharedRenderResources {
++    pub fn new(gpu: Arc<gpu::Context>, surface_info: gpu::SurfaceInfo) -> Self {
++        let pipelines = Arc::new(BladePipelines::new(
++            &gpu,
++            surface_info,
++            RenderingParameters::from_env_default().path_sample_count,
++        ));
++        let atlas = Arc::new(BladeAtlas::new(&gpu));
++        let atlas_sampler = gpu.create_sampler(gpu::SamplerDesc {
++            name: "shared sampler",
++            mag_filter: gpu::FilterMode::Linear,
++            min_filter: gpu::FilterMode::Linear,
++            ..Default::default()
++        });
++        
++        Self {
++            gpu,
++            pipelines,
++            atlas,
++            atlas_sampler,
++            rendering_parameters: RenderingParameters::from_env_default(),
++        }
++    }
++}
++```
++
++### Modified BladeRenderer
++
++```rust
++pub struct BladeRenderer {
++    // Shared resources
++    shared: Arc<SharedRenderResources>,
++    
++    // Window-specific
++    surface: gpu::Surface,
++    surface_config: gpu::SurfaceConfig,
++    
++    // Per-instance state
++    command_encoder: gpu::CommandEncoder,
++    instance_belt: BufferBelt,
++    path_intermediate_texture: gpu::Texture,
++    path_intermediate_texture_view: gpu::TextureView,
++    path_intermediate_msaa_texture: Option<gpu::Texture>,
++    path_intermediate_msaa_texture_view: Option<gpu::TextureView>,
++    last_sync_point: Option<gpu::SyncPoint>,
++    
++    #[cfg(target_os = "macos")]
++    core_video_texture_cache: CVMetalTextureCache,
++}
++
++impl BladeRenderer {
++    /// Get shared resources for creating offscreen renderers
++    pub fn shared_resources(&self) -> Arc<SharedRenderResources> {
++        Arc::clone(&self.shared)
++    }
++    
++    /// Create an offscreen renderer that shares resources with this renderer
++    pub fn create_offscreen_renderer(
++        &self,
++        max_texture_size: Size<DevicePixels>,
++    ) -> BladeOffscreenRenderer {
++        BladeOffscreenRenderer::new(
++            Arc::clone(&self.shared),
++            max_texture_size,
++        )
++    }
++}
++```
++
++### BladeOffscreenRenderer
++
++```rust
++/// Lightweight renderer for offscreen texture rendering.
++/// Shares expensive resources with the main BladeRenderer.
++pub struct BladeOffscreenRenderer {
++    // Shared with main renderer
++    shared: Arc<SharedRenderResources>,
++    
++    // Per-instance state (isolated from main renderer)
++    command_encoder: gpu::CommandEncoder,
++    instance_belt: BufferBelt,
++    path_intermediate_texture: gpu::Texture,
++    path_intermediate_texture_view: gpu::TextureView,
++    path_intermediate_msaa_texture: Option<gpu::Texture>,
++    path_intermediate_msaa_texture_view: Option<gpu::TextureView>,
++    
++    // Offscreen-specific
++    max_texture_size: Size<DevicePixels>,
++}
++
++impl BladeOffscreenRenderer {
++    pub fn new(
++        shared: Arc<SharedRenderResources>,
++        max_texture_size: Size<DevicePixels>,
++    ) -> Self {
++        let command_encoder = shared.gpu.create_command_encoder(gpu::CommandEncoderDesc {
++            name: "offscreen",
++            buffer_count: 2,
++        });
++        
++        let instance_belt = BufferBelt::new(BufferBeltDescriptor {
++            memory: gpu::Memory::Shared,
++            min_chunk_size: 0x1000,
++            alignment: 0x40,
++        });
++        
++        // Create path intermediate textures sized for max texture
++        let (path_intermediate_texture, path_intermediate_texture_view) =
++            create_path_intermediate_texture(
++                &shared.gpu,
++                gpu::TextureFormat::Bgra8UnormSrgb,
++                max_texture_size.width.0 as u32,
++                max_texture_size.height.0 as u32,
++            );
++        
++        let (path_intermediate_msaa_texture, path_intermediate_msaa_texture_view) =
++            create_msaa_texture_if_needed(
++                &shared.gpu,
++                gpu::TextureFormat::Bgra8UnormSrgb,
++                max_texture_size.width.0 as u32,
++                max_texture_size.height.0 as u32,
++                shared.rendering_parameters.path_sample_count,
++            )
++            .unzip();
++        
++        Self {
++            shared,
++            command_encoder,
++            instance_belt,
++            path_intermediate_texture,
++            path_intermediate_texture_view,
++            path_intermediate_msaa_texture,
++            path_intermediate_msaa_texture_view,
++            max_texture_size,
++        }
++    }
++    
++    /// Create a render target texture
++    pub fn create_texture(&self, size: Size<DevicePixels>) -> (gpu::Texture, gpu::TextureView) {
++        let texture = self.shared.gpu.create_texture(gpu::TextureDesc {
++            name: "offscreen_render_target",
++            format: gpu::TextureFormat::Bgra8UnormSrgb,
++            size: gpu::Extent {
++                width: size.width.0 as u32,
++                height: size.height.0 as u32,
++                depth: 1,
++            },
++            array_layer_count: 1,
++            mip_level_count: 1,
++            sample_count: 1,
++            dimension: gpu::TextureDimension::D2,
++            usage: gpu::TextureUsage::TARGET | gpu::TextureUsage::COPY,
++            external: None,
++        });
++        
++        let view = self.shared.gpu.create_texture_view(
++            texture,
++            gpu::TextureViewDesc {
++                name: "offscreen_render_target_view",
++                format: gpu::TextureFormat::Bgra8UnormSrgb,
++                dimension: gpu::ViewDimension::D2,
++                subresources: &Default::default(),
++            },
++        );
++        
++        (texture, view)
++    }
++    
++    /// Render a scene to a texture
++    pub fn draw_to_texture(
++        &mut self,
++        scene: &Scene,
++        texture_view: gpu::TextureView,
++        size: Size<DevicePixels>,
++    ) -> gpu::SyncPoint {
++        let viewport_size = [size.width.0 as f32, size.height.0 as f32];
++        
++        render_batches(
++            scene,
++            texture_view,
++            viewport_size,
++            true, // premultiplied_alpha for offscreen
++            &mut self.command_encoder,
++            &mut self.instance_belt,
++            self.path_intermediate_texture_view,
++            &self.shared.gpu,
++            &self.shared.pipelines,
++            &self.shared.atlas,
++            self.shared.atlas_sampler,
++            &self.shared.rendering_parameters,
++        )
++    }
++    
++    pub fn destroy(&mut self) {
++        self.shared.gpu.destroy_command_encoder(&mut self.command_encoder);
++        self.instance_belt.destroy(&self.shared.gpu);
++        self.shared.gpu.destroy_texture(self.path_intermediate_texture);
++        self.shared.gpu.destroy_texture_view(self.path_intermediate_texture_view);
++        if let Some(tex) = self.path_intermediate_msaa_texture {
++            self.shared.gpu.destroy_texture(tex);
++        }
++        if let Some(view) = self.path_intermediate_msaa_texture_view {
++            self.shared.gpu.destroy_texture_view(view);
++        }
++    }
++}
++```
++
++---
++
++## Shared Rendering Logic
++
++Extract the batch processing loop into a shared function:
++
++```rust
++/// Core rendering logic shared between BladeRenderer and BladeOffscreenRenderer.
++/// 
++/// This function renders all batches in a scene to the specified target.
++fn render_batches(
++    scene: &Scene,
++    target_view: gpu::TextureView,
++    viewport_size: [f32; 2],
++    premultiplied_alpha: bool,
++    // Per-instance resources (mutable)
++    command_encoder: &mut gpu::CommandEncoder,
++    instance_belt: &mut BufferBelt,
++    path_intermediate_texture_view: gpu::TextureView,
++    // Shared resources (immutable)
++    gpu: &gpu::Context,
++    pipelines: &BladePipelines,
++    atlas: &BladeAtlas,
++    atlas_sampler: gpu::Sampler,
++    rendering_parameters: &RenderingParameters,
++) -> gpu::SyncPoint {
++    command_encoder.start();
++    atlas.before_frame(command_encoder);
++
++    let globals = GlobalParams {
++        viewport_size,
++        premultiplied_alpha: if premultiplied_alpha { 1 } else { 0 },
++        pad: 0,
++    };
++
++    let mut pass = command_encoder.render(
++        "main",
++        gpu::RenderTargetSet {
++            colors: &[gpu::RenderTarget {
++                view: target_view,
++                init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
++                finish_op: gpu::FinishOp::Store,
++            }],
++            depth_stencil: None,
++        },
++    );
++
++    for batch in scene.batches() {
++        match batch {
++            PrimitiveBatch::Quads(quads) => {
++                let instance_buf = unsafe { instance_belt.alloc_typed(quads, gpu) };
++                let mut encoder = pass.with(&pipelines.quads);
++                encoder.bind(0, &ShaderQuadsData { globals, b_quads: instance_buf });
++                encoder.draw(0, 4, 0, quads.len() as u32);
++            }
++            PrimitiveBatch::Shadows(shadows) => {
++                let instance_buf = unsafe { instance_belt.alloc_typed(shadows, gpu) };
++                let mut encoder = pass.with(&pipelines.shadows);
++                encoder.bind(0, &ShaderShadowsData { globals, b_shadows: instance_buf });
++                encoder.draw(0, 4, 0, shadows.len() as u32);
++            }
++            PrimitiveBatch::Paths(paths) => {
++                // ... path rendering with path_intermediate_texture_view
++                // (same logic as current draw(), but using passed-in resources)
++            }
++            PrimitiveBatch::Underlines(underlines) => {
++                // ... same pattern
++            }
++            PrimitiveBatch::MonochromeSprites { texture_id, sprites } => {
++                let tex_info = atlas.get_texture_info(texture_id);
++                let instance_buf = unsafe { instance_belt.alloc_typed(sprites, gpu) };
++                let mut encoder = pass.with(&pipelines.mono_sprites);
++                encoder.bind(0, &ShaderMonoSpritesData {
++                    globals,
++                    gamma_ratios: rendering_parameters.gamma_ratios,
++                    grayscale_enhanced_contrast: rendering_parameters.grayscale_enhanced_contrast,
++                    t_sprite: tex_info.raw_view,
++                    s_sprite: atlas_sampler,
++                    b_mono_sprites: instance_buf,
++                });
++                encoder.draw(0, 4, 0, sprites.len() as u32);
++            }
++            PrimitiveBatch::PolychromeSprites { texture_id, sprites } => {
++                // ... same pattern
++            }
++            PrimitiveBatch::Surfaces(surfaces) => {
++                // ... macOS video surfaces (skip for offscreen)
++            }
++        }
++    }
++    
++    drop(pass);
++
++    let sync_point = gpu.submit(command_encoder);
++    instance_belt.flush(&sync_point);
++    atlas.after_frame(&sync_point);
++
++    sync_point
++}
++```
++
++---
++
++## Refactored BladeRenderer::draw()
++
++```rust
++impl BladeRenderer {
++    pub fn draw(&mut self, scene: &Scene) {
++        let frame = {
++            profiling::scope!("acquire frame");
++            self.surface.acquire_frame()
++        };
++        self.command_encoder.init_texture(frame.texture());
++
++        let viewport_size = [
++            self.surface_config.size.width as f32,
++            self.surface_config.size.height as f32,
++        ];
++        let premultiplied_alpha = matches!(
++            self.surface.info().alpha,
++            gpu::AlphaMode::PreMultiplied
++        );
++
++        let sync_point = render_batches(
++            scene,
++            frame.texture_view(),
++            viewport_size,
++            premultiplied_alpha,
++            &mut self.command_encoder,
++            &mut self.instance_belt,
++            self.path_intermediate_texture_view,
++            &self.shared.gpu,
++            &self.shared.pipelines,
++            &self.shared.atlas,
++            self.shared.atlas_sampler,
++            &self.shared.rendering_parameters,
++        );
++
++        // Present to window (not done in render_batches)
++        self.command_encoder.start();
++        self.command_encoder.present(frame);
++        self.shared.gpu.submit(&mut self.command_encoder);
++
++        self.wait_for_gpu();
++        self.last_sync_point = Some(sync_point);
++    }
++}
++```
++
++---
++
++## Pipeline Compatibility
++
++Pipelines are compiled for a specific texture format. For sharing to work:
++
++1. **Window surface format**: Typically `Bgra8UnormSrgb`
++2. **Offscreen texture format**: Must match → `Bgra8UnormSrgb`
++
++This is handled by `create_texture()` using the same format.
++
++If different formats are needed in the future, we'd need separate pipeline sets.
++
++---
++
++## Usage Patterns
++
++### Creating an Offscreen Renderer
++
++```rust
++// From PlatformWindow implementation
++impl WaylandWindow {
++    fn create_offscreen_renderer(&self) -> BladeOffscreenRenderer {
++        let state = self.0.borrow();
++        state.renderer.create_offscreen_renderer(
++            Size {
++                width: DevicePixels(4096),  // Max texture size
++                height: DevicePixels(4096),
++            }
++        )
++    }
++}
++```
++
++### Rendering to Texture
++
++```rust
++fn render_element_to_texture(
++    &mut self,
++    element: impl IntoElement,
++    available_space: Size<AvailableSpace>,
++    window: &mut Window,
++    cx: &mut App,
++) -> Result<CachedTexture> {
++    // 1. Build scene (safe to do anytime)
++    let (scene, size) = window.render_element_to_scene(element, available_space, cx);
++    
++    // 2. Get or create offscreen renderer
++    let offscreen = self.get_offscreen_renderer(window);
++    
++    // 3. Create texture
++    let device_size = size.scale(window.scale_factor());
++    let (texture, view) = offscreen.create_texture(device_size);
++    
++    // 4. Render scene to texture
++    let sync_point = offscreen.draw_to_texture(&scene, view, device_size);
++    
++    Ok(CachedTexture {
++        texture,
++        view,
++        size,
++        sync_point,
++    })
++}
++```
++
++### Pooling Offscreen Renderers
++
++For efficiency, maintain a pool:
++
++```rust
++pub struct OffscreenRendererPool {
++    shared: Arc<SharedRenderResources>,
++    available: Vec<BladeOffscreenRenderer>,
++    max_texture_size: Size<DevicePixels>,
++}
++
++impl OffscreenRendererPool {
++    pub fn acquire(&mut self) -> BladeOffscreenRenderer {
++        self.available.pop().unwrap_or_else(|| {
++            BladeOffscreenRenderer::new(
++                Arc::clone(&self.shared),
++                self.max_texture_size,
++            )
++        })
++    }
++    
++    pub fn release(&mut self, renderer: BladeOffscreenRenderer) {
++        self.available.push(renderer);
++    }
++}
++```
++
++---
++
++## Timing Considerations
++
++Even with separate renderers, there are timing considerations:
++
++### Atlas Synchronization
++
++The `atlas.before_frame()` and `atlas.after_frame()` calls manage pending uploads:
++
++```rust
++// In BladeAtlas
++pub fn before_frame(&self, gpu_encoder: &mut gpu::CommandEncoder) {
++    let mut lock = self.0.lock();
++    lock.flush(gpu_encoder);  // Flush pending uploads
++}
++
++pub fn after_frame(&self, sync_point: &gpu::SyncPoint) {
++    let mut lock = self.0.lock();
++    lock.upload_belt.flush(sync_point);  // Mark uploads complete
++}
++```
++
++Since the atlas is shared, these calls happen for both renderers. This should be safe because:
++- The Mutex ensures serialized access
++- Each `before_frame` flushes pending uploads to that encoder
++- Each `after_frame` marks that sync point's uploads complete
++
++However, for safety, texture rendering should ideally happen:
++- After window `draw()` completes, OR
++- Before window `draw()` starts
++
++### Recommended Flow
++
++```
++1. Window paint phase builds scenes
++   - Main window scene → window.next_frame.scene
++   - Texture scenes → collected separately
++
++2. Window present
++   - renderer.draw(window_scene)
++   - GPU processes window frame
++
++3. Texture rendering (after window frame)
++   - For each texture scene:
++     - offscreen.draw_to_texture(scene, texture)
++   - GPU processes texture renders
++
++4. Next frame
++   - Use cached textures as sprites
++```
++
++---
++
++## Implementation Plan
++
++### Step 1: Extract SharedRenderResources ✅
++
++- [x] Create `SharedRenderResources` struct
++- [x] Modify `BladeRenderer` to use `shared: SharedRenderResources`
++- [x] Update all methods to access via `self.shared.*`
++- [x] **Test:** Verify window rendering unchanged (`cargo test -p gpui` passes)
++
++### Step 2: Extract render_batches() ✅
++
++- [x] Create `RenderContext` struct for per-instance mutable state
++- [x] Extract `draw_paths_to_intermediate()` as standalone function
++- [x] Create standalone `render_batches()` function
++- [x] Refactor `BladeRenderer::draw()` to use it
++- [x] Handle macOS Surfaces separately via `draw_surfaces()`
++- [x] **Test:** Verify window rendering unchanged (`cargo test -p gpui` passes)
++
++### Step 3: Create BladeOffscreenRenderer ✅
++
++- [x] Implement `BladeOffscreenRenderer` struct
++- [x] Add `new()` constructor that takes shared resources
++- [x] Add `create_texture()` method
++- [x] Add `draw_to_texture()` method using `render_batches()`
++- [x] Add `destroy()` method
++- [x] Add `BladeRenderer::create_offscreen_renderer()` factory method
++- [x] Add `render-to-texture` feature flag to Cargo.toml
++- [x] Feature-gate offscreen renderer module and methods
++- [ ] **Test:** Render simple scenes to texture (deferred to Step 4 integration)
++
++### Step 4: Expose Through Platform ✅
++
++- [x] Add `PlatformOffscreenRenderer` trait to `platform.rs`
++- [x] Add `OffscreenTextureId` and `OffscreenTextureInfo` types
++- [x] Add `create_offscreen_renderer()` method to `PlatformWindow` trait
++- [x] Implement `PlatformOffscreenRenderer` for `BladeOffscreenRenderer`
++- [x] Implement `create_offscreen_renderer()` for Wayland
++- [x] Implement `create_offscreen_renderer()` for X11
++- [x] Add `OffscreenRenderer` wrapper type in `window.rs`
++- [x] Add `Window::create_offscreen_renderer()` method
++- [ ] Add `Window::render_element_to_texture()` helper (optional, for convenience)
++- [ ] **Test:** End-to-end texture rendering
++
++### Step 5: Add Pooling (Optional)
++
++- [ ] Create `OffscreenRendererPool`
++- [ ] Integrate with platform window
++- [ ] **Test:** Multiple texture renders
++
++---
++
++## File Changes
++
++| File | Changes |
++|------|---------|
++| `platform/blade/blade_renderer.rs` | Add `SharedRenderResources`, extract `render_batches()`, add `create_offscreen_renderer()`, wrap `BladePipelines` in `Arc` |
++| `platform/blade/blade_offscreen_renderer.rs` | New file: `BladeOffscreenRenderer`, `OffscreenTexture`, impl `PlatformOffscreenRenderer` (feature-gated) |
++| `platform/blade.rs` | Export `blade_offscreen_renderer` module (feature-gated) |
++| `Cargo.toml` | Add `render-to-texture` feature flag |
++| `platform.rs` | Add `PlatformOffscreenRenderer` trait, `OffscreenTextureId`, `OffscreenTextureInfo`, add `create_offscreen_renderer()` to `PlatformWindow` |
++| `platform/linux/wayland/window.rs` | Implement `create_offscreen_renderer()` for `WaylandWindow` |
++| `platform/linux/x11/window.rs` | Implement `create_offscreen_renderer()` for `X11Window` |
++| `window.rs` | Add `OffscreenRenderer` wrapper, add `Window::create_offscreen_renderer()` |
++
++---
++
++## Advantages of This Approach
++
++1. **Safe reentrancy** - Each renderer has isolated state
++2. **Resource efficient** - Expensive resources shared
++3. **Code reuse** - Same rendering logic via `render_batches()`
++4. **Flexible timing** - Can render textures at any point
++5. **Scalable** - Can create multiple offscreen renderers if needed
++6. **Feature-gated** - Opt-in via `render-to-texture` feature flag
++7. **Platform-agnostic API** - `PlatformOffscreenRenderer` trait enables cross-platform support
++8. **Clean public API** - `OffscreenRenderer` wrapper hides internal `Scene` type
++
++## Potential Issues
++
++1. **Atlas contention** - Multiple renderers accessing atlas simultaneously
++   - Mitigated by Mutex in BladeAtlas
++2. **GPU memory** - Each offscreen renderer has path intermediate textures
++   - Mitigated by pooling and reasonable max sizes
++3. **Pipeline format lock-in** - All renderers must use same texture format
++   - Acceptable for our use case
++
++---
++
++## References
++
++- `gpui/src/platform/blade/blade_renderer.rs` - Current renderer implementation
++- `gpui/src/platform/blade/blade_atlas.rs` - Atlas with Mutex for thread safety
++- `gpui/research/render-to-texture-methodology.md` - Overall RTT design
+\ No newline at end of file
+diff --git a/crates/gpui/src/gpui.rs b/crates/gpui/src/gpui.rs
+index 76a61e286d..a51251fa5b 100644
+--- a/crates/gpui/src/gpui.rs
++++ b/crates/gpui/src/gpui.rs
+@@ -27,6 +27,8 @@ mod inspector;
+ mod interactive;
+ mod key_dispatch;
+ mod keymap;
++#[cfg(feature = "render-to-texture")]
++mod offscreen_render_context;
+ mod path_builder;
+ mod platform;
+ pub mod prelude;
+@@ -88,6 +90,8 @@ pub use inspector::*;
+ pub use interactive::*;
+ use key_dispatch::*;
+ pub use keymap::*;
++#[cfg(feature = "render-to-texture")]
++pub use offscreen_render_context::OffscreenRenderContext;
+ pub use path_builder::*;
+ pub use platform::*;
+ pub use profiler::*;
+diff --git a/crates/gpui/src/offscreen_render_context.rs b/crates/gpui/src/offscreen_render_context.rs
+new file mode 100644
+index 0000000000..c74717787b
+--- /dev/null
++++ b/crates/gpui/src/offscreen_render_context.rs
+@@ -0,0 +1,338 @@
++//! Offscreen rendering context for building scenes without a Window.
++//!
++//! This module provides `OffscreenRenderContext`, a minimal rendering context
++//! that can build GPUI scenes for render-to-texture operations without requiring
++//! the full `Window` infrastructure.
++//!
++//! # Feature Flag
++//!
++//! This module is only available when the `render-to-texture` feature is enabled.
++//!
++//! # Usage
++//!
++//! ```ignore
++//! // Create render context with shared resources from window
++//! let mut ctx = OffscreenRenderContext::new(
++//!     size(px(256.0), px(256.0)),
++//!     window.scale_factor(),
++//!     window.text_system().clone(),
++//!     window.sprite_atlas().clone(),
++//! );
++//!
++//! // Paint primitives
++//! ctx.paint_quad(PaintQuad {
++//!     bounds: Bounds::new(point(px(10.0), px(10.0)), size(px(100.0), px(50.0))),
++//!     background: blue().into(),
++//!     ..Default::default()
++//! });
++//!
++//! // Get scene and render to texture
++//! let scene = ctx.take_scene();
++//! offscreen_renderer.draw_scene_to_texture(&scene, texture_id);
++//! ```
++
++use std::borrow::Cow;
++use std::sync::Arc;
++
++use crate::geometry::IsZero;
++use crate::scene::Scene;
++use crate::{
++    Background, Bounds, ContentMask, FontId, GlyphId, Hsla,
++    MonochromeSprite, PaintQuad, Path, Pixels, PlatformAtlas, Point, Quad, RenderGlyphParams,
++    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, Size, TransformationMatrix, Underline,
++    UnderlineStyle, WindowTextSystem, px,
++};
++
++/// A minimal rendering context for offscreen element rendering.
++///
++/// This provides the essential infrastructure to render GPUI primitives
++/// to a Scene without the full Window overhead. Useful for:
++/// - Rendering thumbnails
++/// - Caching UI to textures
++/// - Infinite canvas tile rendering
++///
++/// Unlike `Window`, this context does NOT support:
++/// - Focus management
++/// - Hit testing
++/// - Input handlers
++/// - Persistent element state
++/// - Deferred draws (tooltips, popovers)
++pub struct OffscreenRenderContext {
++    // Rendering parameters
++    scale_factor: f32,
++    viewport_size: Size<Pixels>,
++
++    // Content mask stack (for clipping)
++    content_mask_stack: Vec<ContentMask<Pixels>>,
++
++    // Opacity stack
++    opacity_stack: Vec<f32>,
++
++    // The scene being built
++    scene: Scene,
++
++    // Text system (shared)
++    text_system: Arc<WindowTextSystem>,
++
++    // Sprite atlas for glyph caching (shared)
++    sprite_atlas: Arc<dyn PlatformAtlas>,
++}
++
++impl OffscreenRenderContext {
++    /// Create a new offscreen render context.
++    ///
++    /// # Arguments
++    ///
++    /// * `viewport_size` - Size of the rendering viewport in logical pixels
++    /// * `scale_factor` - Display scale factor (e.g., 2.0 for retina)
++    /// * `text_system` - Shared text system for shaping and rasterizing text
++    /// * `sprite_atlas` - Shared sprite atlas for caching glyphs
++    pub fn new(
++        viewport_size: Size<Pixels>,
++        scale_factor: f32,
++        text_system: Arc<WindowTextSystem>,
++        sprite_atlas: Arc<dyn PlatformAtlas>,
++    ) -> Self {
++        let content_mask = ContentMask {
++            bounds: Bounds {
++                origin: Point::new(px(0.0), px(0.0)),
++                size: viewport_size,
++            },
++        };
++
++        Self {
++            scale_factor,
++            viewport_size,
++            content_mask_stack: vec![content_mask],
++            opacity_stack: vec![1.0],
++            scene: Scene::default(),
++            text_system,
++            sprite_atlas,
++        }
++    }
++
++    /// Returns the scale factor for this context.
++    pub fn scale_factor(&self) -> f32 {
++        self.scale_factor
++    }
++
++    /// Returns the viewport size in logical pixels.
++    pub fn viewport_size(&self) -> Size<Pixels> {
++        self.viewport_size
++    }
++
++    /// Returns the current content mask (for clipping).
++    pub fn content_mask(&self) -> ContentMask<Pixels> {
++        self.content_mask_stack
++            .last()
++            .cloned()
++            .unwrap_or_else(|| ContentMask {
++                bounds: Bounds {
++                    origin: Point::new(px(0.0), px(0.0)),
++                    size: self.viewport_size,
++                },
++            })
++    }
++
++    /// Returns the current cumulative opacity.
++    pub fn element_opacity(&self) -> f32 {
++        self.opacity_stack.iter().product()
++    }
++
++    /// Access the text system for text shaping.
++    pub fn text_system(&self) -> &Arc<WindowTextSystem> {
++        &self.text_system
++    }
++
++    /// Access the sprite atlas.
++    pub fn sprite_atlas(&self) -> &Arc<dyn PlatformAtlas> {
++        &self.sprite_atlas
++    }
++
++    /// Push a content mask onto the stack (for clipping).
++    pub fn push_content_mask(&mut self, mask: ContentMask<Pixels>) {
++        self.content_mask_stack.push(mask);
++    }
++
++    /// Pop a content mask from the stack.
++    pub fn pop_content_mask(&mut self) {
++        self.content_mask_stack.pop();
++    }
++
++    /// Push an opacity value onto the stack.
++    pub fn push_opacity(&mut self, opacity: f32) {
++        self.opacity_stack.push(opacity);
++    }
++
++    /// Pop an opacity value from the stack.
++    pub fn pop_opacity(&mut self) {
++        self.opacity_stack.pop();
++    }
++
++    /// Push a layer for z-ordering.
++    pub fn push_layer(&mut self, bounds: Bounds<Pixels>) {
++        self.scene.push_layer(bounds.scale(self.scale_factor));
++    }
++
++    /// Pop a layer.
++    pub fn pop_layer(&mut self) {
++        self.scene.pop_layer();
++    }
++
++    /// Paint a quad (rectangle with background, border, etc.)
++    pub fn paint_quad(&mut self, quad: PaintQuad) {
++        let scale_factor = self.scale_factor();
++        let content_mask = self.content_mask();
++        let opacity = self.element_opacity();
++
++        self.scene.insert_primitive(Quad {
++            order: 0,
++            bounds: quad.bounds.scale(scale_factor),
++            content_mask: content_mask.scale(scale_factor),
++            background: quad.background.opacity(opacity),
++            border_color: quad.border_color.opacity(opacity),
++            corner_radii: quad.corner_radii.scale(scale_factor),
++            border_widths: quad.border_widths.scale(scale_factor),
++            border_style: quad.border_style,
++        });
++    }
++
++    /// Paint a path (vector shape).
++    pub fn paint_path(&mut self, mut path: Path<Pixels>, color: impl Into<Background>) {
++        let scale_factor = self.scale_factor();
++        let content_mask = self.content_mask();
++        let opacity = self.element_opacity();
++
++        path.content_mask = content_mask;
++        let color: Background = color.into();
++        path.color = color.opacity(opacity);
++
++        self.scene.insert_primitive(path.scale(scale_factor));
++    }
++
++    /// Paint an underline.
++    pub fn paint_underline(
++        &mut self,
++        origin: Point<Pixels>,
++        width: Pixels,
++        style: &UnderlineStyle,
++    ) {
++        let scale_factor = self.scale_factor();
++        let content_mask = self.content_mask();
++        let opacity = self.element_opacity();
++
++        let height = if style.wavy {
++            style.thickness * 3.0
++        } else {
++            style.thickness
++        };
++        let bounds = Bounds {
++            origin,
++            size: Size { width, height },
++        };
++
++        self.scene.insert_primitive(Underline {
++            order: 0,
++            pad: 0,
++            bounds: bounds.scale(scale_factor),
++            content_mask: content_mask.scale(scale_factor),
++            color: style.color.unwrap_or_default().opacity(opacity),
++            thickness: style.thickness.scale(scale_factor),
++            wavy: style.wavy as u32,
++        });
++    }
++
++    /// Paint a text glyph.
++    ///
++    /// The y component of the origin is the baseline of the glyph.
++    pub fn paint_glyph(
++        &mut self,
++        origin: Point<Pixels>,
++        font_id: FontId,
++        glyph_id: GlyphId,
++        font_size: Pixels,
++        color: Hsla,
++    ) -> anyhow::Result<()> {
++        let scale_factor = self.scale_factor();
++        let glyph_origin = origin.scale(scale_factor);
++
++        let subpixel_variant = Point {
++            x: (glyph_origin.x.0.fract() * SUBPIXEL_VARIANTS_X as f32).floor() as u8,
++            y: (glyph_origin.y.0.fract() * SUBPIXEL_VARIANTS_Y as f32).floor() as u8,
++        };
++
++        let params = RenderGlyphParams {
++            font_id,
++            glyph_id,
++            font_size,
++            subpixel_variant,
++            scale_factor,
++            is_emoji: false,
++        };
++
++        let raster_bounds = self.text_system.raster_bounds(&params)?;
++        if !raster_bounds.is_zero() {
++            let tile = self
++                .sprite_atlas
++                .get_or_insert_with(&params.clone().into(), &mut || {
++                    let (size, bytes) = self.text_system.rasterize_glyph(&params)?;
++                    Ok(Some((size, Cow::Owned(bytes))))
++                })?
++                .expect("Callback above only errors or returns Some");
++
++            let bounds = Bounds {
++                origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),
++                size: tile.bounds.size.map(Into::into),
++            };
++            let content_mask = self.content_mask().scale(scale_factor);
++            let opacity = self.element_opacity();
++
++            self.scene.insert_primitive(MonochromeSprite {
++                order: 0,
++                pad: 0,
++                bounds,
++                content_mask,
++                color: color.opacity(opacity),
++                tile,
++                transformation: TransformationMatrix::unit(),
++            });
++        }
++        Ok(())
++    }
++
++    /// Take the built scene, replacing it with an empty scene.
++    ///
++    /// Use this to get the scene for rendering to a texture.
++    pub fn take_scene(&mut self) -> Scene {
++        let mut scene = Scene::default();
++        std::mem::swap(&mut self.scene, &mut scene);
++        scene.finish();
++        scene
++    }
++
++    /// Get a reference to the current scene.
++    pub(crate) fn scene(&self) -> &Scene {
++        &self.scene
++    }
++
++    /// Get a mutable reference to the current scene.
++    pub(crate) fn scene_mut(&mut self) -> &mut Scene {
++        &mut self.scene
++    }
++
++    /// Clear the scene for reuse.
++    pub fn clear(&mut self) {
++        self.scene.clear();
++        self.content_mask_stack.clear();
++        self.opacity_stack.clear();
++
++        // Reset to defaults
++        self.content_mask_stack.push(ContentMask {
++            bounds: Bounds {
++                origin: Point::new(px(0.0), px(0.0)),
++                size: self.viewport_size,
++            },
++        });
++        self.opacity_stack.push(1.0);
++    }
++}
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 112775890e..abd5880aef 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -2,6 +2,9 @@ mod app_menu;
+ mod keyboard;
+ mod keystroke;
+ 
++#[cfg(feature = "render-to-texture")]
++mod offscreen_rendering;
++
+ #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+ mod linux;
+ 
+@@ -35,6 +38,11 @@ mod windows;
+ ))]
+ pub(crate) mod scap_screen_capture;
+ 
++#[cfg(feature = "render-to-texture")]
++pub(crate) use offscreen_rendering::PlatformOffscreenRenderer;
++#[cfg(feature = "render-to-texture")]
++pub use offscreen_rendering::{OffscreenTextureId, OffscreenTextureInfo, TextureData};
++
+ use crate::{
+     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
+     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
+@@ -564,6 +572,27 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+     fn set_client_inset(&self, _inset: Pixels) {}
+     fn gpu_specs(&self) -> Option<GpuSpecs>;
+ 
++    /// Creates an offscreen renderer for render-to-texture operations.
++    ///
++    /// The offscreen renderer shares GPU resources with the main window renderer
++    /// but maintains its own command buffers for isolated rendering.
++    ///
++    /// # Arguments
++    ///
++    /// * `max_texture_size` - Maximum size of textures the renderer will create
++    ///
++    /// # Returns
++    ///
++    /// An offscreen renderer, or `None` if the platform doesn't support it.
++    #[cfg(feature = "render-to-texture")]
++    fn create_offscreen_renderer(
++        &self,
++        max_texture_size: Size<DevicePixels>,
++    ) -> Option<Box<dyn PlatformOffscreenRenderer>> {
++        let _ = max_texture_size;
++        None
++    }
++
+     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
+ 
+     #[cfg(any(test, feature = "test-support"))]
+diff --git a/crates/gpui/src/platform/blade.rs b/crates/gpui/src/platform/blade.rs
+index 9d966d8a4e..5b0caa272d 100644
+--- a/crates/gpui/src/platform/blade.rs
++++ b/crates/gpui/src/platform/blade.rs
+@@ -2,10 +2,14 @@
+ mod apple_compat;
+ mod blade_atlas;
+ mod blade_context;
++#[cfg(feature = "render-to-texture")]
++mod blade_offscreen_renderer;
+ mod blade_renderer;
+ 
+ #[cfg(target_os = "macos")]
+ pub(crate) use apple_compat::*;
+ pub(crate) use blade_atlas::*;
+ pub(crate) use blade_context::*;
++#[cfg(feature = "render-to-texture")]
++pub(crate) use blade_offscreen_renderer::*;
+ pub(crate) use blade_renderer::*;
+diff --git a/crates/gpui/src/platform/blade/blade_offscreen_renderer.rs b/crates/gpui/src/platform/blade/blade_offscreen_renderer.rs
+new file mode 100644
+index 0000000000..2914201f4d
+--- /dev/null
++++ b/crates/gpui/src/platform/blade/blade_offscreen_renderer.rs
+@@ -0,0 +1,536 @@
++//! Offscreen renderer for render-to-texture support.
++//!
++//! This module provides `BladeOffscreenRenderer`, a lightweight renderer that shares
++//! expensive GPU resources with the main `BladeRenderer` while maintaining its own
++//! per-instance state for safe concurrent/reentrant rendering.
++
++use super::BladeAtlas;
++use super::blade_renderer::{
++    RenderContext, SharedRenderResources, create_msaa_texture_if_needed,
++    create_path_intermediate_texture, render_batches,
++};
++use blade_graphics as gpu;
++use blade_util::{BufferBelt, BufferBeltDescriptor};
++use std::collections::HashMap;
++use std::sync::Arc;
++
++use crate::platform::{
++    OffscreenTextureId, OffscreenTextureInfo, PlatformOffscreenRenderer, TextureData,
++};
++use crate::{DevicePixels, Scene, Size};
++
++/// A lightweight offscreen renderer that can render scenes to textures.
++///
++/// This renderer shares expensive GPU resources (pipelines, atlas, etc.) with the main
++/// `BladeRenderer` while maintaining its own command encoder and instance buffers for
++/// isolation. This allows render-to-texture operations without interfering with the
++/// main rendering pipeline.
++///
++/// # Usage
++///
++/// ```ignore
++/// // Create an offscreen renderer from the main renderer
++/// let offscreen = blade_renderer.create_offscreen_renderer(max_size)?;
++///
++/// // Create a texture to render to
++/// let texture = offscreen.create_texture(width, height);
++///
++/// // Render a scene to the texture
++/// offscreen.draw_to_texture(&scene, &texture);
++///
++/// // Clean up when done
++/// offscreen.destroy();
++/// ```
++pub struct BladeOffscreenRenderer {
++    // Shared resources (from main renderer)
++    gpu: Arc<gpu::Context>,
++    pipelines: Arc<BladePipelines>,
++    atlas: Arc<BladeAtlas>,
++    atlas_sampler: gpu::Sampler,
++    rendering_parameters: RenderingParameters,
++
++    // Per-instance state
++    command_encoder: gpu::CommandEncoder,
++    instance_belt: BufferBelt,
++    path_intermediate_texture: gpu::Texture,
++    path_intermediate_texture_view: gpu::TextureView,
++    path_intermediate_msaa_texture: Option<gpu::Texture>,
++    path_intermediate_msaa_texture_view: Option<gpu::TextureView>,
++
++    // Texture management
++    textures: HashMap<u64, OffscreenTexture>,
++    next_texture_id: u64,
++
++    // Configuration
++    max_texture_size: gpu::Extent,
++    surface_format: gpu::TextureFormat,
++}
++
++// Re-import types from blade_renderer that we need
++use super::blade_renderer::{BladePipelines, RenderingParameters};
++
++/// A GPU texture that can be rendered to by `BladeOffscreenRenderer`.
++pub struct OffscreenTexture {
++    pub(crate) texture: gpu::Texture,
++    pub(crate) view: gpu::TextureView,
++    pub(crate) size: Size<u32>,
++}
++
++impl OffscreenTexture {
++    /// Returns the size of the texture in pixels.
++    pub fn size(&self) -> Size<u32> {
++        self.size
++    }
++
++    /// Returns the raw GPU texture handle.
++    pub fn raw_texture(&self) -> gpu::Texture {
++        self.texture
++    }
++
++    /// Returns the raw GPU texture view handle.
++    pub fn raw_view(&self) -> gpu::TextureView {
++        self.view
++    }
++}
++
++impl BladeOffscreenRenderer {
++    /// Creates a new offscreen renderer that shares resources with the main renderer.
++    ///
++    /// # Arguments
++    ///
++    /// * `shared` - Shared resources from the main `BladeRenderer`
++    /// * `max_texture_size` - Maximum size of textures this renderer will create
++    /// * `surface_format` - The texture format to use (should match main renderer)
++    pub(super) fn new(
++        shared: &SharedRenderResources,
++        max_texture_size: gpu::Extent,
++        surface_format: gpu::TextureFormat,
++    ) -> Self {
++        let command_encoder = shared.gpu.create_command_encoder(gpu::CommandEncoderDesc {
++            name: "offscreen renderer",
++            buffer_count: 2,
++        });
++
++        let instance_belt = BufferBelt::new(BufferBeltDescriptor {
++            memory: gpu::Memory::Shared,
++            min_chunk_size: 0x1000,
++            alignment: 0x40, // Vulkan `minStorageBufferOffsetAlignment` on Intel Xe
++        });
++
++        // Create path intermediate textures sized for max texture size
++        let (path_intermediate_texture, path_intermediate_texture_view) =
++            create_path_intermediate_texture(
++                &shared.gpu,
++                surface_format,
++                max_texture_size.width,
++                max_texture_size.height,
++            );
++
++        let (path_intermediate_msaa_texture, path_intermediate_msaa_texture_view) =
++            create_msaa_texture_if_needed(
++                &shared.gpu,
++                surface_format,
++                max_texture_size.width,
++                max_texture_size.height,
++                shared.rendering_parameters.path_sample_count,
++            )
++            .unzip();
++
++        Self {
++            gpu: Arc::clone(&shared.gpu),
++            pipelines: Arc::clone(&shared.pipelines),
++            atlas: Arc::clone(&shared.atlas),
++            atlas_sampler: shared.atlas_sampler,
++            rendering_parameters: shared.rendering_parameters.clone(),
++            command_encoder,
++            instance_belt,
++            path_intermediate_texture,
++            path_intermediate_texture_view,
++            path_intermediate_msaa_texture,
++            path_intermediate_msaa_texture_view,
++            textures: HashMap::new(),
++            next_texture_id: 1,
++            max_texture_size,
++            surface_format,
++        }
++    }
++
++    /// Creates a new texture that can be rendered to.
++    ///
++    /// # Arguments
++    ///
++    /// * `width` - Width of the texture in pixels
++    /// * `height` - Height of the texture in pixels
++    ///
++    /// # Panics
++    ///
++    /// Panics if the requested size exceeds `max_texture_size`.
++    pub fn create_texture_raw(&self, width: u32, height: u32) -> OffscreenTexture {
++        assert!(
++            width <= self.max_texture_size.width && height <= self.max_texture_size.height,
++            "Requested texture size {}x{} exceeds max size {}x{}",
++            width,
++            height,
++            self.max_texture_size.width,
++            self.max_texture_size.height
++        );
++
++        let texture = self.gpu.create_texture(gpu::TextureDesc {
++            name: "offscreen target",
++            format: self.surface_format,
++            size: gpu::Extent {
++                width,
++                height,
++                depth: 1,
++            },
++            array_layer_count: 1,
++            mip_level_count: 1,
++            sample_count: 1,
++            dimension: gpu::TextureDimension::D2,
++            usage: gpu::TextureUsage::COPY
++                | gpu::TextureUsage::RESOURCE
++                | gpu::TextureUsage::TARGET,
++            external: None,
++        });
++
++        let view = self.gpu.create_texture_view(
++            texture,
++            gpu::TextureViewDesc {
++                name: "offscreen target view",
++                format: self.surface_format,
++                dimension: gpu::ViewDimension::D2,
++                subresources: &Default::default(),
++            },
++        );
++
++        OffscreenTexture {
++            texture,
++            view,
++            size: Size { width, height },
++        }
++    }
++
++    /// Renders a scene to the specified texture.
++    ///
++    /// This method renders the scene using the same rendering logic as the main
++    /// `BladeRenderer`, but outputs to the provided texture instead of the screen.
++    ///
++    /// # Arguments
++    ///
++    /// * `scene` - The scene to render
++    /// * `texture` - The target texture to render to
++    ///
++    /// # Note
++    ///
++    /// This method does NOT handle macOS video surfaces (`PrimitiveBatch::Surfaces`),
++    /// as they require platform-specific resources that are only available in the
++    /// main renderer.
++    pub fn draw_to_texture(&mut self, scene: &Scene, texture: &OffscreenTexture) {
++        self.command_encoder.start();
++        self.atlas.before_frame(&mut self.command_encoder);
++        self.command_encoder.init_texture(texture.texture);
++
++        let viewport_size = [texture.size.width as f32, texture.size.height as f32];
++
++        // Create render context for this frame
++        let mut ctx = RenderContext {
++            command_encoder: &mut self.command_encoder,
++            instance_belt: &mut self.instance_belt,
++            path_intermediate_texture: self.path_intermediate_texture,
++            path_intermediate_texture_view: self.path_intermediate_texture_view,
++            path_intermediate_msaa_texture: self.path_intermediate_msaa_texture,
++            path_intermediate_msaa_texture_view: self.path_intermediate_msaa_texture_view,
++        };
++
++        // Create a temporary SharedRenderResources view for render_batches
++        // This is a bit awkward but avoids changing render_batches signature
++        let shared = SharedRenderResources {
++            gpu: Arc::clone(&self.gpu),
++            pipelines: Arc::clone(&self.pipelines),
++            atlas: Arc::clone(&self.atlas),
++            atlas_sampler: self.atlas_sampler,
++            rendering_parameters: self.rendering_parameters.clone(),
++        };
++
++        // Render all batches using shared logic
++        // Offscreen textures use premultiplied alpha
++        render_batches(
++            scene,
++            texture.view,
++            viewport_size,
++            true, // premultiplied_alpha
++            &mut ctx,
++            &shared,
++        );
++
++        let sync_point = self.gpu.submit(&mut self.command_encoder);
++
++        self.instance_belt.flush(&sync_point);
++        self.atlas.after_frame(&sync_point);
++
++        // Wait for GPU to complete
++        self.gpu.wait_for(&sync_point, 10000);
++    }
++
++    /// Destroys a texture created by this renderer.
++    ///
++    /// # Arguments
++    ///
++    /// * `texture` - The texture to destroy
++    pub fn destroy_texture(&self, texture: OffscreenTexture) {
++        self.gpu.destroy_texture_view(texture.view);
++        self.gpu.destroy_texture(texture.texture);
++    }
++
++    /// Returns the maximum texture size this renderer supports.
++    pub fn max_texture_size(&self) -> gpu::Extent {
++        self.max_texture_size
++    }
++
++    /// Returns a reference to the shared atlas.
++    pub fn atlas(&self) -> &Arc<BladeAtlas> {
++        &self.atlas
++    }
++
++    /// Reads a texture's contents back from the GPU as RGBA data.
++    ///
++    /// This method copies the texture data from GPU memory to CPU memory,
++    /// converting from the internal BGRA format to standard RGBA.
++    ///
++    /// # Arguments
++    ///
++    /// * `texture_id` - The ID of the texture to read
++    ///
++    /// # Returns
++    ///
++    /// The texture data as RGBA bytes, or an error if the texture doesn't exist
++    /// or the read operation fails.
++    ///
++    /// # Example
++    ///
++    /// ```ignore
++    /// let texture_data = offscreen_renderer.read_texture(texture_id)?;
++    /// // Save to PNG using the image crate:
++    /// image::save_buffer(
++    ///     "output.png",
++    ///     texture_data.as_bytes(),
++    ///     texture_data.width,
++    ///     texture_data.height,
++    ///     image::ColorType::Rgba8,
++    /// )?;
++    /// ```
++    pub fn read_texture(&mut self, texture_id: OffscreenTextureId) -> anyhow::Result<TextureData> {
++        let Some(texture) = self.textures.get(&texture_id.0) else {
++            anyhow::bail!("Texture {:?} not found", texture_id);
++        };
++
++        let width = texture.size.width;
++        let height = texture.size.height;
++        let bytes_per_pixel = 4u32; // BGRA8
++        let bytes_per_row = width * bytes_per_pixel;
++        // Align to 256 bytes as required by some GPU APIs
++        let aligned_bytes_per_row = (bytes_per_row + 255) & !255;
++        let buffer_size = (aligned_bytes_per_row * height) as u64;
++
++        // Create a buffer to hold the texture data
++        let readback_buffer = self.gpu.create_buffer(gpu::BufferDesc {
++            name: "texture readback",
++            size: buffer_size,
++            memory: gpu::Memory::Shared,
++        });
++
++        // Copy texture to buffer using transfer encoder
++        self.command_encoder.start();
++        {
++            let mut transfers = self.command_encoder.transfer("texture readback");
++            transfers.copy_texture_to_buffer(
++                gpu::TexturePiece {
++                    texture: texture.texture,
++                    mip_level: 0,
++                    array_layer: 0,
++                    origin: [0, 0, 0],
++                },
++                gpu::BufferPiece {
++                    buffer: readback_buffer,
++                    offset: 0,
++                },
++                aligned_bytes_per_row,
++                gpu::Extent {
++                    width,
++                    height,
++                    depth: 1,
++                },
++            );
++        }
++
++        let sync_point = self.gpu.submit(&mut self.command_encoder);
++        self.gpu.wait_for(&sync_point, 10000);
++
++        // Read the buffer data - for Shared memory buffers, data() returns the mapped pointer
++        let buffer_data = unsafe {
++            let ptr = readback_buffer.data();
++            std::slice::from_raw_parts(ptr as *const u8, buffer_size as usize)
++        };
++
++        // Convert from BGRA to RGBA and handle row alignment
++        let mut rgba_data = Vec::with_capacity((width * height * 4) as usize);
++        for y in 0..height {
++            let row_start = (y * aligned_bytes_per_row) as usize;
++            for x in 0..width {
++                let pixel_start = row_start + (x * 4) as usize;
++                // BGRA -> RGBA
++                rgba_data.push(buffer_data[pixel_start + 2]); // R
++                rgba_data.push(buffer_data[pixel_start + 1]); // G
++                rgba_data.push(buffer_data[pixel_start]); // B
++                rgba_data.push(buffer_data[pixel_start + 3]); // A
++            }
++        }
++
++        // Destroy the buffer (Shared memory doesn't need explicit unmap)
++        self.gpu.destroy_buffer(readback_buffer);
++
++        Ok(TextureData::new(rgba_data, width, height))
++    }
++
++    /// Destroys this offscreen renderer and releases its resources.
++    ///
++    /// This should be called when the renderer is no longer needed.
++    pub fn destroy(&mut self) {
++        // Wait for any pending GPU work
++        // Note: We don't have a last_sync_point like BladeRenderer, but the
++        // wait in draw_to_texture should have completed any pending work.
++
++        // Destroy all managed textures
++        for (_, texture) in self.textures.drain() {
++            self.gpu.destroy_texture_view(texture.view);
++            self.gpu.destroy_texture(texture.texture);
++        }
++
++        self.instance_belt.destroy(&self.gpu);
++        self.gpu.destroy_command_encoder(&mut self.command_encoder);
++        self.gpu.destroy_texture(self.path_intermediate_texture);
++        self.gpu
++            .destroy_texture_view(self.path_intermediate_texture_view);
++
++        if let Some(msaa_texture) = self.path_intermediate_msaa_texture {
++            self.gpu.destroy_texture(msaa_texture);
++        }
++        if let Some(msaa_view) = self.path_intermediate_msaa_texture_view {
++            self.gpu.destroy_texture_view(msaa_view);
++        }
++
++        // Note: We don't destroy shared resources (gpu, pipelines, atlas, sampler)
++        // as they are owned by the main BladeRenderer
++    }
++}
++
++// Implement PlatformOffscreenRenderer trait
++impl PlatformOffscreenRenderer for BladeOffscreenRenderer {
++    fn create_texture(&mut self, size: Size<DevicePixels>) -> OffscreenTextureInfo {
++        let width = size.width.0 as u32;
++        let height = size.height.0 as u32;
++
++        let texture = self.create_texture_raw(width, height);
++        let id = self.next_texture_id;
++        self.next_texture_id += 1;
++
++        let info = OffscreenTextureInfo {
++            id: OffscreenTextureId(id),
++            size,
++        };
++
++        self.textures.insert(id, texture);
++        info
++    }
++
++    fn draw_to_texture(&mut self, scene: &Scene, texture_id: OffscreenTextureId) {
++        let Some(texture) = self.textures.get(&texture_id.0) else {
++            log::error!(
++                "Attempted to draw to non-existent texture: {:?}",
++                texture_id
++            );
++            return;
++        };
++
++        self.command_encoder.start();
++        self.atlas.before_frame(&mut self.command_encoder);
++        self.command_encoder.init_texture(texture.texture);
++
++        let viewport_size = [texture.size.width as f32, texture.size.height as f32];
++
++        // Create render context for this frame
++        let mut ctx = RenderContext {
++            command_encoder: &mut self.command_encoder,
++            instance_belt: &mut self.instance_belt,
++            path_intermediate_texture: self.path_intermediate_texture,
++            path_intermediate_texture_view: self.path_intermediate_texture_view,
++            path_intermediate_msaa_texture: self.path_intermediate_msaa_texture,
++            path_intermediate_msaa_texture_view: self.path_intermediate_msaa_texture_view,
++        };
++
++        // Create a temporary SharedRenderResources view for render_batches
++        let shared = SharedRenderResources {
++            gpu: Arc::clone(&self.gpu),
++            pipelines: Arc::clone(&self.pipelines),
++            atlas: Arc::clone(&self.atlas),
++            atlas_sampler: self.atlas_sampler,
++            rendering_parameters: self.rendering_parameters.clone(),
++        };
++
++        // Render all batches using shared logic
++        // Offscreen textures use premultiplied alpha
++        render_batches(
++            scene,
++            texture.view,
++            viewport_size,
++            true, // premultiplied_alpha
++            &mut ctx,
++            &shared,
++        );
++
++        let sync_point = self.gpu.submit(&mut self.command_encoder);
++
++        self.instance_belt.flush(&sync_point);
++        self.atlas.after_frame(&sync_point);
++
++        // Wait for GPU to complete
++        self.gpu.wait_for(&sync_point, 10000);
++    }
++
++    fn destroy_texture(&mut self, texture_id: OffscreenTextureId) {
++        if let Some(texture) = self.textures.remove(&texture_id.0) {
++            self.gpu.destroy_texture_view(texture.view);
++            self.gpu.destroy_texture(texture.texture);
++        } else {
++            log::warn!(
++                "Attempted to destroy non-existent texture: {:?}",
++                texture_id
++            );
++        }
++    }
++
++    fn max_texture_size(&self) -> Size<DevicePixels> {
++        Size {
++            width: DevicePixels(self.max_texture_size.width as i32),
++            height: DevicePixels(self.max_texture_size.height as i32),
++        }
++    }
++
++    fn read_texture(&mut self, texture_id: OffscreenTextureId) -> anyhow::Result<TextureData> {
++        // Delegate to the inherent method
++        BladeOffscreenRenderer::read_texture(self, texture_id)
++    }
++
++    fn destroy(&mut self) {
++        // Delegate to the inherent method
++        BladeOffscreenRenderer::destroy(self);
++    }
++}
++
++// Safety: BladeOffscreenRenderer can be sent between threads because:
++// - Arc<gpu::Context> is Send + Sync
++// - Arc<BladePipelines> is Send + Sync
++// - Arc<BladeAtlas> is Send + Sync
++// - gpu::Sampler is Copy and thread-safe
++// - Other fields are owned and don't have thread-local state
++unsafe impl Send for BladeOffscreenRenderer {}
+diff --git a/crates/gpui/src/platform/blade/blade_renderer.rs b/crates/gpui/src/platform/blade/blade_renderer.rs
+index dd0be7db43..f01e059d28 100644
+--- a/crates/gpui/src/platform/blade/blade_renderer.rs
++++ b/crates/gpui/src/platform/blade/blade_renderer.rs
+@@ -123,7 +123,7 @@ struct PathRasterizationVertex {
+     bounds: Bounds<ScaledPixels>,
+ }
+ 
+-struct BladePipelines {
++pub(super) struct BladePipelines {
+     quads: gpu::RenderPipeline,
+     shadows: gpu::RenderPipeline,
+     path_rasterization: gpu::RenderPipeline,
+@@ -135,7 +135,11 @@ struct BladePipelines {
+ }
+ 
+ impl BladePipelines {
+-    fn new(gpu: &gpu::Context, surface_info: gpu::SurfaceInfo, path_sample_count: u32) -> Self {
++    pub(super) fn new(
++        gpu: &gpu::Context,
++        surface_info: gpu::SurfaceInfo,
++        path_sample_count: u32,
++    ) -> Self {
+         use gpu::ShaderData as _;
+ 
+         log::info!(
+@@ -304,7 +308,7 @@ impl BladePipelines {
+         }
+     }
+ 
+-    fn destroy(&mut self, gpu: &gpu::Context) {
++    pub(super) fn destroy(&mut self, gpu: &gpu::Context) {
+         gpu.destroy_render_pipeline(&mut self.quads);
+         gpu.destroy_render_pipeline(&mut self.shadows);
+         gpu.destroy_render_pipeline(&mut self.path_rasterization);
+@@ -325,23 +329,322 @@ pub struct BladeSurfaceConfig {
+ // so that they are shared between windows. E.g. `pipelines`.
+ // But that is complicated by the fact that pipelines depend on
+ // the format and alpha mode.
++/// This bundles the mutable state that varies per-renderer.
++pub(super) struct RenderContext<'a> {
++    pub command_encoder: &'a mut gpu::CommandEncoder,
++    pub instance_belt: &'a mut BufferBelt,
++    pub path_intermediate_texture: gpu::Texture,
++    pub path_intermediate_texture_view: gpu::TextureView,
++    pub path_intermediate_msaa_texture: Option<gpu::Texture>,
++    pub path_intermediate_msaa_texture_view: Option<gpu::TextureView>,
++}
++
++/// GPU resources that can be shared between the main renderer and offscreen renderers.
++/// These are expensive to create and should be reused.
++#[allow(private_interfaces)]
++pub(super) struct SharedRenderResources {
++    pub(super) gpu: Arc<gpu::Context>,
++    pub(super) pipelines: Arc<BladePipelines>,
++    pub(super) atlas: Arc<BladeAtlas>,
++    pub(super) atlas_sampler: gpu::Sampler,
++    pub(super) rendering_parameters: RenderingParameters,
++}
++
++impl SharedRenderResources {
++    fn new(
++        gpu: Arc<gpu::Context>,
++        surface_info: gpu::SurfaceInfo,
++        rendering_parameters: RenderingParameters,
++    ) -> Self {
++        let pipelines = Arc::new(BladePipelines::new(
++            &gpu,
++            surface_info,
++            rendering_parameters.path_sample_count,
++        ));
++        let atlas = Arc::new(BladeAtlas::new(&gpu));
++        let atlas_sampler = gpu.create_sampler(gpu::SamplerDesc {
++            name: "shared sampler",
++            mag_filter: gpu::FilterMode::Linear,
++            min_filter: gpu::FilterMode::Linear,
++            ..Default::default()
++        });
++
++        Self {
++            gpu,
++            pipelines,
++            atlas,
++            atlas_sampler,
++            rendering_parameters,
++        }
++    }
++
++    fn destroy(&mut self) {
++        self.atlas.destroy();
++        self.gpu.destroy_sampler(self.atlas_sampler);
++        // Only destroy pipelines if we have the only reference
++        if let Some(pipelines) = Arc::get_mut(&mut self.pipelines) {
++            pipelines.destroy(&self.gpu);
++        }
++    }
++}
++
++/// Rasterize paths to an intermediate texture for MSAA.
++/// This is called during batch processing when paths are encountered.
++#[profiling::function]
++fn draw_paths_to_intermediate(
++    ctx: &mut RenderContext<'_>,
++    shared: &SharedRenderResources,
++    paths: &[Path<ScaledPixels>],
++    width: f32,
++    height: f32,
++) {
++    ctx.command_encoder
++        .init_texture(ctx.path_intermediate_texture);
++    if let Some(msaa_texture) = ctx.path_intermediate_msaa_texture {
++        ctx.command_encoder.init_texture(msaa_texture);
++    }
++
++    let target = if let Some(msaa_view) = ctx.path_intermediate_msaa_texture_view {
++        gpu::RenderTarget {
++            view: msaa_view,
++            init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
++            finish_op: gpu::FinishOp::ResolveTo(ctx.path_intermediate_texture_view),
++        }
++    } else {
++        gpu::RenderTarget {
++            view: ctx.path_intermediate_texture_view,
++            init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
++            finish_op: gpu::FinishOp::Store,
++        }
++    };
++    if let mut pass = ctx.command_encoder.render(
++        "rasterize paths",
++        gpu::RenderTargetSet {
++            colors: &[target],
++            depth_stencil: None,
++        },
++    ) {
++        let globals = GlobalParams {
++            viewport_size: [width, height],
++            premultiplied_alpha: 0,
++            pad: 0,
++        };
++        let mut encoder = pass.with(&shared.pipelines.path_rasterization);
++
++        let mut vertices = Vec::new();
++        for path in paths {
++            vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
++                xy_position: v.xy_position,
++                st_position: v.st_position,
++                color: path.color,
++                bounds: path.clipped_bounds(),
++            }));
++        }
++        let vertex_buf = unsafe { ctx.instance_belt.alloc_typed(&vertices, &shared.gpu) };
++        encoder.bind(
++            0,
++            &ShaderPathRasterizationData {
++                globals,
++                b_path_vertices: vertex_buf,
++            },
++        );
++        encoder.draw(0, vertices.len() as u32, 0, 1);
++    }
++}
++
++/// Core rendering logic shared between BladeRenderer and BladeOffscreenRenderer.
++///
++/// This function renders all batches in a scene to the specified target texture view.
++/// It handles all primitive types: quads, shadows, paths, underlines, and sprites.
++///
++/// Note: Surfaces (macOS video) are NOT handled here as they require platform-specific
++/// resources (CVMetalTextureCache). The caller must handle those separately.
++#[profiling::function]
++pub(super) fn render_batches(
++    scene: &Scene,
++    target_view: gpu::TextureView,
++    viewport_size: [f32; 2],
++    premultiplied_alpha: bool,
++    ctx: &mut RenderContext<'_>,
++    shared: &SharedRenderResources,
++) {
++    let globals = GlobalParams {
++        viewport_size,
++        premultiplied_alpha: if premultiplied_alpha { 1 } else { 0 },
++        pad: 0,
++    };
++
++    let mut pass = ctx.command_encoder.render(
++        "main",
++        gpu::RenderTargetSet {
++            colors: &[gpu::RenderTarget {
++                view: target_view,
++                init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
++                finish_op: gpu::FinishOp::Store,
++            }],
++            depth_stencil: None,
++        },
++    );
++
++    for batch in scene.batches() {
++        match batch {
++            PrimitiveBatch::Quads(quads) => {
++                let instance_buf = unsafe { ctx.instance_belt.alloc_typed(quads, &shared.gpu) };
++                let mut encoder = pass.with(&shared.pipelines.quads);
++                encoder.bind(
++                    0,
++                    &ShaderQuadsData {
++                        globals,
++                        b_quads: instance_buf,
++                    },
++                );
++                encoder.draw(0, 4, 0, quads.len() as u32);
++            }
++            PrimitiveBatch::Shadows(shadows) => {
++                let instance_buf = unsafe { ctx.instance_belt.alloc_typed(shadows, &shared.gpu) };
++                let mut encoder = pass.with(&shared.pipelines.shadows);
++                encoder.bind(
++                    0,
++                    &ShaderShadowsData {
++                        globals,
++                        b_shadows: instance_buf,
++                    },
++                );
++                encoder.draw(0, 4, 0, shadows.len() as u32);
++            }
++            PrimitiveBatch::Paths(paths) => {
++                let Some(first_path) = paths.first() else {
++                    continue;
++                };
++                drop(pass);
++                draw_paths_to_intermediate(ctx, shared, paths, viewport_size[0], viewport_size[1]);
++                pass = ctx.command_encoder.render(
++                    "main",
++                    gpu::RenderTargetSet {
++                        colors: &[gpu::RenderTarget {
++                            view: target_view,
++                            init_op: gpu::InitOp::Load,
++                            finish_op: gpu::FinishOp::Store,
++                        }],
++                        depth_stencil: None,
++                    },
++                );
++                let mut encoder = pass.with(&shared.pipelines.paths);
++                // When copying paths from the intermediate texture to the drawable,
++                // each pixel must only be copied once, in case of transparent paths.
++                //
++                // If all paths have the same draw order, then their bounds are all
++                // disjoint, so we can copy each path's bounds individually. If this
++                // batch combines different draw orders, we perform a single copy
++                // for a minimal spanning rect.
++                let sprites = if paths.last().unwrap().order == first_path.order {
++                    paths
++                        .iter()
++                        .map(|path| PathSprite {
++                            bounds: path.clipped_bounds(),
++                        })
++                        .collect()
++                } else {
++                    let mut bounds = first_path.clipped_bounds();
++                    for path in paths.iter().skip(1) {
++                        bounds = bounds.union(&path.clipped_bounds());
++                    }
++                    vec![PathSprite { bounds }]
++                };
++                let instance_buf = unsafe { ctx.instance_belt.alloc_typed(&sprites, &shared.gpu) };
++                encoder.bind(
++                    0,
++                    &ShaderPathsData {
++                        globals,
++                        t_sprite: ctx.path_intermediate_texture_view,
++                        s_sprite: shared.atlas_sampler,
++                        b_path_sprites: instance_buf,
++                    },
++                );
++                encoder.draw(0, 4, 0, sprites.len() as u32);
++            }
++            PrimitiveBatch::Underlines(underlines) => {
++                let instance_buf =
++                    unsafe { ctx.instance_belt.alloc_typed(underlines, &shared.gpu) };
++                let mut encoder = pass.with(&shared.pipelines.underlines);
++                encoder.bind(
++                    0,
++                    &ShaderUnderlinesData {
++                        globals,
++                        b_underlines: instance_buf,
++                    },
++                );
++                encoder.draw(0, 4, 0, underlines.len() as u32);
++            }
++            PrimitiveBatch::MonochromeSprites {
++                texture_id,
++                sprites,
++            } => {
++                let tex_info = shared.atlas.get_texture_info(texture_id);
++                let instance_buf = unsafe { ctx.instance_belt.alloc_typed(sprites, &shared.gpu) };
++                let mut encoder = pass.with(&shared.pipelines.mono_sprites);
++                encoder.bind(
++                    0,
++                    &ShaderMonoSpritesData {
++                        globals,
++                        gamma_ratios: shared.rendering_parameters.gamma_ratios,
++                        grayscale_enhanced_contrast: shared
++                            .rendering_parameters
++                            .grayscale_enhanced_contrast,
++                        t_sprite: tex_info.raw_view,
++                        s_sprite: shared.atlas_sampler,
++                        b_mono_sprites: instance_buf,
++                    },
++                );
++                encoder.draw(0, 4, 0, sprites.len() as u32);
++            }
++            PrimitiveBatch::PolychromeSprites {
++                texture_id,
++                sprites,
++            } => {
++                let tex_info = shared.atlas.get_texture_info(texture_id);
++                let instance_buf = unsafe { ctx.instance_belt.alloc_typed(sprites, &shared.gpu) };
++                let mut encoder = pass.with(&shared.pipelines.poly_sprites);
++                encoder.bind(
++                    0,
++                    &ShaderPolySpritesData {
++                        globals,
++                        t_sprite: tex_info.raw_view,
++                        s_sprite: shared.atlas_sampler,
++                        b_poly_sprites: instance_buf,
++                    },
++                );
++                encoder.draw(0, 4, 0, sprites.len() as u32);
++            }
++            PrimitiveBatch::Surfaces(_surfaces) => {
++                // Surfaces (macOS video) are handled separately by the caller
++                // because they require platform-specific resources (CVMetalTextureCache)
++            }
++        }
++    }
++
++    drop(pass);
++}
++
+ pub struct BladeRenderer {
+-    gpu: Arc<gpu::Context>,
++    // Shared resources (can be used by offscreen renderers)
++    shared: SharedRenderResources,
++
++    // Window-specific resources
+     surface: gpu::Surface,
+     surface_config: gpu::SurfaceConfig,
++
++    // Per-instance state
+     command_encoder: gpu::CommandEncoder,
+     last_sync_point: Option<gpu::SyncPoint>,
+-    pipelines: BladePipelines,
+     instance_belt: BufferBelt,
+-    atlas: Arc<BladeAtlas>,
+-    atlas_sampler: gpu::Sampler,
+-    #[cfg(target_os = "macos")]
+-    core_video_texture_cache: CVMetalTextureCache,
+     path_intermediate_texture: gpu::Texture,
+     path_intermediate_texture_view: gpu::TextureView,
+     path_intermediate_msaa_texture: Option<gpu::Texture>,
+     path_intermediate_msaa_texture_view: Option<gpu::TextureView>,
+-    rendering_parameters: RenderingParameters,
++
++    #[cfg(target_os = "macos")]
++    core_video_texture_cache: CVMetalTextureCache,
+ }
+ 
+ impl BladeRenderer {
+@@ -368,23 +671,19 @@ impl BladeRenderer {
+             buffer_count: 2,
+         });
+         let rendering_parameters = RenderingParameters::from_env(context);
+-        let pipelines = BladePipelines::new(
+-            &context.gpu,
++
++        // Create shared resources
++        let shared = SharedRenderResources::new(
++            Arc::clone(&context.gpu),
+             surface.info(),
+-            rendering_parameters.path_sample_count,
++            rendering_parameters,
+         );
++
+         let instance_belt = BufferBelt::new(BufferBeltDescriptor {
+             memory: gpu::Memory::Shared,
+             min_chunk_size: 0x1000,
+             alignment: 0x40, // Vulkan `minStorageBufferOffsetAlignment` on Intel Xe
+         });
+-        let atlas = Arc::new(BladeAtlas::new(&context.gpu));
+-        let atlas_sampler = context.gpu.create_sampler(gpu::SamplerDesc {
+-            name: "path rasterization sampler",
+-            mag_filter: gpu::FilterMode::Linear,
+-            min_filter: gpu::FilterMode::Linear,
+-            ..Default::default()
+-        });
+ 
+         let (path_intermediate_texture, path_intermediate_texture_view) =
+             create_path_intermediate_texture(
+@@ -399,7 +698,7 @@ impl BladeRenderer {
+                 surface.info().format,
+                 config.size.width,
+                 config.size.height,
+-                rendering_parameters.path_sample_count,
++                shared.rendering_parameters.path_sample_count,
+             )
+             .unzip();
+ 
+@@ -412,32 +711,28 @@ impl BladeRenderer {
+         };
+ 
+         Ok(Self {
+-            gpu: Arc::clone(&context.gpu),
++            shared,
+             surface,
+             surface_config,
+             command_encoder,
+             last_sync_point: None,
+-            pipelines,
+             instance_belt,
+-            atlas,
+-            atlas_sampler,
+-            #[cfg(target_os = "macos")]
+-            core_video_texture_cache,
+             path_intermediate_texture,
+             path_intermediate_texture_view,
+             path_intermediate_msaa_texture,
+             path_intermediate_msaa_texture_view,
+-            rendering_parameters,
++            #[cfg(target_os = "macos")]
++            core_video_texture_cache,
+         })
+     }
+ 
+     fn wait_for_gpu(&mut self) {
+         if let Some(last_sp) = self.last_sync_point.take()
+-            && !self.gpu.wait_for(&last_sp, MAX_FRAME_TIME_MS)
++            && !self.shared.gpu.wait_for(&last_sp, MAX_FRAME_TIME_MS)
+         {
+             log::error!("GPU hung");
+             #[cfg(target_os = "linux")]
+-            if self.gpu.device_information().driver_name == "radv" {
++            if self.shared.gpu.device_information().driver_name == "radv" {
+                 log::error!(
+                     "there's a known bug with amdgpu/radv, try setting ZED_PATH_SAMPLE_COUNT=0 as a workaround"
+                 );
+@@ -447,9 +742,9 @@ impl BladeRenderer {
+             }
+             log::error!(
+                 "your device information is: {:?}",
+-                self.gpu.device_information()
++                self.shared.gpu.device_information()
+             );
+-            while !self.gpu.wait_for(&last_sp, MAX_FRAME_TIME_MS) {}
++            while !self.shared.gpu.wait_for(&last_sp, MAX_FRAME_TIME_MS) {}
+         }
+     }
+ 
+@@ -478,20 +773,24 @@ impl BladeRenderer {
+         if always_resize || gpu_size != self.surface_config.size {
+             self.wait_for_gpu();
+             self.surface_config.size = gpu_size;
+-            self.gpu
++            self.shared
++                .gpu
+                 .reconfigure_surface(&mut self.surface, self.surface_config);
+-            self.gpu.destroy_texture(self.path_intermediate_texture);
+-            self.gpu
++            self.shared
++                .gpu
++                .destroy_texture(self.path_intermediate_texture);
++            self.shared
++                .gpu
+                 .destroy_texture_view(self.path_intermediate_texture_view);
+             if let Some(msaa_texture) = self.path_intermediate_msaa_texture {
+-                self.gpu.destroy_texture(msaa_texture);
++                self.shared.gpu.destroy_texture(msaa_texture);
+             }
+             if let Some(msaa_view) = self.path_intermediate_msaa_texture_view {
+-                self.gpu.destroy_texture_view(msaa_view);
++                self.shared.gpu.destroy_texture_view(msaa_view);
+             }
+             let (path_intermediate_texture, path_intermediate_texture_view) =
+                 create_path_intermediate_texture(
+-                    &self.gpu,
++                    &self.shared.gpu,
+                     self.surface.info().format,
+                     gpu_size.width,
+                     gpu_size.height,
+@@ -500,11 +799,11 @@ impl BladeRenderer {
+             self.path_intermediate_texture_view = path_intermediate_texture_view;
+             let (path_intermediate_msaa_texture, path_intermediate_msaa_texture_view) =
+                 create_msaa_texture_if_needed(
+-                    &self.gpu,
++                    &self.shared.gpu,
+                     self.surface.info().format,
+                     gpu_size.width,
+                     gpu_size.height,
+-                    self.rendering_parameters.path_sample_count,
++                    self.shared.rendering_parameters.path_sample_count,
+                 )
+                 .unzip();
+             self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
+@@ -516,14 +815,17 @@ impl BladeRenderer {
+         if transparent != self.surface_config.transparent {
+             self.wait_for_gpu();
+             self.surface_config.transparent = transparent;
+-            self.gpu
++            self.shared
++                .gpu
+                 .reconfigure_surface(&mut self.surface, self.surface_config);
+-            self.pipelines.destroy(&self.gpu);
+-            self.pipelines = BladePipelines::new(
+-                &self.gpu,
++            if let Some(pipelines) = Arc::get_mut(&mut self.shared.pipelines) {
++                pipelines.destroy(&self.shared.gpu);
++            }
++            self.shared.pipelines = Arc::new(BladePipelines::new(
++                &self.shared.gpu,
+                 self.surface.info(),
+-                self.rendering_parameters.path_sample_count,
+-            );
++                self.shared.rendering_parameters.path_sample_count,
++            ));
+         }
+     }
+ 
+@@ -536,12 +838,48 @@ impl BladeRenderer {
+     }
+ 
+     pub fn sprite_atlas(&self) -> &Arc<BladeAtlas> {
+-        &self.atlas
++        &self.shared.atlas
++    }
++
++    /// Returns the surface format used by this renderer.
++    #[cfg(feature = "render-to-texture")]
++    pub fn surface_format(&self) -> gpu::TextureFormat {
++        self.surface.info().format
++    }
++
++    /// Creates a new offscreen renderer that shares resources with this renderer.
++    ///
++    /// The offscreen renderer can be used for render-to-texture operations without
++    /// interfering with the main rendering pipeline.
++    ///
++    /// # Arguments
++    ///
++    /// * `max_texture_size` - Maximum size of textures the offscreen renderer will create
++    ///
++    /// # Example
++    ///
++    /// ```ignore
++    /// let offscreen = renderer.create_offscreen_renderer(gpu::Extent {
++    ///     width: 1024,
++    ///     height: 1024,
++    ///     depth: 1,
++    /// });
++    /// ```
++    #[cfg(feature = "render-to-texture")]
++    pub fn create_offscreen_renderer(
++        &self,
++        max_texture_size: gpu::Extent,
++    ) -> super::BladeOffscreenRenderer {
++        super::BladeOffscreenRenderer::new(
++            &self.shared,
++            max_texture_size,
++            self.surface.info().format,
++        )
+     }
+ 
+     #[cfg_attr(target_os = "macos", allow(dead_code))]
+     pub fn gpu_specs(&self) -> GpuSpecs {
+-        let info = self.gpu.device_information();
++        let info = self.shared.gpu.device_information();
+ 
+         GpuSpecs {
+             is_software_emulated: info.is_software_emulated,
+@@ -561,89 +899,32 @@ impl BladeRenderer {
+         objc2::rc::Retained::as_ptr(&self.surface.metal_layer()) as *mut _
+     }
+ 
+-    #[profiling::function]
+-    fn draw_paths_to_intermediate(
+-        &mut self,
+-        paths: &[Path<ScaledPixels>],
+-        width: f32,
+-        height: f32,
+-    ) {
+-        self.command_encoder
+-            .init_texture(self.path_intermediate_texture);
+-        if let Some(msaa_texture) = self.path_intermediate_msaa_texture {
+-            self.command_encoder.init_texture(msaa_texture);
+-        }
+-
+-        let target = if let Some(msaa_view) = self.path_intermediate_msaa_texture_view {
+-            gpu::RenderTarget {
+-                view: msaa_view,
+-                init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
+-                finish_op: gpu::FinishOp::ResolveTo(self.path_intermediate_texture_view),
+-            }
+-        } else {
+-            gpu::RenderTarget {
+-                view: self.path_intermediate_texture_view,
+-                init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
+-                finish_op: gpu::FinishOp::Store,
+-            }
+-        };
+-        if let mut pass = self.command_encoder.render(
+-            "rasterize paths",
+-            gpu::RenderTargetSet {
+-                colors: &[target],
+-                depth_stencil: None,
+-            },
+-        ) {
+-            let globals = GlobalParams {
+-                viewport_size: [width, height],
+-                premultiplied_alpha: 0,
+-                pad: 0,
+-            };
+-            let mut encoder = pass.with(&self.pipelines.path_rasterization);
+-
+-            let mut vertices = Vec::new();
+-            for path in paths {
+-                vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
+-                    xy_position: v.xy_position,
+-                    st_position: v.st_position,
+-                    color: path.color,
+-                    bounds: path.clipped_bounds(),
+-                }));
+-            }
+-            let vertex_buf = unsafe { self.instance_belt.alloc_typed(&vertices, &self.gpu) };
+-            encoder.bind(
+-                0,
+-                &ShaderPathRasterizationData {
+-                    globals,
+-                    b_path_vertices: vertex_buf,
+-                },
+-            );
+-            encoder.draw(0, vertices.len() as u32, 0, 1);
+-        }
+-    }
+-
+     pub fn destroy(&mut self) {
+         self.wait_for_gpu();
+-        self.atlas.destroy();
+-        self.gpu.destroy_sampler(self.atlas_sampler);
+-        self.instance_belt.destroy(&self.gpu);
+-        self.gpu.destroy_command_encoder(&mut self.command_encoder);
+-        self.pipelines.destroy(&self.gpu);
+-        self.gpu.destroy_surface(&mut self.surface);
+-        self.gpu.destroy_texture(self.path_intermediate_texture);
+-        self.gpu
++        self.instance_belt.destroy(&self.shared.gpu);
++        self.shared
++            .gpu
++            .destroy_command_encoder(&mut self.command_encoder);
++        self.shared.gpu.destroy_surface(&mut self.surface);
++        self.shared
++            .gpu
++            .destroy_texture(self.path_intermediate_texture);
++        self.shared
++            .gpu
+             .destroy_texture_view(self.path_intermediate_texture_view);
+         if let Some(msaa_texture) = self.path_intermediate_msaa_texture {
+-            self.gpu.destroy_texture(msaa_texture);
++            self.shared.gpu.destroy_texture(msaa_texture);
+         }
+         if let Some(msaa_view) = self.path_intermediate_msaa_texture_view {
+-            self.gpu.destroy_texture_view(msaa_view);
++            self.shared.gpu.destroy_texture_view(msaa_view);
+         }
++        // Destroy shared resources last
++        self.shared.destroy();
+     }
+ 
+     pub fn draw(&mut self, scene: &Scene) {
+         self.command_encoder.start();
+-        self.atlas.before_frame(&mut self.command_encoder);
++        self.shared.atlas.before_frame(&mut self.command_encoder);
+ 
+         let frame = {
+             profiling::scope!("acquire frame");
+@@ -651,275 +932,160 @@ impl BladeRenderer {
+         };
+         self.command_encoder.init_texture(frame.texture());
+ 
+-        let globals = GlobalParams {
+-            viewport_size: [
+-                self.surface_config.size.width as f32,
+-                self.surface_config.size.height as f32,
+-            ],
+-            premultiplied_alpha: match self.surface.info().alpha {
+-                gpu::AlphaMode::Ignored | gpu::AlphaMode::PostMultiplied => 0,
+-                gpu::AlphaMode::PreMultiplied => 1,
+-            },
+-            pad: 0,
++        let viewport_size = [
++            self.surface_config.size.width as f32,
++            self.surface_config.size.height as f32,
++        ];
++        let premultiplied_alpha =
++            matches!(self.surface.info().alpha, gpu::AlphaMode::PreMultiplied);
++
++        // Create render context for this frame
++        let mut ctx = RenderContext {
++            command_encoder: &mut self.command_encoder,
++            instance_belt: &mut self.instance_belt,
++            path_intermediate_texture: self.path_intermediate_texture,
++            path_intermediate_texture_view: self.path_intermediate_texture_view,
++            path_intermediate_msaa_texture: self.path_intermediate_msaa_texture,
++            path_intermediate_msaa_texture_view: self.path_intermediate_msaa_texture_view,
+         };
+ 
+-        let mut pass = self.command_encoder.render(
+-            "main",
+-            gpu::RenderTargetSet {
+-                colors: &[gpu::RenderTarget {
+-                    view: frame.texture_view(),
+-                    init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
+-                    finish_op: gpu::FinishOp::Store,
+-                }],
+-                depth_stencil: None,
+-            },
++        // Render all batches using shared logic
++        render_batches(
++            scene,
++            frame.texture_view(),
++            viewport_size,
++            premultiplied_alpha,
++            &mut ctx,
++            &self.shared,
+         );
+ 
+-        profiling::scope!("render pass");
++        // Handle macOS surfaces separately (they need core_video_texture_cache)
++        #[cfg(target_os = "macos")]
++        self.draw_surfaces(scene, frame.texture_view(), viewport_size);
++
++        self.command_encoder.present(frame);
++        let sync_point = self.shared.gpu.submit(&mut self.command_encoder);
++
++        profiling::scope!("finish");
++        self.instance_belt.flush(&sync_point);
++        self.shared.atlas.after_frame(&sync_point);
++
++        self.wait_for_gpu();
++        self.last_sync_point = Some(sync_point);
++    }
++
++    /// Draw macOS video surfaces. This is separate from render_batches because
++    /// it requires the platform-specific CVMetalTextureCache.
++    #[cfg(target_os = "macos")]
++    fn draw_surfaces(
++        &mut self,
++        scene: &Scene,
++        target_view: gpu::TextureView,
++        viewport_size: [f32; 2],
++    ) {
++        let globals = GlobalParams {
++            viewport_size,
++            premultiplied_alpha: 1,
++            pad: 0,
++        };
++
+         for batch in scene.batches() {
+-            match batch {
+-                PrimitiveBatch::Quads(quads) => {
+-                    let instance_buf = unsafe { self.instance_belt.alloc_typed(quads, &self.gpu) };
+-                    let mut encoder = pass.with(&self.pipelines.quads);
+-                    encoder.bind(
+-                        0,
+-                        &ShaderQuadsData {
+-                            globals,
+-                            b_quads: instance_buf,
+-                        },
+-                    );
+-                    encoder.draw(0, 4, 0, quads.len() as u32);
+-                }
+-                PrimitiveBatch::Shadows(shadows) => {
+-                    let instance_buf =
+-                        unsafe { self.instance_belt.alloc_typed(shadows, &self.gpu) };
+-                    let mut encoder = pass.with(&self.pipelines.shadows);
+-                    encoder.bind(
+-                        0,
+-                        &ShaderShadowsData {
+-                            globals,
+-                            b_shadows: instance_buf,
+-                        },
+-                    );
+-                    encoder.draw(0, 4, 0, shadows.len() as u32);
+-                }
+-                PrimitiveBatch::Paths(paths) => {
+-                    let Some(first_path) = paths.first() else {
+-                        continue;
+-                    };
+-                    drop(pass);
+-                    self.draw_paths_to_intermediate(
+-                        paths,
+-                        self.surface_config.size.width as f32,
+-                        self.surface_config.size.height as f32,
+-                    );
+-                    pass = self.command_encoder.render(
+-                        "main",
+-                        gpu::RenderTargetSet {
+-                            colors: &[gpu::RenderTarget {
+-                                view: frame.texture_view(),
+-                                init_op: gpu::InitOp::Load,
+-                                finish_op: gpu::FinishOp::Store,
+-                            }],
+-                            depth_stencil: None,
+-                        },
+-                    );
+-                    let mut encoder = pass.with(&self.pipelines.paths);
+-                    // When copying paths from the intermediate texture to the drawable,
+-                    // each pixel must only be copied once, in case of transparent paths.
+-                    //
+-                    // If all paths have the same draw order, then their bounds are all
+-                    // disjoint, so we can copy each path's bounds individually. If this
+-                    // batch combines different draw orders, we perform a single copy
+-                    // for a minimal spanning rect.
+-                    let sprites = if paths.last().unwrap().order == first_path.order {
+-                        paths
+-                            .iter()
+-                            .map(|path| PathSprite {
+-                                bounds: path.clipped_bounds(),
+-                            })
+-                            .collect()
+-                    } else {
+-                        let mut bounds = first_path.clipped_bounds();
+-                        for path in paths.iter().skip(1) {
+-                            bounds = bounds.union(&path.clipped_bounds());
+-                        }
+-                        vec![PathSprite { bounds }]
++            if let PrimitiveBatch::Surfaces(surfaces) = batch {
++                let mut pass = self.command_encoder.render(
++                    "surfaces",
++                    gpu::RenderTargetSet {
++                        colors: &[gpu::RenderTarget {
++                            view: target_view,
++                            init_op: gpu::InitOp::Load,
++                            finish_op: gpu::FinishOp::Store,
++                        }],
++                        depth_stencil: None,
++                    },
++                );
++                let mut encoder = pass.with(&self.shared.pipelines.surfaces);
++
++                for surface in surfaces {
++                    let (t_y, t_cb_cr) = unsafe {
++                        use core_foundation::base::TCFType as _;
++                        use std::ptr;
++
++                        assert_eq!(
++                            surface.image_buffer.get_pixel_format(),
++                            core_video::pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
++                        );
++
++                        let y_texture = self
++                            .core_video_texture_cache
++                            .create_texture_from_image(
++                                surface.image_buffer.as_concrete_TypeRef(),
++                                ptr::null(),
++                                metal::MTLPixelFormat::R8Unorm,
++                                surface.image_buffer.get_width_of_plane(0),
++                                surface.image_buffer.get_height_of_plane(0),
++                                0,
++                            )
++                            .unwrap();
++                        let cb_cr_texture = self
++                            .core_video_texture_cache
++                            .create_texture_from_image(
++                                surface.image_buffer.as_concrete_TypeRef(),
++                                ptr::null(),
++                                metal::MTLPixelFormat::RG8Unorm,
++                                surface.image_buffer.get_width_of_plane(1),
++                                surface.image_buffer.get_height_of_plane(1),
++                                1,
++                            )
++                            .unwrap();
++                        (
++                            gpu::TextureView::from_metal_texture(
++                                &objc2::rc::Retained::retain(
++                                    foreign_types::ForeignTypeRef::as_ptr(
++                                        y_texture.as_texture_ref(),
++                                    )
++                                        as *mut objc2::runtime::ProtocolObject<
++                                            dyn objc2_metal::MTLTexture,
++                                        >,
++                                )
++                                .unwrap(),
++                                gpu::TexelAspects::COLOR,
++                            ),
++                            gpu::TextureView::from_metal_texture(
++                                &objc2::rc::Retained::retain(
++                                    foreign_types::ForeignTypeRef::as_ptr(
++                                        cb_cr_texture.as_texture_ref(),
++                                    )
++                                        as *mut objc2::runtime::ProtocolObject<
++                                            dyn objc2_metal::MTLTexture,
++                                        >,
++                                )
++                                .unwrap(),
++                                gpu::TexelAspects::COLOR,
++                            ),
++                        )
+                     };
+-                    let instance_buf =
+-                        unsafe { self.instance_belt.alloc_typed(&sprites, &self.gpu) };
+-                    encoder.bind(
+-                        0,
+-                        &ShaderPathsData {
+-                            globals,
+-                            t_sprite: self.path_intermediate_texture_view,
+-                            s_sprite: self.atlas_sampler,
+-                            b_path_sprites: instance_buf,
+-                        },
+-                    );
+-                    encoder.draw(0, 4, 0, sprites.len() as u32);
+-                }
+-                PrimitiveBatch::Underlines(underlines) => {
+-                    let instance_buf =
+-                        unsafe { self.instance_belt.alloc_typed(underlines, &self.gpu) };
+-                    let mut encoder = pass.with(&self.pipelines.underlines);
+-                    encoder.bind(
+-                        0,
+-                        &ShaderUnderlinesData {
+-                            globals,
+-                            b_underlines: instance_buf,
+-                        },
+-                    );
+-                    encoder.draw(0, 4, 0, underlines.len() as u32);
+-                }
+-                PrimitiveBatch::MonochromeSprites {
+-                    texture_id,
+-                    sprites,
+-                } => {
+-                    let tex_info = self.atlas.get_texture_info(texture_id);
+-                    let instance_buf =
+-                        unsafe { self.instance_belt.alloc_typed(sprites, &self.gpu) };
+-                    let mut encoder = pass.with(&self.pipelines.mono_sprites);
+-                    encoder.bind(
+-                        0,
+-                        &ShaderMonoSpritesData {
+-                            globals,
+-                            gamma_ratios: self.rendering_parameters.gamma_ratios,
+-                            grayscale_enhanced_contrast: self
+-                                .rendering_parameters
+-                                .grayscale_enhanced_contrast,
+-                            t_sprite: tex_info.raw_view,
+-                            s_sprite: self.atlas_sampler,
+-                            b_mono_sprites: instance_buf,
+-                        },
+-                    );
+-                    encoder.draw(0, 4, 0, sprites.len() as u32);
+-                }
+-                PrimitiveBatch::PolychromeSprites {
+-                    texture_id,
+-                    sprites,
+-                } => {
+-                    let tex_info = self.atlas.get_texture_info(texture_id);
+-                    let instance_buf =
+-                        unsafe { self.instance_belt.alloc_typed(sprites, &self.gpu) };
+-                    let mut encoder = pass.with(&self.pipelines.poly_sprites);
++
+                     encoder.bind(
+                         0,
+-                        &ShaderPolySpritesData {
++                        &ShaderSurfacesData {
+                             globals,
+-                            t_sprite: tex_info.raw_view,
+-                            s_sprite: self.atlas_sampler,
+-                            b_poly_sprites: instance_buf,
++                            surface_locals: SurfaceParams {
++                                bounds: surface.bounds.into(),
++                                content_mask: surface.content_mask.bounds.into(),
++                            },
++                            t_y,
++                            t_cb_cr,
++                            s_surface: self.shared.atlas_sampler,
+                         },
+                     );
+-                    encoder.draw(0, 4, 0, sprites.len() as u32);
+-                }
+-                PrimitiveBatch::Surfaces(surfaces) => {
+-                    let mut _encoder = pass.with(&self.pipelines.surfaces);
+-
+-                    for surface in surfaces {
+-                        #[cfg(not(target_os = "macos"))]
+-                        {
+-                            let _ = surface;
+-                            continue;
+-                        };
+-
+-                        #[cfg(target_os = "macos")]
+-                        {
+-                            let (t_y, t_cb_cr) = unsafe {
+-                                use core_foundation::base::TCFType as _;
+-                                use std::ptr;
+-
+-                                assert_eq!(
+-                                        surface.image_buffer.get_pixel_format(),
+-                                        core_video::pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+-                                    );
+-
+-                                let y_texture = self
+-                                    .core_video_texture_cache
+-                                    .create_texture_from_image(
+-                                        surface.image_buffer.as_concrete_TypeRef(),
+-                                        ptr::null(),
+-                                        metal::MTLPixelFormat::R8Unorm,
+-                                        surface.image_buffer.get_width_of_plane(0),
+-                                        surface.image_buffer.get_height_of_plane(0),
+-                                        0,
+-                                    )
+-                                    .unwrap();
+-                                let cb_cr_texture = self
+-                                    .core_video_texture_cache
+-                                    .create_texture_from_image(
+-                                        surface.image_buffer.as_concrete_TypeRef(),
+-                                        ptr::null(),
+-                                        metal::MTLPixelFormat::RG8Unorm,
+-                                        surface.image_buffer.get_width_of_plane(1),
+-                                        surface.image_buffer.get_height_of_plane(1),
+-                                        1,
+-                                    )
+-                                    .unwrap();
+-                                (
+-                                    gpu::TextureView::from_metal_texture(
+-                                        &objc2::rc::Retained::retain(
+-                                            foreign_types::ForeignTypeRef::as_ptr(
+-                                                y_texture.as_texture_ref(),
+-                                            )
+-                                                as *mut objc2::runtime::ProtocolObject<
+-                                                    dyn objc2_metal::MTLTexture,
+-                                                >,
+-                                        )
+-                                        .unwrap(),
+-                                        gpu::TexelAspects::COLOR,
+-                                    ),
+-                                    gpu::TextureView::from_metal_texture(
+-                                        &objc2::rc::Retained::retain(
+-                                            foreign_types::ForeignTypeRef::as_ptr(
+-                                                cb_cr_texture.as_texture_ref(),
+-                                            )
+-                                                as *mut objc2::runtime::ProtocolObject<
+-                                                    dyn objc2_metal::MTLTexture,
+-                                                >,
+-                                        )
+-                                        .unwrap(),
+-                                        gpu::TexelAspects::COLOR,
+-                                    ),
+-                                )
+-                            };
+ 
+-                            _encoder.bind(
+-                                0,
+-                                &ShaderSurfacesData {
+-                                    globals,
+-                                    surface_locals: SurfaceParams {
+-                                        bounds: surface.bounds.into(),
+-                                        content_mask: surface.content_mask.bounds.into(),
+-                                    },
+-                                    t_y,
+-                                    t_cb_cr,
+-                                    s_surface: self.atlas_sampler,
+-                                },
+-                            );
+-
+-                            _encoder.draw(0, 4, 0, 1);
+-                        }
+-                    }
++                    encoder.draw(0, 4, 0, 1);
+                 }
+             }
+         }
+-        drop(pass);
+-
+-        self.command_encoder.present(frame);
+-        let sync_point = self.gpu.submit(&mut self.command_encoder);
+-
+-        profiling::scope!("finish");
+-        self.instance_belt.flush(&sync_point);
+-        self.atlas.after_frame(&sync_point);
+-
+-        self.wait_for_gpu();
+-        self.last_sync_point = Some(sync_point);
+     }
+ }
+ 
+-fn create_path_intermediate_texture(
++pub(super) fn create_path_intermediate_texture(
+     gpu: &gpu::Context,
+     format: gpu::TextureFormat,
+     width: u32,
+@@ -952,7 +1118,7 @@ fn create_path_intermediate_texture(
+     (texture, texture_view)
+ }
+ 
+-fn create_msaa_texture_if_needed(
++pub(super) fn create_msaa_texture_if_needed(
+     gpu: &gpu::Context,
+     format: gpu::TextureFormat,
+     width: u32,
+@@ -991,10 +1157,11 @@ fn create_msaa_texture_if_needed(
+ }
+ 
+ /// A set of parameters that can be set using a corresponding environment variable.
+-struct RenderingParameters {
++#[derive(Clone)]
++pub(super) struct RenderingParameters {
+     // Env var: ZED_PATH_SAMPLE_COUNT
+     // workaround for https://github.com/zed-industries/zed/issues/26143
+-    path_sample_count: u32,
++    pub(super) path_sample_count: u32,
+ 
+     // Env var: ZED_FONTS_GAMMA
+     // Allowed range [1.0, 2.2], other values are clipped
+diff --git a/crates/gpui/src/platform/linux/wayland/window.rs b/crates/gpui/src/platform/linux/wayland/window.rs
+index 6b4dad3b39..59a99a6fbf 100644
+--- a/crates/gpui/src/platform/linux/wayland/window.rs
++++ b/crates/gpui/src/platform/linux/wayland/window.rs
+@@ -1388,6 +1388,21 @@ impl PlatformWindow for WaylandWindow {
+     fn gpu_specs(&self) -> Option<GpuSpecs> {
+         self.borrow().renderer.gpu_specs().into()
+     }
++
++    #[cfg(feature = "render-to-texture")]
++    fn create_offscreen_renderer(
++        &self,
++        max_texture_size: crate::Size<crate::DevicePixels>,
++    ) -> Option<Box<dyn crate::platform::PlatformOffscreenRenderer>> {
++        let state = self.borrow();
++        let max_size = blade_graphics::Extent {
++            width: max_texture_size.width.0 as u32,
++            height: max_texture_size.height.0 as u32,
++            depth: 1,
++        };
++        let offscreen = state.renderer.create_offscreen_renderer(max_size);
++        Some(Box::new(offscreen))
++    }
+ }
+ 
+ fn update_window(mut state: RefMut<WaylandWindowState>) {
+diff --git a/crates/gpui/src/platform/linux/x11/window.rs b/crates/gpui/src/platform/linux/x11/window.rs
+index 46d1cbd325..a8bf92bb59 100644
+--- a/crates/gpui/src/platform/linux/x11/window.rs
++++ b/crates/gpui/src/platform/linux/x11/window.rs
+@@ -1742,4 +1742,19 @@ impl PlatformWindow for X11Window {
+     fn gpu_specs(&self) -> Option<GpuSpecs> {
+         self.0.state.borrow().renderer.gpu_specs().into()
+     }
++
++    #[cfg(feature = "render-to-texture")]
++    fn create_offscreen_renderer(
++        &self,
++        max_texture_size: crate::Size<crate::DevicePixels>,
++    ) -> Option<Box<dyn crate::platform::PlatformOffscreenRenderer>> {
++        let state = self.0.state.borrow();
++        let max_size = blade_graphics::Extent {
++            width: max_texture_size.width.0 as u32,
++            height: max_texture_size.height.0 as u32,
++            depth: 1,
++        };
++        let offscreen = state.renderer.create_offscreen_renderer(max_size);
++        Some(Box::new(offscreen))
++    }
+ }
+diff --git a/crates/gpui/src/platform/offscreen_rendering.rs b/crates/gpui/src/platform/offscreen_rendering.rs
+new file mode 100644
+index 0000000000..b36c156bb7
+--- /dev/null
++++ b/crates/gpui/src/platform/offscreen_rendering.rs
+@@ -0,0 +1,164 @@
++//! Offscreen rendering support for render-to-texture operations.
++//!
++//! This module provides the platform-agnostic types and traits for rendering
++//! GPUI scenes to GPU textures without displaying them on screen.
++//!
++//! # Feature Flag
++//!
++//! This module is only available when the `render-to-texture` feature is enabled.
++
++use crate::{DevicePixels, Scene, Size};
++
++/// A unique identifier for an offscreen texture.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub struct OffscreenTextureId(pub u64);
++
++impl OffscreenTextureId {
++    /// Creates a new texture ID from a raw value.
++    pub fn from_raw(id: u64) -> Self {
++        Self(id)
++    }
++
++    /// Returns the raw ID value.
++    pub fn as_raw(&self) -> u64 {
++        self.0
++    }
++}
++
++/// Information about an offscreen texture.
++#[derive(Debug, Clone)]
++pub struct OffscreenTextureInfo {
++    /// The unique identifier for this texture.
++    pub id: OffscreenTextureId,
++    /// The size of the texture in device pixels.
++    pub size: Size<DevicePixels>,
++}
++
++/// Raw texture data read back from the GPU.
++///
++/// Contains RGBA pixel data that can be used for saving to files,
++/// further processing, or any other purpose.
++#[derive(Debug, Clone)]
++pub struct TextureData {
++    /// RGBA pixel data, row-major order, 4 bytes per pixel.
++    /// The data is in standard RGBA format (not premultiplied).
++    pub data: Vec<u8>,
++    /// Width of the texture in pixels.
++    pub width: u32,
++    /// Height of the texture in pixels.
++    pub height: u32,
++}
++
++impl TextureData {
++    /// Creates a new TextureData from raw components.
++    pub fn new(data: Vec<u8>, width: u32, height: u32) -> Self {
++        debug_assert_eq!(
++            data.len(),
++            (width * height * 4) as usize,
++            "Data length must match width * height * 4 bytes"
++        );
++        Self {
++            data,
++            width,
++            height,
++        }
++    }
++
++    /// Returns the size in pixels.
++    pub fn size(&self) -> (u32, u32) {
++        (self.width, self.height)
++    }
++
++    /// Returns the raw RGBA data as a slice.
++    pub fn as_bytes(&self) -> &[u8] {
++        &self.data
++    }
++
++    /// Consumes self and returns the raw RGBA data.
++    pub fn into_bytes(self) -> Vec<u8> {
++        self.data
++    }
++
++    /// Returns the pixel at the given coordinates as [R, G, B, A].
++    ///
++    /// # Panics
++    ///
++    /// Panics if the coordinates are out of bounds.
++    pub fn pixel_at(&self, x: u32, y: u32) -> [u8; 4] {
++        assert!(x < self.width && y < self.height, "Pixel coordinates out of bounds");
++        let idx = ((y * self.width + x) * 4) as usize;
++        [
++            self.data[idx],
++            self.data[idx + 1],
++            self.data[idx + 2],
++            self.data[idx + 3],
++        ]
++    }
++}
++
++/// A platform-agnostic trait for offscreen rendering to textures.
++///
++/// This trait enables rendering GPUI scenes to GPU textures without displaying
++/// them on screen. Implementations are provided by platform-specific backends.
++pub(crate) trait PlatformOffscreenRenderer: Send {
++    /// Creates a new texture that can be rendered to.
++    ///
++    /// # Arguments
++    ///
++    /// * `size` - The size of the texture in device pixels
++    ///
++    /// # Returns
++    ///
++    /// Information about the created texture, including its ID.
++    fn create_texture(&mut self, size: Size<DevicePixels>) -> OffscreenTextureInfo;
++
++    /// Renders a scene to the specified texture.
++    ///
++    /// # Arguments
++    ///
++    /// * `scene` - The scene to render
++    /// * `texture_id` - The ID of the texture to render to
++    fn draw_to_texture(&mut self, scene: &Scene, texture_id: OffscreenTextureId);
++
++    /// Reads a texture's contents back from the GPU.
++    ///
++    /// This method copies the texture data from GPU memory to CPU memory,
++    /// converting from the internal BGRA format to standard RGBA.
++    ///
++    /// # Arguments
++    ///
++    /// * `texture_id` - The ID of the texture to read
++    ///
++    /// # Returns
++    ///
++    /// The texture data as RGBA bytes, or an error if the texture doesn't exist
++    /// or the read operation fails.
++    ///
++    /// # Example
++    ///
++    /// ```ignore
++    /// let texture_data = renderer.read_texture(texture_id)?;
++    /// // Use the image crate to save to PNG:
++    /// image::save_buffer(
++    ///     "output.png",
++    ///     &texture_data.data,
++    ///     texture_data.width,
++    ///     texture_data.height,
++    ///     image::ColorType::Rgba8,
++    /// )?;
++    /// ```
++    fn read_texture(&mut self, texture_id: OffscreenTextureId) -> anyhow::Result<TextureData>;
++
++    /// Destroys a texture, freeing its GPU resources.
++    ///
++    /// # Arguments
++    ///
++    /// * `texture_id` - The ID of the texture to destroy
++    fn destroy_texture(&mut self, texture_id: OffscreenTextureId);
++
++    /// Returns the maximum texture size supported by this renderer.
++    fn max_texture_size(&self) -> Size<DevicePixels>;
++
++    /// Destroys the offscreen renderer and releases all its resources.
++    fn destroy(&mut self);
++}
+diff --git a/crates/gpui/src/scene.rs b/crates/gpui/src/scene.rs
+index 758d06e597..bcc57053ec 100644
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -20,8 +20,12 @@ pub(crate) type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
+ 
+ pub(crate) type DrawOrder = u32;
+ 
++/// A collection of rendering primitives that can be drawn to a GPU surface.
++///
++/// Scenes are built by calling paint methods (like `paint_quad`, `paint_glyph`, etc.)
++/// and then rendered to either a window surface or an offscreen texture.
+ #[derive(Default)]
+-pub(crate) struct Scene {
++pub struct Scene {
+     pub(crate) paint_operations: Vec<PaintOperation>,
+     primitive_bounds: BoundsTree<ScaledPixels>,
+     layer_stack: Vec<DrawOrder>,
+@@ -35,6 +39,7 @@ pub(crate) struct Scene {
+ }
+ 
+ impl Scene {
++    /// Clear all primitives from the scene.
+     pub fn clear(&mut self) {
+         self.paint_operations.clear();
+         self.primitive_bounds.clear();
+@@ -48,10 +53,12 @@ impl Scene {
+         self.surfaces.clear();
+     }
+ 
++    /// Returns the number of paint operations in the scene.
+     pub fn len(&self) -> usize {
+         self.paint_operations.len()
+     }
+ 
++    /// Push a layer for z-ordering. Elements painted after this will be above previous elements.
+     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
+         let order = self.primitive_bounds.insert(bounds);
+         self.layer_stack.push(order);
+@@ -59,12 +66,14 @@ impl Scene {
+             .push(PaintOperation::StartLayer(bounds));
+     }
+ 
++    /// Pop the current layer, returning to the previous z-order level.
+     pub fn pop_layer(&mut self) {
+         self.layer_stack.pop();
+         self.paint_operations.push(PaintOperation::EndLayer);
+     }
+ 
+-    pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
++    /// Insert a primitive into the scene.
++    pub(crate) fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
+         let mut primitive = primitive.into();
+         let clipped_bounds = primitive
+             .bounds()
+@@ -114,6 +123,7 @@ impl Scene {
+             .push(PaintOperation::Primitive(primitive));
+     }
+ 
++    /// Replay paint operations from a previous scene into this one.
+     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
+         for operation in &prev_scene.paint_operations[range] {
+             match operation {
+@@ -124,6 +134,7 @@ impl Scene {
+         }
+     }
+ 
++    /// Finish building the scene by sorting primitives for correct rendering order.
+     pub fn finish(&mut self) {
+         self.shadows.sort_by_key(|shadow| shadow.order);
+         self.quads.sort_by_key(|quad| quad.order);
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 8df421feb9..116d07139b 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -1,5 +1,7 @@
+ #[cfg(any(feature = "inspector", debug_assertions))]
+ use crate::Inspector;
++#[cfg(feature = "render-to-texture")]
++use crate::platform::{OffscreenTextureId, OffscreenTextureInfo, PlatformOffscreenRenderer, TextureData};
+ use crate::{
+     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
+     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
+@@ -1547,6 +1549,11 @@ impl Window {
+         &self.text_system
+     }
+ 
++    /// Accessor for the sprite atlas (used for caching glyphs and images).
++    pub fn sprite_atlas(&self) -> &Arc<dyn PlatformAtlas> {
++        &self.sprite_atlas
++    }
++
+     /// The current text style. Which is composed of all the style refinements provided to `with_text_style`.
+     pub fn text_style(&self) -> TextStyle {
+         let mut style = TextStyle::default();
+@@ -4605,6 +4612,68 @@ impl Window {
+         self.platform_window.gpu_specs()
+     }
+ 
++    /// Creates an offscreen renderer for render-to-texture operations.
++    ///
++    /// The offscreen renderer shares GPU resources with the main window renderer
++    /// but maintains its own command buffers for isolated rendering. This enables
++    /// rendering scenes to textures without interfering with the main window.
++    ///
++    /// # Arguments
++    ///
++    /// * `max_texture_size` - Maximum size of textures the renderer will create
++    ///
++    /// # Returns
++    ///
++    /// An offscreen renderer, or `None` if the platform doesn't support it.
++    ///
++    /// # Example
++    ///
++    /// ```ignore
++    /// let mut offscreen = window.create_offscreen_renderer(size(DevicePixels(1024), DevicePixels(1024)))?;
++    /// let texture = offscreen.create_texture(size(DevicePixels(512), DevicePixels(512)));
++    /// offscreen.draw_to_texture(&scene, texture.id);
++    /// ```
++    #[cfg(feature = "render-to-texture")]
++    pub fn create_offscreen_renderer(
++        &self,
++        max_texture_size: Size<DevicePixels>,
++    ) -> Option<OffscreenRenderer> {
++        self.platform_window
++            .create_offscreen_renderer(max_texture_size)
++            .map(OffscreenRenderer::new)
++    }
++
++    /// Creates an offscreen render context for building scenes without the full Window overhead.
++    ///
++    /// This context shares the text system and sprite atlas with this window, allowing
++    /// you to render text and other primitives to a scene that can then be rendered
++    /// to a texture via `OffscreenRenderer::draw_scene_to_texture`.
++    ///
++    /// # Arguments
++    ///
++    /// * `viewport_size` - Size of the rendering viewport in logical pixels
++    ///
++    /// # Example
++    ///
++    /// ```ignore
++    /// let mut ctx = window.create_offscreen_render_context(size(px(256.0), px(256.0)));
++    /// ctx.paint_quad(fill(bounds, color));
++    /// let scene = ctx.take_scene();
++    /// offscreen_renderer.draw_scene_to_texture(&scene, texture_id);
++    /// ```
++    #[cfg(feature = "render-to-texture")]
++    pub fn create_offscreen_render_context(
++        &self,
++        viewport_size: Size<Pixels>,
++    ) -> crate::OffscreenRenderContext {
++        crate::OffscreenRenderContext::new(
++            viewport_size,
++            self.scale_factor(),
++            self.text_system.clone(),
++            self.sprite_atlas.clone(),
++        )
++    }
++
+     /// Perform titlebar double-click action.
+     /// This is macOS specific.
+     pub fn titlebar_double_click(&self) {
+@@ -4857,6 +4926,129 @@ slotmap::new_key_type! {
+     pub struct WindowId;
+ }
+ 
++/// An offscreen renderer for render-to-texture operations.
++///
++/// This renderer shares GPU resources with the main window renderer but maintains
++/// its own command buffers for isolated rendering. Use this to render GPUI scenes
++/// to textures without interfering with the main window rendering.
++///
++/// # Example
++///
++/// ```ignore
++/// // Create an offscreen renderer
++/// let mut offscreen = window.create_offscreen_renderer(size(DevicePixels(1024), DevicePixels(1024)))?;
++///
++/// // Create a texture to render to
++/// let texture_info = offscreen.create_texture(size(DevicePixels(512), DevicePixels(512)));
++///
++/// // Render a scene to the texture
++/// offscreen.draw_scene_to_texture(&scene, texture_info.id);
++///
++/// // Clean up
++/// offscreen.destroy_texture(texture_info.id);
++/// offscreen.destroy();
++/// ```
++#[cfg(feature = "render-to-texture")]
++pub struct OffscreenRenderer {
++    inner: Box<dyn PlatformOffscreenRenderer>,
++}
++
++#[cfg(feature = "render-to-texture")]
++impl OffscreenRenderer {
++    fn new(inner: Box<dyn PlatformOffscreenRenderer>) -> Self {
++        Self { inner }
++    }
++
++    /// Creates a new texture that can be rendered to.
++    ///
++    /// # Arguments
++    ///
++    /// * `size` - The size of the texture in device pixels
++    ///
++    /// # Returns
++    ///
++    /// Information about the created texture, including its ID for use with
++    /// `draw_scene_to_texture` and `destroy_texture`.
++    pub fn create_texture(&mut self, size: Size<DevicePixels>) -> OffscreenTextureInfo {
++        self.inner.create_texture(size)
++    }
++
++    /// Renders a scene to the specified texture.
++    ///
++    /// Use this with `OffscreenRenderContext` to render primitives to a texture:
++    ///
++    /// ```ignore
++    /// let mut ctx = OffscreenRenderContext::new(...);
++    /// ctx.paint_quad(...);
++    /// let scene = ctx.take_scene();
++    /// offscreen_renderer.draw_scene_to_texture(&scene, texture_id);
++    /// ```
++    ///
++    /// # Arguments
++    ///
++    /// * `scene` - The scene to render (built with `OffscreenRenderContext`)
++    /// * `texture_id` - The ID of the texture to render to
++    pub fn draw_scene_to_texture(&mut self, scene: &Scene, texture_id: OffscreenTextureId) {
++        self.inner.draw_to_texture(scene, texture_id)
++    }
++
++    /// Destroys a texture, freeing its GPU resources.
++    ///
++    /// # Arguments
++    ///
++    /// * `texture_id` - The ID of the texture to destroy
++    pub fn destroy_texture(&mut self, texture_id: OffscreenTextureId) {
++        self.inner.destroy_texture(texture_id)
++    }
++
++    /// Reads a texture's contents back from the GPU as RGBA data.
++    ///
++    /// This method copies the texture data from GPU memory to CPU memory,
++    /// converting from the internal format to standard RGBA.
++    ///
++    /// # Arguments
++    ///
++    /// * `texture_id` - The ID of the texture to read
++    ///
++    /// # Returns
++    ///
++    /// The texture data as RGBA bytes, or an error if the texture doesn't exist
++    /// or the read operation fails.
++    ///
++    /// # Example
++    ///
++    /// ```ignore
++    /// offscreen_renderer.draw_scene_to_texture(&scene, texture_id);
++    /// let texture_data = offscreen_renderer.read_texture(texture_id)?;
++    /// // Save to PNG using the image crate:
++    /// image::save_buffer(
++    ///     "output.png",
++    ///     texture_data.as_bytes(),
++    ///     texture_data.width,
++    ///     texture_data.height,
++    ///     image::ColorType::Rgba8,
++    /// )?;
++    /// ```
++    pub fn read_texture(
++        &mut self,
++        texture_id: OffscreenTextureId,
++    ) -> anyhow::Result<TextureData> {
++        self.inner.read_texture(texture_id)
++    }
++
++    /// Returns the maximum texture size supported by this renderer.
++    pub fn max_texture_size(&self) -> Size<DevicePixels> {
++        self.inner.max_texture_size()
++    }
++
++    /// Destroys the offscreen renderer and releases all its resources.
++    ///
++    /// This should be called when the renderer is no longer needed.
++    pub fn destroy(&mut self) {
++        self.inner.destroy()
++    }
++}
++
+ impl WindowId {
+     /// Converts this window ID to a `u64`.
+     pub fn as_u64(&self) -> u64 {
