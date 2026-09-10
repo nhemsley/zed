@@ -81,14 +81,30 @@ impl WgpuContext {
         Self::new_with_options(instance, surface, compositor_gpu, true)
     }
 
+    /// Creates a context that never presents to a surface, for rendering into
+    /// offscreen textures only (headless tests, benchmarks, texture windows
+    /// opened before any real window exists).
     #[cfg(not(target_family = "wasm"))]
-    fn new_with_options(
-        instance: wgpu::Instance,
-        surface: &wgpu::Surface<'_>,
-        compositor_gpu: Option<CompositorGpuHint>,
-        reject_software: bool,
-    ) -> anyhow::Result<Self> {
-        let device_id_filter = match std::env::var("ZED_DEVICE_ID") {
+    pub fn new_headless(instance: wgpu::Instance) -> anyhow::Result<Self> {
+        let device_id_filter = Self::device_id_filter_from_env();
+        let (adapter, device, queue, dual_source_blending, color_texture_format) =
+            gpui::block_on(Self::select_adapter_and_device_headless(
+                &instance,
+                device_id_filter,
+            ))?;
+        Ok(Self::from_parts(
+            instance,
+            adapter,
+            device,
+            queue,
+            dual_source_blending,
+            color_texture_format,
+        ))
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn device_id_filter_from_env() -> Option<u32> {
+        match std::env::var("ZED_DEVICE_ID") {
             Ok(val) => parse_pci_id(&val)
                 .context("Failed to parse device ID from `ZED_DEVICE_ID` environment variable")
                 .log_err(),
@@ -98,7 +114,17 @@ impl WgpuContext {
                     .log_err();
                 None
             }
-        };
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn new_with_options(
+        instance: wgpu::Instance,
+        surface: &wgpu::Surface<'_>,
+        compositor_gpu: Option<CompositorGpuHint>,
+        reject_software: bool,
+    ) -> anyhow::Result<Self> {
+        let device_id_filter = Self::device_id_filter_from_env();
 
         // Select an adapter by actually testing surface configuration with the real device.
         // This is the only reliable way to determine compatibility on hybrid GPU systems.
@@ -111,6 +137,25 @@ impl WgpuContext {
                 reject_software,
             ))?;
 
+        Ok(Self::from_parts(
+            instance,
+            adapter,
+            device,
+            queue,
+            dual_source_blending,
+            color_texture_format,
+        ))
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn from_parts(
+        instance: wgpu::Instance,
+        adapter: wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        dual_source_blending: bool,
+        color_texture_format: TextureFormat,
+    ) -> Self {
         let device_lost = Arc::new(AtomicBool::new(false));
         device.set_device_lost_callback({
             let device_lost = Arc::clone(&device_lost);
@@ -129,7 +174,7 @@ impl WgpuContext {
         );
 
         let backend = WgpuBackend::Native(adapter.get_info().backend);
-        Ok(Self {
+        Self {
             instance,
             adapter,
             device: Arc::new(device),
@@ -138,7 +183,7 @@ impl WgpuContext {
             dual_source_blending,
             color_texture_format,
             device_lost,
-        })
+        }
     }
 
     #[cfg(target_family = "wasm")]
@@ -288,12 +333,25 @@ impl WgpuContext {
 
     #[cfg(not(target_family = "wasm"))]
     pub fn instance(display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) -> wgpu::Instance {
+        Self::instance_with_display(Some(display))
+    }
+
+    /// An instance that is not bound to any display server, for headless use.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn headless_instance() -> wgpu::Instance {
+        Self::instance_with_display(None)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn instance_with_display(
+        display: Option<Box<dyn wgpu::wgt::WgpuHasDisplayHandle>>,
+    ) -> wgpu::Instance {
         wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-            display: Some(display),
+            display,
         })
     }
 
@@ -331,6 +389,106 @@ impl WgpuContext {
         bool,
         TextureFormat,
     )> {
+        let adapters =
+            Self::enumerate_adapters_by_priority(instance, device_id_filter, compositor_gpu)
+                .await?;
+
+        // Test each adapter by creating a device and configuring the surface
+        for adapter in adapters {
+            let info = adapter.get_info();
+
+            if reject_software && info.device_type == wgpu::DeviceType::Cpu {
+                log::info!(
+                    "Skipping software renderer: {} ({:?})",
+                    info.name,
+                    info.backend
+                );
+                continue;
+            }
+
+            log::info!("Testing adapter: {} ({:?})...", info.name, info.backend);
+
+            match Self::try_adapter_with_surface(&adapter, surface).await {
+                Ok((device, queue, dual_source_blending, color_atlas_texture_format)) => {
+                    log::info!(
+                        "Selected GPU (passed configuration test): {} ({:?})",
+                        info.name,
+                        info.backend
+                    );
+                    return Ok((
+                        adapter,
+                        device,
+                        queue,
+                        dual_source_blending,
+                        color_atlas_texture_format,
+                    ));
+                }
+                Err(e) => {
+                    log::info!(
+                        "  Adapter {} ({:?}) failed: {}, trying next...",
+                        info.name,
+                        info.backend,
+                        e
+                    );
+                }
+            }
+        }
+
+        anyhow::bail!("No GPU adapter found that can configure the display surface")
+    }
+
+    /// Like [`Self::select_adapter_and_device`] but without a surface to test
+    /// against: the first adapter in priority order that yields a device wins.
+    #[cfg(not(target_family = "wasm"))]
+    async fn select_adapter_and_device_headless(
+        instance: &wgpu::Instance,
+        device_id_filter: Option<u32>,
+    ) -> anyhow::Result<(
+        wgpu::Adapter,
+        wgpu::Device,
+        wgpu::Queue,
+        bool,
+        TextureFormat,
+    )> {
+        let adapters = Self::enumerate_adapters_by_priority(instance, device_id_filter, None).await?;
+
+        for adapter in adapters {
+            let info = adapter.get_info();
+            match Self::create_device(&adapter).await {
+                Ok((device, queue, dual_source_blending, color_atlas_texture_format)) => {
+                    log::info!(
+                        "Selected GPU (headless): {} ({:?})",
+                        info.name,
+                        info.backend
+                    );
+                    return Ok((
+                        adapter,
+                        device,
+                        queue,
+                        dual_source_blending,
+                        color_atlas_texture_format,
+                    ));
+                }
+                Err(e) => {
+                    log::info!(
+                        "  Adapter {} ({:?}) failed: {}, trying next...",
+                        info.name,
+                        info.backend,
+                        e
+                    );
+                }
+            }
+        }
+
+        anyhow::bail!("No GPU adapter found that can create a device")
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    async fn enumerate_adapters_by_priority(
+        instance: &wgpu::Instance,
+        device_id_filter: Option<u32>,
+        compositor_gpu: Option<&CompositorGpuHint>,
+    ) -> anyhow::Result<Vec<wgpu::Adapter>> {
         let mut adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::all()).await;
 
         if adapters.is_empty() {
@@ -410,48 +568,7 @@ impl WgpuContext {
             );
         }
 
-        // Test each adapter by creating a device and configuring the surface
-        for adapter in adapters {
-            let info = adapter.get_info();
-
-            if reject_software && info.device_type == wgpu::DeviceType::Cpu {
-                log::info!(
-                    "Skipping software renderer: {} ({:?})",
-                    info.name,
-                    info.backend
-                );
-                continue;
-            }
-
-            log::info!("Testing adapter: {} ({:?})...", info.name, info.backend);
-
-            match Self::try_adapter_with_surface(&adapter, surface).await {
-                Ok((device, queue, dual_source_blending, color_atlas_texture_format)) => {
-                    log::info!(
-                        "Selected GPU (passed configuration test): {} ({:?})",
-                        info.name,
-                        info.backend
-                    );
-                    return Ok((
-                        adapter,
-                        device,
-                        queue,
-                        dual_source_blending,
-                        color_atlas_texture_format,
-                    ));
-                }
-                Err(e) => {
-                    log::info!(
-                        "  Adapter {} ({:?}) failed: {}, trying next...",
-                        info.name,
-                        info.backend,
-                        e
-                    );
-                }
-            }
-        }
-
-        anyhow::bail!("No GPU adapter found that can configure the display surface")
+        Ok(adapters)
     }
 
     /// Try to use an adapter with a surface by creating a device and testing configuration.

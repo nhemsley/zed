@@ -26,6 +26,31 @@ pub(crate) use x11::*;
 
 use std::rc::Rc;
 
+/// Returns a renderer that draws into an offscreen texture, sharing one
+/// headless GPU context per thread so test windows and texture windows on
+/// the same thread share a device.
+#[cfg(any(feature = "wayland", feature = "x11"))]
+pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRenderer>> {
+    use anyhow::Context as _;
+    use gpui_util::ResultExt as _;
+
+    thread_local! {
+        static HEADLESS_GPU_CONTEXT: gpui_wgpu::GpuContext =
+            Rc::new(std::cell::RefCell::new(None));
+    }
+
+    let gpu_context = HEADLESS_GPU_CONTEXT.with(|context| context.clone());
+    let renderer = gpui_wgpu::WgpuHeadlessRenderer::new(gpu_context)
+        .context("Failed to create headless wgpu renderer")
+        .log_err()?;
+    Some(Box::new(renderer))
+}
+
+#[cfg(not(any(feature = "wayland", feature = "x11")))]
+pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRenderer>> {
+    None
+}
+
 /// Returns the default platform implementation for the current OS.
 pub fn current_platform(headless: bool) -> Rc<dyn gpui::Platform> {
     #[cfg(feature = "x11")]

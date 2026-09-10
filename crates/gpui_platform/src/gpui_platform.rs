@@ -90,9 +90,66 @@ pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRende
         ))
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        gpui_linux::current_headless_renderer()
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd"
+    )))]
     {
         None
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "test-support",
+    any(target_os = "linux", target_os = "freebsd")
+))]
+mod linux_tests {
+    use super::*;
+    use gpui::{AppContext as _, Context, HeadlessAppContext, IntoElement, Render, Window, div, px, rgb, size};
+    use std::sync::Arc;
+
+    struct RedBox;
+
+    impl Render for RedBox {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().bg(rgb(0xff0000))
+        }
+    }
+
+    #[test]
+    fn headless_window_renders_through_wgpu() {
+        if current_headless_renderer().is_none() {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        }
+
+        let text_system = current_platform(true).text_system();
+        let mut cx = HeadlessAppContext::with_platform(
+            text_system,
+            Arc::new(()),
+            current_headless_renderer,
+        );
+        let window = cx
+            .open_window(size(px(16.), px(16.)), |_, cx| cx.new(|_| RedBox))
+            .expect("headless window should open");
+        cx.run_until_parked();
+
+        let image = cx
+            .capture_screenshot(window.into())
+            .expect("screenshot should render through the wgpu headless renderer");
+        assert!(image.width() >= 16 && image.height() >= 16);
+        let pixel = image.get_pixel(image.width() / 2, image.height() / 2).0;
+        assert!(
+            pixel[0] > 200 && pixel[1] < 40 && pixel[2] < 40 && pixel[3] > 200,
+            "expected an opaque red pixel, got {pixel:?}"
+        );
     }
 }
 

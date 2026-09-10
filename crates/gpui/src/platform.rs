@@ -1018,15 +1018,16 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
 }
 
-/// A renderer for headless windows that can produce real rendered output.
-#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+/// A renderer for windows that have no presentation surface: headless test
+/// windows, benchmarks, and texture windows. It draws into an offscreen target
+/// owned by the renderer.
 pub trait PlatformHeadlessRenderer {
     /// Render a scene and return the result as an RGBA image.
     fn render_scene_to_image(
         &mut self,
         scene: &Scene,
         size: Size<DevicePixels>,
-    ) -> Result<RgbaImage>;
+    ) -> Result<image::RgbaImage>;
 
     /// Render a scene to an offscreen target without reading the result back.
     ///
