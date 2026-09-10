@@ -1,6 +1,7 @@
 # Texture Windows — Implementation Plan
 
-> Status: concrete plan, informed by a pass over current `main` (wgpu backend).
+> Status: milestones 1–3 landed on branch `textured` (see "Steps / milestones"
+> for what each delivered and where it deviates from the text below).
 > Supersedes the preliminary notes. The four branch summaries in `diffs/` are
 > Blade-era and kept **for reference only**; none of their code applies.
 
@@ -335,23 +336,40 @@ host frame.
 
 ## Steps / milestones
 
-1. **`gpui_wgpu`**: `render_to_view` factoring, optional surface,
-   `WgpuHeadlessRenderer` implementing `PlatformHeadlessRenderer`, lift the
-   trait's cfg. Wire it into `TestPlatform`'s `headless_renderer_factory` on
-   Linux and get one visual test rendering. *Standalone PR.*
-2. **`gpui_linux`**: `TextureWindow`, `Platform::open_texture_window`
-   (Wayland). Smoke test: open one, `draw`, `render_scene_to_image`, save PNG
-   (the old `render_to_texture` example, done properly).
-3. **`gpui` core, milestone A**: `App::open_texture_window`,
-   `paint_texture_window` backed by **readback → `RenderImage` → `img`-style
-   sprite** (CPU round trip, no atlas changes), attachment-by-painting,
-   depth-first frame driving, `set_texture_active`. Land
-   `texture-window-example.rs` as `crates/gpui/examples/texture_windows.rs`.
+1. **`gpui_wgpu`** — *done.* `render_to_view` factoring, optional surface,
+   `WgpuHeadlessRenderer` implementing `PlatformHeadlessRenderer`, trait cfg
+   lifted, wired into `gpui_platform::current_headless_renderer` on Linux
+   with a red-box visual test. Atlas external textures deferred to 4.
+2. **`gpui_linux`** — *done.* `TextureWindow`, `Platform::open_texture_window`
+   (Wayland; X11 errors). Smoke test draws, reads back, and writes a PNG when
+   `GPUI_TEXTURE_WINDOW_PNG_DIR` is set. Deviation: the platform takes
+   `TextureWindowOptions` (size, scale factor, background) rather than
+   `WindowParams`, so the child's scale factor is set at open time.
+3. **`gpui` core, milestone A** — *done.* `App::open_texture_window`,
+   `Window::paint_texture_window` (readback → `RenderImage` → `paint_image`),
+   `Window::set_texture_active`, synchronous `Window::resize`, depth-first
+   frame driving from the host's `on_request_frame`, and
+   `examples/texture_windows.rs`. Deviations from the design text above:
+   - Attachment persists once painted (until the child closes) instead of
+     being re-derived every frame: cached views replay their paint without
+     re-running it, so "painted last frame" is not observable.
+   - A dirty child marks its hosts dirty directly (through the child's
+     invalidator waker) rather than only waking their frame source, and the
+     host marks the views that painted the child dirty so the new frame is
+     re-uploaded instead of replayed from the view cache.
+   - Children that still want a frame after being drawn (animations via
+     `on_next_frame`) make the host re-arm its own frame source.
+   - `TestPlatform` opens texture windows through its headless renderer, and
+     `HeadlessAppContext::simulate_frame` drives a host's frame loop, so the
+     mechanics are tested without a GPU (`gpui`) and the pixels with one
+     (`gpui_platform` Linux tests).
 4. **`gpui` core, milestone B**: atlas external textures; swap readback for
    the zero-copy `PolychromeSprite` path. IME proxy and cursor-style relay
    helpers for hosts that want them.
 5. Cleanup: `render_to_image` gating, docs, `Application::headless()` parity,
-   X11 `open_texture_window` if trivial.
+   X11 `open_texture_window` if trivial. Known gap: headless adapter selection
+   does not validate pipeline creation, so a GL adapter without vertex storage
+   buffers panics at first draw (`LIBGL_ALWAYS_SOFTWARE=1` works around it).
 
 ## Alternatives considered
 

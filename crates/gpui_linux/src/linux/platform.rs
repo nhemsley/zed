@@ -35,8 +35,8 @@ use gpui::{
     Action, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle,
     DisplayId, ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
     PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Result, RunnableVariant, Task, ThermalState, WindowAppearance,
-    WindowButtonLayout, WindowParams,
+    PlatformWindow, Result, RunnableVariant, Task, TextureWindowOptions, ThermalState,
+    WindowAppearance, WindowButtonLayout, WindowParams,
 };
 #[cfg(any(feature = "wayland", feature = "x11"))]
 use gpui::{Pixels, Point, px};
@@ -91,7 +91,7 @@ pub(crate) trait LinuxClient {
     fn open_texture_window(
         &self,
         _handle: AnyWindowHandle,
-        _options: WindowParams,
+        _options: TextureWindowOptions,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
         anyhow::bail!(
             "texture windows are not supported by the {} client",
@@ -437,7 +437,7 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
     fn open_texture_window(
         &self,
         handle: AnyWindowHandle,
-        options: WindowParams,
+        options: TextureWindowOptions,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
         self.inner.open_texture_window(handle, options)
     }

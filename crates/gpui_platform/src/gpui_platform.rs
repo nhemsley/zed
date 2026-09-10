@@ -109,8 +109,9 @@ pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRende
 mod linux_tests {
     use super::*;
     use gpui::{
-        AppContext as _, Context, HeadlessAppContext, IntoElement, Render, Styled as _, Window,
-        div, px, rgb, size,
+        AnyWindowHandle, AppContext as _, Bounds, Context, HeadlessAppContext, IntoElement,
+        ParentElement as _, Render, Styled as _, TextureWindowOptions, Window, canvas, div, point,
+        px, rgb, size,
     };
     use std::sync::Arc;
 
@@ -145,6 +146,130 @@ mod linux_tests {
         assert!(
             pixel[0] > 200 && pixel[1] < 40 && pixel[2] < 40 && pixel[3] > 200,
             "expected an opaque red pixel, got {pixel:?}"
+        );
+    }
+
+    struct SolidColor {
+        color: u32,
+    }
+
+    impl Render for SolidColor {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().bg(rgb(self.color))
+        }
+    }
+
+    struct CompositesTextureWindow {
+        child: AnyWindowHandle,
+    }
+
+    impl Render for CompositesTextureWindow {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let child = self.child;
+            div().size_full().bg(rgb(0x0000ff)).child(
+                canvas(
+                    |_, _, _| {},
+                    move |_, _, window, cx| {
+                        let bounds = Bounds {
+                            origin: point(px(8.), px(8.)),
+                            size: size(px(16.), px(16.)),
+                        };
+                        window.paint_texture_window(&child, bounds, cx);
+                    },
+                )
+                .size_full(),
+            )
+        }
+    }
+
+    fn assert_pixel(pixel: [u8; 4], expected: [u8; 3], what: &str) {
+        let close = |actual: u8, expected: u8| actual.abs_diff(expected) < 40;
+        assert!(
+            close(pixel[0], expected[0])
+                && close(pixel[1], expected[1])
+                && close(pixel[2], expected[2])
+                && pixel[3] > 200,
+            "{what}: expected roughly {expected:?}, got {pixel:?}"
+        );
+    }
+
+    #[test]
+    fn texture_window_is_composited_into_its_host() {
+        if current_headless_renderer().is_none() {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        }
+
+        let text_system = current_platform(true).text_system();
+        let mut cx =
+            HeadlessAppContext::with_platform(text_system, Arc::new(()), current_headless_renderer);
+        let child = cx
+            .update(|cx| {
+                cx.open_texture_window(
+                    TextureWindowOptions {
+                        size: size(px(16.), px(16.)),
+                        scale_factor: 2.0,
+                        ..TextureWindowOptions::default()
+                    },
+                    |_, cx| cx.new(|_| SolidColor { color: 0xff0000 }),
+                )
+            })
+            .expect("texture window should open on the test platform");
+        let host = cx
+            .open_window(size(px(32.), px(32.)), |_, cx| {
+                cx.new(|_| CompositesTextureWindow {
+                    child: child.into(),
+                })
+            })
+            .expect("host window should open");
+        cx.run_until_parked();
+
+        // The test platform renders at 2x, so logical (8..24) is device (16..48).
+        let image = cx
+            .capture_screenshot(host.into())
+            .expect("host screenshot should render");
+        assert_eq!(image.dimensions(), (64, 64));
+        assert_pixel(
+            image.get_pixel(32, 32).0,
+            [255, 0, 0],
+            "texture window content",
+        );
+        assert_pixel(
+            image.get_pixel(4, 4).0,
+            [0, 0, 255],
+            "host background outside the texture",
+        );
+        assert_pixel(
+            image.get_pixel(60, 60).0,
+            [0, 0, 255],
+            "host background past the texture",
+        );
+
+        // A change inside the texture window shows up in the host after the
+        // host's next frame, without anything else touching the host.
+        cx.update(|cx| {
+            child
+                .update(cx, |view, _, cx| {
+                    view.color = 0x00ff00;
+                    cx.notify();
+                })
+                .expect("child window should still be open");
+        });
+        cx.simulate_frame(host.into())
+            .expect("frame should be delivered to the host");
+        cx.run_until_parked();
+        let image = cx
+            .capture_screenshot(host.into())
+            .expect("host screenshot should render");
+        assert_pixel(
+            image.get_pixel(32, 32).0,
+            [0, 255, 0],
+            "updated texture window content",
+        );
+        assert_pixel(
+            image.get_pixel(4, 4).0,
+            [0, 0, 255],
+            "host background after update",
         );
     }
 }

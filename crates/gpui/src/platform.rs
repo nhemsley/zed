@@ -190,7 +190,7 @@ pub trait Platform: 'static {
     fn open_texture_window(
         &self,
         _handle: AnyWindowHandle,
-        _options: WindowParams,
+        _options: TextureWindowOptions,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
         anyhow::bail!("texture windows are not supported on this platform")
     }
@@ -1026,6 +1026,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     #[cfg(any(test, feature = "test-support"))]
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
+    }
+
+    /// For texture windows: the most recently drawn frame, ready to be painted
+    /// into another window with [`Window::paint_image`]. Each call reads the
+    /// frame back from the GPU, so callers should cache the result until the
+    /// window is drawn again.
+    fn texture_frame(&self) -> Result<Arc<RenderImage>> {
+        anyhow::bail!("this window does not render into a texture")
     }
 }
 
@@ -2197,6 +2205,32 @@ pub struct TitlebarOptions {
 
     /// The position of the macOS traffic light buttons
     pub traffic_light_position: Option<Point<Pixels>>,
+}
+
+/// Options for [`App::open_texture_window`]. A texture window has no
+/// compositor surface; it is sized and scaled by these options and by
+/// [`Window::resize`] alone.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextureWindowOptions {
+    /// Logical size of the window's viewport.
+    pub size: Size<Pixels>,
+    /// Ratio of device pixels to logical pixels. Hosts that composite the
+    /// texture should pass their own scale factor so the child renders at
+    /// the host's native resolution.
+    pub scale_factor: f32,
+    /// Whether the texture keeps an alpha channel. Transparent textures are
+    /// composited over whatever the host paints beneath them.
+    pub window_background: WindowBackgroundAppearance,
+}
+
+impl Default for TextureWindowOptions {
+    fn default() -> Self {
+        Self {
+            size: DEFAULT_WINDOW_SIZE,
+            scale_factor: 1.0,
+            window_background: WindowBackgroundAppearance::Transparent,
+        }
+    }
 }
 
 /// The kind of window to create

@@ -101,7 +101,8 @@ use gpui::{
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
     MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay, PlatformInput,
     PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollWheelEvent, SharedString,
-    Size, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point, profiler, px, size,
+    Size, TextureWindowOptions, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point,
+    profiler, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -1122,7 +1123,7 @@ impl LinuxClient for WaylandClient {
     fn open_texture_window(
         &self,
         _handle: AnyWindowHandle,
-        params: WindowParams,
+        options: TextureWindowOptions,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
         use anyhow::Context as _;
 
@@ -1148,7 +1149,7 @@ impl LinuxClient for WaylandClient {
         let window = crate::linux::TextureWindow::new(
             state.gpu_context.clone(),
             instance,
-            params,
+            options,
             state.common.appearance,
         )?;
         Ok(Box::new(window))

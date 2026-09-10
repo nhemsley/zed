@@ -54,6 +54,7 @@ use crate::{
     WindowInvalidator,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
+    window::WindowInit,
 };
 
 mod async_context;
@@ -1265,10 +1266,35 @@ impl App {
         options: crate::WindowOptions,
         build_root_view: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
     ) -> anyhow::Result<WindowHandle<V>> {
+        self.open_window_with(WindowInit::Surface(options), build_root_view)
+    }
+
+    /// Opens a window that renders into an offscreen texture instead of a
+    /// compositor surface. It is a complete window (own root view, focus,
+    /// hit-testing, dispatch tree), but the platform never draws it or sends
+    /// it input: another window composites it with
+    /// [`Window::paint_texture_window`], forwards input with
+    /// [`Window::dispatch_event`], and grants it the keyboard with
+    /// [`Window::set_texture_active`].
+    ///
+    /// Fails on platforms without texture window support.
+    pub fn open_texture_window<V: 'static + Render>(
+        &mut self,
+        options: crate::TextureWindowOptions,
+        build_root_view: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
+    ) -> anyhow::Result<WindowHandle<V>> {
+        self.open_window_with(WindowInit::Texture(options), build_root_view)
+    }
+
+    fn open_window_with<V: 'static + Render>(
+        &mut self,
+        init: WindowInit,
+        build_root_view: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
+    ) -> anyhow::Result<WindowHandle<V>> {
         self.update(|cx| {
             let id = cx.windows.insert(None);
             let handle = WindowHandle::new(id);
-            match Window::new(handle.into(), options, cx) {
+            match Window::new(handle.into(), init, cx) {
                 Ok(mut window) => {
                     cx.window_update_stack.push(id);
                     let root_view = build_root_view(&mut window, cx);
@@ -1281,6 +1307,11 @@ impl App {
                     // on windows we quite frequently lose the race and return a window that has never rendered, which leads to a crash
                     // where DispatchTree::root_node_id asserts on empty nodes
                     let clear = window.draw(cx);
+                    // A texture window has pixels only once presented, and
+                    // nothing presents it until a host paints it.
+                    if window.is_texture_window() {
+                        window.present();
+                    }
                     clear.clear(cx);
 
                     cx.window_handles.insert(id, window.handle);

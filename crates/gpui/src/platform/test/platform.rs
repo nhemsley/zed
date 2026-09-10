@@ -505,6 +505,46 @@ impl Platform for TestPlatform {
         Ok(Box::new(window))
     }
 
+    fn open_texture_window(
+        &self,
+        handle: AnyWindowHandle,
+        options: crate::TextureWindowOptions,
+    ) -> anyhow::Result<Box<dyn crate::PlatformWindow>> {
+        let renderer = self.headless_renderer_factory.as_ref().and_then(|f| f());
+        let window = TestWindow::new(
+            handle,
+            WindowParams {
+                bounds: crate::Bounds {
+                    origin: crate::Point::default(),
+                    size: options.size,
+                },
+                titlebar: None,
+                kind: crate::WindowKind::Normal,
+                is_movable: false,
+                app_owns_titlebar_drag: false,
+                is_resizable: false,
+                is_minimizable: false,
+                focus: false,
+                show: false,
+                display_id: None,
+                window_min_size: None,
+                app_id: None,
+                icon: None,
+                #[cfg(target_os = "macos")]
+                tabbing_identifier: None,
+            },
+            self.weak.clone(),
+            self.active_display.clone(),
+            renderer,
+        );
+        {
+            let mut state = window.0.lock();
+            state.scale_factor = options.scale_factor;
+            state.texture_frame = Some(None);
+        }
+        Ok(Box::new(window))
+    }
+
     fn window_appearance(&self) -> WindowAppearance {
         WindowAppearance::Light
     }

@@ -17,8 +17,9 @@ use gpui_wgpu::{GpuContext, WgpuHeadlessRenderer};
 use gpui::{
     Bounds, Capslock, DispatchEventResult, GpuSpecs, Modifiers, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformHeadlessRenderer as _, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, Scene, Size,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    PlatformWindow, Point, PromptButton, PromptLevel, RenderImage, RequestFrameOptions, Scene,
+    Size, TextureWindowOptions, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea,
 };
 
 struct TextureWindowState {
@@ -59,17 +60,25 @@ impl TextureWindow {
     pub(crate) fn new(
         gpu_context: GpuContext,
         instance: Option<gpui_wgpu::wgpu::Instance>,
-        params: WindowParams,
+        options: TextureWindowOptions,
         appearance: WindowAppearance,
     ) -> Result<Self> {
+        anyhow::ensure!(
+            options.scale_factor.is_finite() && options.scale_factor > 0.0,
+            "texture window scale factor must be positive, got {}",
+            options.scale_factor
+        );
         let renderer = WgpuHeadlessRenderer::new_with_instance(gpu_context, instance)?;
         Ok(Self {
             state: RefCell::new(TextureWindowState {
                 renderer,
-                bounds: params.bounds,
-                scale_factor: 1.0,
+                bounds: Bounds {
+                    origin: Point::default(),
+                    size: options.size,
+                },
+                scale_factor: options.scale_factor,
                 appearance,
-                background_appearance: WindowBackgroundAppearance::Transparent,
+                background_appearance: options.window_background,
                 input_handler: None,
                 title: String::new(),
             }),
@@ -248,35 +257,27 @@ impl PlatformWindow for TextureWindow {
         self.draw(scene);
         self.read_frame()
     }
+
+    fn texture_frame(&self) -> Result<Arc<RenderImage>> {
+        let state = self.state.borrow();
+        let image = state.renderer.read_frame_for_atlas()?;
+        Ok(Arc::new(RenderImage::new([image::Frame::new(image)])))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::{
-        Background, BorderStyle, ContentMask, Corners, Edges, Hsla, Quad, ScaledPixels, WindowKind,
-        point, px, size,
+        Background, BorderStyle, ContentMask, Corners, Edges, Hsla, Quad, ScaledPixels, point, px,
+        size,
     };
     use std::cell::Cell;
 
-    fn params(width: f32, height: f32) -> WindowParams {
-        WindowParams {
-            bounds: Bounds {
-                origin: Point::default(),
-                size: size(px(width), px(height)),
-            },
-            titlebar: None,
-            kind: WindowKind::Normal,
-            is_movable: false,
-            app_owns_titlebar_drag: false,
-            is_resizable: false,
-            is_minimizable: false,
-            focus: false,
-            show: false,
-            icon: None,
-            display_id: None,
-            app_id: None,
-            window_min_size: None,
+    fn params(width: f32, height: f32) -> TextureWindowOptions {
+        TextureWindowOptions {
+            size: size(px(width), px(height)),
+            ..TextureWindowOptions::default()
         }
     }
 

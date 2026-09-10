@@ -3,6 +3,22 @@ use anyhow::{Context as _, Result};
 use gpui::{DevicePixels, PlatformAtlas, PlatformHeadlessRenderer, Scene, Size};
 use std::sync::Arc;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadbackLayout {
+    PremultipliedRgba,
+    StraightBgra,
+}
+
+impl ReadbackLayout {
+    fn is_bgra(self) -> bool {
+        self == Self::StraightBgra
+    }
+
+    fn is_straight_alpha(self) -> bool {
+        self == Self::StraightBgra
+    }
+}
+
 struct OffscreenTarget {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -123,9 +139,20 @@ impl WgpuHeadlessRenderer {
             .context("offscreen target was not created")
     }
 
-    /// Copies the most recently rendered frame back to the CPU as straight
-    /// RGBA rows, without rendering again.
+    /// Copies the most recently rendered frame back to the CPU as RGBA rows
+    /// with premultiplied alpha, without rendering again.
     pub fn read_frame(&self) -> Result<image::RgbaImage> {
+        self.read_frame_as(ReadbackLayout::PremultipliedRgba)
+    }
+
+    /// Like [`Self::read_frame`], but in the layout GPUI's sprite atlas
+    /// expects for images: BGRA bytes with straight alpha. The result is
+    /// suitable for wrapping in a `RenderImage`.
+    pub fn read_frame_for_atlas(&self) -> Result<image::RgbaImage> {
+        self.read_frame_as(ReadbackLayout::StraightBgra)
+    }
+
+    fn read_frame_as(&self, layout: ReadbackLayout) -> Result<image::RgbaImage> {
         let target = self
             .target
             .as_ref()
@@ -183,20 +210,28 @@ impl WgpuHeadlessRenderer {
             .context("readback mapping callback never fired")?
             .context("mapping offscreen readback buffer")?;
 
-        let swap_red_blue = match self.renderer.color_format() {
+        let source_is_bgra = match self.renderer.color_format() {
             wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => true,
             _ => false,
         };
+        let swap_red_blue = source_is_bgra != layout.is_bgra();
+        let unpremultiply = layout.is_straight_alpha() && self.renderer.premultiplied_alpha();
         let mapped = slice.get_mapped_range();
         let mut pixels = Vec::with_capacity((unpadded_bytes_per_row * height) as usize);
         for row in mapped.chunks_exact(padded_bytes_per_row as usize) {
             let row = &row[..unpadded_bytes_per_row as usize];
-            if swap_red_blue {
-                for pixel in row.chunks_exact(4) {
-                    pixels.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+            for pixel in row.chunks_exact(4) {
+                let mut pixel = [pixel[0], pixel[1], pixel[2], pixel[3]];
+                if swap_red_blue {
+                    pixel.swap(0, 2);
                 }
-            } else {
-                pixels.extend_from_slice(row);
+                if unpremultiply && pixel[3] != 0 && pixel[3] != 255 {
+                    let alpha = u32::from(pixel[3]);
+                    for channel in &mut pixel[..3] {
+                        *channel = ((u32::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
+                    }
+                }
+                pixels.extend_from_slice(&pixel);
             }
         }
         drop(mapped);

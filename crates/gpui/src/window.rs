@@ -19,10 +19,10 @@ use crate::{
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, TextureWindowOptions,
+    ThermalState, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
+    WindowParams, WindowTextSystem, point, prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -1140,6 +1140,53 @@ enum InputModality {
     Touch,
 }
 
+/// How a [`Window`] is backed: by a compositor surface, or by an offscreen
+/// texture that other windows composite.
+pub(crate) enum WindowInit {
+    Surface(WindowOptions),
+    Texture(TextureWindowOptions),
+}
+
+/// A window that composites a texture window, recorded when it paints the
+/// texture so the texture's invalidations can wake it.
+#[derive(Clone)]
+struct TextureHost {
+    handle: AnyWindowHandle,
+    invalidator: WindowInvalidator,
+}
+
+/// State that only texture windows carry.
+struct TextureWindowState {
+    /// Shared with the invalidator's waker: a dirty texture window wakes
+    /// every host that composites it instead of a platform frame source.
+    hosts: Rc<RefCell<Vec<TextureHost>>>,
+    /// Readback of the most recent frame, cached until the next draw.
+    frame: Option<Arc<RenderImage>>,
+    /// Set by [`Window::resize`]; consumed before the next draw so bounds
+    /// observers run with an `App` in hand.
+    bounds_changed_pending: bool,
+}
+
+/// Outcome of one frame-loop step for a texture window.
+#[derive(Default, Clone, Copy)]
+struct TextureFrameStep {
+    redrawn: bool,
+    /// The window is dirty again or has next-frame callbacks, so its hosts
+    /// must request another frame on its behalf.
+    need_frame: bool,
+}
+
+/// A texture window painted by this window, recorded by
+/// [`Window::paint_texture_window`].
+struct TextureChild {
+    handle: AnyWindowHandle,
+    /// Views that painted the texture; marked dirty when the texture changes
+    /// so their cached paint is not replayed with a stale image.
+    painters: SmallVec<[EntityId; 1]>,
+    /// The frame most recently uploaded to this window's atlas for the child.
+    painted_frame: Option<Arc<RenderImage>>,
+}
+
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
@@ -1227,6 +1274,8 @@ pub struct Window {
     #[cfg(feature = "profiler")]
     debug_frame_overlay: crate::debug_overlay::DebugFrameOverlay,
     pub(crate) a11y: A11y,
+    texture: Option<TextureWindowState>,
+    texture_children: Vec<TextureChild>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1495,11 +1544,23 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
 }
 
 impl Window {
-    pub(crate) fn new(
-        handle: AnyWindowHandle,
-        options: WindowOptions,
-        cx: &mut App,
-    ) -> Result<Self> {
+    pub(crate) fn new(handle: AnyWindowHandle, init: WindowInit, cx: &mut App) -> Result<Self> {
+        let (options, texture) = match init {
+            WindowInit::Surface(options) => (options, None),
+            WindowInit::Texture(texture_options) => {
+                let options = WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: texture_options.size,
+                    })),
+                    focus: false,
+                    show: false,
+                    window_background: texture_options.window_background,
+                    ..WindowOptions::default()
+                };
+                (options, Some(texture_options))
+            }
+        };
         let WindowOptions {
             window_bounds,
             titlebar,
@@ -1530,31 +1591,37 @@ impl Window {
             .and_then(|titlebar| titlebar.title.clone());
 
         let window_bounds = window_bounds.unwrap_or_else(|| default_bounds(display_id, cx));
-        let mut platform_window = cx.platform.open_window(
-            handle,
-            WindowParams {
-                bounds: window_bounds.get_bounds(),
-                titlebar,
-                kind,
-                is_movable,
-                app_owns_titlebar_drag,
-                is_resizable,
-                is_minimizable,
-                focus,
-                show,
-                display_id,
-                window_min_size,
-                app_id: app_id.clone(),
-                icon,
-                #[cfg(target_os = "macos")]
-                tabbing_identifier,
-            },
-        )?;
+        let is_texture = texture.is_some();
+        let mut platform_window = match texture {
+            Some(texture_options) => cx.platform.open_texture_window(handle, texture_options)?,
+            None => cx.platform.open_window(
+                handle,
+                WindowParams {
+                    bounds: window_bounds.get_bounds(),
+                    titlebar,
+                    kind,
+                    is_movable,
+                    app_owns_titlebar_drag,
+                    is_resizable,
+                    is_minimizable,
+                    focus,
+                    show,
+                    display_id,
+                    window_min_size,
+                    app_id: app_id.clone(),
+                    icon,
+                    #[cfg(target_os = "macos")]
+                    tabbing_identifier,
+                },
+            )?,
+        };
 
-        let tab_bar_visible = platform_window.tab_bar_visible();
-        SystemWindowTabController::init_visible(cx, tab_bar_visible);
-        if let Some(tabs) = platform_window.tabbed_windows() {
-            SystemWindowTabController::add_tab(cx, handle.window_id(), tabs);
+        if !is_texture {
+            let tab_bar_visible = platform_window.tab_bar_visible();
+            SystemWindowTabController::init_visible(cx, tab_bar_visible);
+            if let Some(tabs) = platform_window.tabbed_windows() {
+                SystemWindowTabController::add_tab(cx, handle.window_id(), tabs);
+            }
         }
 
         let display_id = platform_window.display().map(|display| display.id());
@@ -1574,8 +1641,10 @@ impl Window {
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
 
-        platform_window
-            .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
+        if !is_texture {
+            platform_window
+                .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
+        }
         platform_window.set_background_appearance(window_background);
 
         match window_bounds {
@@ -1584,7 +1653,9 @@ impl Window {
             WindowBounds::Windowed(_) => {}
         }
 
-        let accessibility_force_disabled = cx.accessibility_force_disabled;
+        // Texture windows are not visible to assistive technology; their host
+        // window's tree is what gets exposed.
+        let accessibility_force_disabled = cx.accessibility_force_disabled || is_texture;
         let a11y_active_flag = Arc::new(AtomicBool::new(false));
 
         #[cfg(not(target_family = "wasm"))]
@@ -1776,6 +1847,16 @@ impl Window {
                     || needs_present.get()
                     || input_rate_tracker.borrow_mut().is_high_rate();
 
+                // Children that still want a frame afterwards (an animation
+                // scheduled a next-frame callback, or a draw re-dirtied them)
+                // have no frame source of their own; this window's is theirs.
+                let texture_children_need_frame = handle
+                    .update(&mut cx, |_, window, cx| {
+                        window.draw_texture_children(force_render, cx)
+                    })
+                    .log_err()
+                    .unwrap_or(false);
+
                 if invalidator.is_dirty() || force_render {
                     measure("frame duration", || {
                         handle
@@ -1801,6 +1882,7 @@ impl Window {
                     .update(&mut cx, |_, window, _| {
                         if window.invalidator.is_dirty()
                             || !window.next_frame_callbacks.borrow().is_empty()
+                            || texture_children_need_frame
                         {
                             window.platform_window.schedule_frame();
                         }
@@ -1812,20 +1894,48 @@ impl Window {
                 // after this frame (the window was re-invalidated mid-draw, or
                 // animations scheduled next-frame callbacks), re-arm the frame
                 // source explicitly.
-                if invalidator.is_dirty() || !next_frame_callbacks.borrow().is_empty() {
+                if invalidator.is_dirty()
+                    || !next_frame_callbacks.borrow().is_empty()
+                    || texture_children_need_frame
+                {
                     invalidator.wake_platform();
                 }
             }
         }));
-        invalidator.set_platform_waker(platform_window.frame_waker());
-        platform_window.on_resize(Box::new({
-            let mut cx = cx.to_async();
-            move |_, _| {
-                handle
-                    .update(&mut cx, |_, window, cx| window.bounds_changed(cx))
-                    .log_err();
-            }
-        }));
+        let texture_state = if is_texture {
+            let hosts: Rc<RefCell<Vec<TextureHost>>> = Rc::default();
+            invalidator.set_platform_waker(Some(Rc::new({
+                let hosts = hosts.clone();
+                move || {
+                    // Clone out of the borrow: a host's waker may dirty a
+                    // further host, which would re-enter this list if that
+                    // host is also a texture window painted by this one.
+                    let hosts = hosts.borrow().clone();
+                    for host in hosts {
+                        host.invalidator.set_dirty(true);
+                    }
+                }
+            })));
+            Some(TextureWindowState {
+                hosts,
+                frame: None,
+                bounds_changed_pending: false,
+            })
+        } else {
+            invalidator.set_platform_waker(platform_window.frame_waker());
+            // Texture windows resize synchronously from `Window::resize`,
+            // which is always called with the window off the `App` and so
+            // could not be updated from this callback.
+            platform_window.on_resize(Box::new({
+                let mut cx = cx.to_async();
+                move |_, _| {
+                    handle
+                        .update(&mut cx, |_, window, cx| window.bounds_changed(cx))
+                        .log_err();
+                }
+            }));
+            None
+        };
         platform_window.on_moved(Box::new({
             let mut cx = cx.to_async();
             move || {
@@ -1967,11 +2077,12 @@ impl Window {
             })
         });
 
-        if let Some(app_id) = app_id {
-            platform_window.set_app_id(&app_id);
+        if !is_texture {
+            if let Some(app_id) = app_id {
+                platform_window.set_app_id(&app_id);
+            }
+            platform_window.map_window()?;
         }
-
-        platform_window.map_window().unwrap();
 
         Ok(Window {
             handle,
@@ -2054,6 +2165,8 @@ impl Window {
                 accessibility_force_disabled,
                 initial_window_title,
             ),
+            texture: texture_state,
+            texture_children: Vec::new(),
         })
     }
 
@@ -2631,8 +2744,238 @@ impl Window {
     }
 
     /// Set the content size of the window.
+    ///
+    /// For a texture window this takes effect immediately: the viewport is
+    /// updated, the window is marked dirty, and bounds observers run before
+    /// its next draw.
     pub fn resize(&mut self, size: Size<Pixels>) {
+        if self.texture.is_some() && self.viewport_size == size {
+            return;
+        }
         self.platform_window.resize(size);
+        if let Some(texture) = &mut self.texture {
+            self.viewport_size = self.platform_window.content_size();
+            self.scale_factor = self.platform_window.scale_factor();
+            texture.bounds_changed_pending = true;
+            self.refresh();
+        }
+    }
+
+    /// Whether this window renders into a texture instead of a compositor
+    /// surface. See [`App::open_texture_window`].
+    pub fn is_texture_window(&self) -> bool {
+        self.texture.is_some()
+    }
+
+    /// Marks a texture window as (in)active, the way a compositor would for a
+    /// real window: activation observers run and the window redraws with its
+    /// active styling. Hosts call this when they decide which texture window
+    /// owns the keyboard, since keyboard events are only meaningful to an
+    /// active window.
+    pub fn set_texture_active(&mut self, active: bool, cx: &mut App) {
+        debug_assert!(
+            self.texture.is_some(),
+            "set_texture_active called on a window with a compositor surface"
+        );
+        if self.active.get() == active {
+            return;
+        }
+        self.active.set(active);
+        self.activation_observers
+            .clone()
+            .retain(&(), |callback| callback(self, cx));
+        self.refresh();
+    }
+
+    /// Composites the most recent frame of a texture window into `bounds`,
+    /// scaling it to fit. Painting attaches the child to this window: this
+    /// window's frame loop draws the child when it is dirty, and the child's
+    /// invalidations wake this window. Input is not forwarded; hosts remap
+    /// events into the child's space and call [`Window::dispatch_event`].
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_texture_window(
+        &mut self,
+        child: &AnyWindowHandle,
+        bounds: Bounds<Pixels>,
+        cx: &mut App,
+    ) {
+        self.invalidator.debug_assert_paint();
+        debug_assert!(
+            *child != self.handle,
+            "a window cannot paint itself as a texture"
+        );
+
+        let host = TextureHost {
+            handle: self.handle,
+            invalidator: self.invalidator.clone(),
+        };
+        let frame = child.update(cx, |_, child_window, _| {
+            let Some(texture) = &mut child_window.texture else {
+                anyhow::bail!("window is not a texture window");
+            };
+            if !texture
+                .hosts
+                .borrow()
+                .iter()
+                .any(|h| h.handle == host.handle)
+            {
+                texture.hosts.borrow_mut().push(host);
+            }
+            if texture.frame.is_none() {
+                texture.frame = Some(child_window.platform_window.texture_frame()?);
+            }
+            Ok(texture.frame.clone().expect("frame was just populated"))
+        });
+        let frame = match frame {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(error)) | Err(error) => {
+                log::error!("failed to read texture window frame: {error:#}");
+                return;
+            }
+        };
+
+        let painter = self.current_view();
+        let entry = match self
+            .texture_children
+            .iter_mut()
+            .find(|entry| entry.handle == *child)
+        {
+            Some(entry) => entry,
+            None => {
+                self.texture_children.push(TextureChild {
+                    handle: *child,
+                    painters: SmallVec::new(),
+                    painted_frame: None,
+                });
+                self.texture_children
+                    .last_mut()
+                    .expect("entry was just pushed")
+            }
+        };
+        if !entry.painters.contains(&painter) {
+            entry.painters.push(painter);
+        }
+        let previous_frame = entry.painted_frame.replace(frame.clone());
+        if let Some(previous) = previous_frame.filter(|previous| !Arc::ptr_eq(previous, &frame)) {
+            self.drop_image(previous).log_err();
+        }
+
+        self.paint_image(bounds, bounds, Corners::default(), frame, 0, false)
+            .log_err();
+    }
+
+    /// Draws every texture window this window paints, deepest first, so each
+    /// frame composites children that are already up to date. Children whose
+    /// texture changed have their painters marked dirty here, which is what
+    /// makes the host's own draw re-upload the new frame.
+    ///
+    /// Returns whether any child still wants a frame afterwards. Runs from
+    /// the frame loop before the host draws, never from inside a draw:
+    /// nested draws would share the element arena.
+    pub(crate) fn draw_texture_children(&mut self, force_render: bool, cx: &mut App) -> bool {
+        let mut visited = FxHashSet::default();
+        visited.insert(self.handle);
+        self.draw_texture_children_inner(force_render, &mut visited, cx)
+    }
+
+    fn draw_texture_children_inner(
+        &mut self,
+        force_render: bool,
+        visited: &mut FxHashSet<AnyWindowHandle>,
+        cx: &mut App,
+    ) -> bool {
+        let mut need_frame = false;
+        let mut index = 0;
+        while index < self.texture_children.len() {
+            let child = self.texture_children[index].handle;
+            if !visited.insert(child) {
+                debug_assert!(false, "texture windows form a cycle through {child:?}");
+                log::error!("texture windows form a cycle through {child:?}; skipping");
+                index += 1;
+                continue;
+            }
+            let step = child.update(cx, |_, child_window, cx| {
+                let descendants_need_frame =
+                    child_window.draw_texture_children_inner(force_render, visited, cx);
+                let step = child_window.draw_as_texture(force_render, cx);
+                TextureFrameStep {
+                    need_frame: step.need_frame || descendants_need_frame,
+                    ..step
+                }
+            });
+            match step {
+                Ok(step) => {
+                    if step.redrawn {
+                        for painter in self.texture_children[index].painters.clone() {
+                            self.mark_view_dirty(painter);
+                        }
+                        self.invalidator.set_dirty(true);
+                    }
+                    need_frame |= step.need_frame;
+                    index += 1;
+                }
+                // The child was closed; forget it and release its last frame.
+                Err(_) => {
+                    let entry = self.texture_children.remove(index);
+                    if let Some(frame) = entry.painted_frame {
+                        self.drop_image(frame).log_err();
+                    }
+                }
+            }
+        }
+        need_frame
+    }
+
+    /// One frame-loop step for a texture window. If the texture was redrawn
+    /// the cached readback is discarded.
+    fn draw_as_texture(&mut self, force_render: bool, cx: &mut App) -> TextureFrameStep {
+        let Some(texture) = &mut self.texture else {
+            log::error!("draw_as_texture called on a window with a compositor surface");
+            return TextureFrameStep::default();
+        };
+        texture
+            .hosts
+            .borrow_mut()
+            .retain(|host| cx.windows.contains_key(host.handle.id));
+
+        // `resize` already applied the new size and dirtied the window; only
+        // the observers were waiting for an `App`.
+        if mem::take(&mut texture.bounds_changed_pending) {
+            self.bounds_observers
+                .clone()
+                .retain(&(), |callback| callback(self, cx));
+        }
+
+        let pending_next_frame_callbacks = self.next_frame_callbacks.take();
+        for callback in pending_next_frame_callbacks {
+            callback(self, cx);
+        }
+
+        let mut redrawn = false;
+        if self.invalidator.is_dirty() || force_render {
+            if force_render {
+                self.refresh();
+            }
+            let arena_clear_needed = self.draw(cx);
+            self.present();
+            arena_clear_needed.clear(cx);
+            redrawn = true;
+        } else if self.needs_present.get() {
+            // Drawn outside the frame loop (`Window::draw` is public, and
+            // test builds draw dirty windows eagerly): the frame exists but
+            // has not reached the texture yet.
+            self.present();
+            redrawn = true;
+        }
+        if redrawn && let Some(texture) = &mut self.texture {
+            texture.frame = None;
+        }
+        TextureFrameStep {
+            redrawn,
+            need_frame: self.invalidator.is_dirty()
+                || !self.next_frame_callbacks.borrow().is_empty(),
+        }
     }
 
     /// Returns whether or not the window is currently fullscreen
@@ -3206,7 +3549,7 @@ impl Window {
     }
 
     #[profiling::function]
-    fn present(&mut self) {
+    pub(crate) fn present(&mut self) {
         #[cfg(feature = "profiler")]
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
@@ -5222,6 +5565,18 @@ impl Window {
         cx.propagate_event = true;
         // Handlers may set this to true by calling `prevent_default`.
         self.default_prevented = false;
+
+        // No compositor reports hover to a texture window: the input a host
+        // forwards is the only signal.
+        if self.texture.is_some() {
+            match &event {
+                PlatformInput::MouseMove(_)
+                | PlatformInput::MouseDown(_)
+                | PlatformInput::ScrollWheel(_) => self.hovered.set(true),
+                PlatformInput::MouseExited(_) => self.hovered.set(false),
+                _ => {}
+            }
+        }
 
         let event = match event {
             // Track the mouse position with our own state, since accessing the platform
@@ -7382,8 +7737,9 @@ mod tests {
         ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
         InputEvent as _, InteractiveElement as _, IntoElement, LongPressEvent, MouseButton,
         MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render, RequestFrameOptions,
-        StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
-        TouchId, TouchPhase, Window, WindowAppearance, WindowOptions, canvas, div, point, px, size,
+        StatefulInteractiveElement as _, Styled, TestAppContext, TextureWindowOptions,
+        TouchDragEvent, TouchEvent, TouchId, TouchPhase, Window, WindowAppearance, WindowOptions,
+        canvas, div, point, px, size,
     };
 
     struct EmptyView;
@@ -7392,6 +7748,166 @@ mod tests {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div()
         }
+    }
+
+    struct CountsRenders {
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for CountsRenders {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div().size_full()
+        }
+    }
+
+    struct PaintsTextureWindow {
+        child: AnyWindowHandle,
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for PaintsTextureWindow {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let child = self.child;
+            div().size_full().child(
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, cx| window.paint_texture_window(&child, bounds, cx),
+                )
+                .size_full(),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn test_texture_window_is_driven_by_its_host(cx: &mut TestAppContext) {
+        let child_renders = Rc::new(Cell::new(0));
+        let child = cx
+            .update(|cx| {
+                cx.open_texture_window(
+                    TextureWindowOptions {
+                        size: size(px(32.), px(32.)),
+                        ..TextureWindowOptions::default()
+                    },
+                    |_, cx| {
+                        cx.new(|_| CountsRenders {
+                            renders: child_renders.clone(),
+                        })
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            child_renders.get(),
+            1,
+            "a texture window draws once on open"
+        );
+        child
+            .update(cx, |_, window, _| assert!(window.is_texture_window()))
+            .unwrap();
+
+        let host_renders = Rc::new(Cell::new(0));
+        let host = cx.add_window(|_, _| PaintsTextureWindow {
+            child: child.into(),
+            renders: host_renders.clone(),
+        });
+        let test_window = cx.test_window(host.into());
+        // Serve the demand created by opening the host.
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        let composited_frame = |cx: &mut TestAppContext| {
+            host.update(cx, |_, window, _| {
+                let child = window
+                    .texture_children
+                    .iter()
+                    .find(|entry| entry.handle == child.into())
+                    .expect("painting attaches the child to the host");
+                child.painted_frame.as_ref().map(|frame| frame.id)
+            })
+            .unwrap()
+        };
+        let (child_baseline, host_baseline) = (child_renders.get(), host_renders.get());
+        let frame_baseline = composited_frame(cx).expect("host composited the child");
+
+        // An idle host does not redraw an idle child.
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert_eq!(
+            (child_renders.get(), host_renders.get()),
+            (child_baseline, host_baseline)
+        );
+        assert_eq!(composited_frame(cx), Some(frame_baseline));
+
+        // Notifying a view inside the child wakes the host. On the host's
+        // next frame the child is drawn once, and the host redraws to
+        // composite the child's new frame.
+        let wake_baseline = test_window.frame_wake_count();
+        child.update(cx, |_, _, cx| cx.notify()).unwrap();
+        assert!(
+            test_window.frame_wake_count() > wake_baseline,
+            "a dirty texture window must wake its host's frame source"
+        );
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert_eq!(child_renders.get(), child_baseline + 1);
+        assert!(host_renders.get() > host_baseline);
+        let frame_after_notify = composited_frame(cx).expect("host composited the child");
+        assert_ne!(frame_after_notify, frame_baseline);
+        let (child_baseline, host_baseline) = (child_renders.get(), host_renders.get());
+
+        // Resizing takes effect synchronously, notifies bounds observers on
+        // the next frame, and redraws the child exactly once.
+        let bounds_changes = Rc::new(Cell::new(0));
+        let _bounds_subscription = child
+            .update(cx, |_, window, cx| {
+                let bounds_changes = bounds_changes.clone();
+                cx.observe_window_bounds(window, move |_, _, _| {
+                    bounds_changes.set(bounds_changes.get() + 1)
+                })
+            })
+            .unwrap();
+        child
+            .update(cx, |_, window, _| {
+                window.resize(size(px(48.), px(40.)));
+                assert_eq!(window.viewport_size(), size(px(48.), px(40.)));
+            })
+            .unwrap();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert_eq!(child_renders.get(), child_baseline + 1);
+        assert!(host_renders.get() > host_baseline);
+        assert_eq!(bounds_changes.get(), 1);
+        assert_ne!(composited_frame(cx), Some(frame_after_notify));
+
+        // Activation is explicit, since no compositor will ever report it.
+        let activations = Rc::new(Cell::new(0));
+        let _activation_subscription = child
+            .update(cx, |_, window, cx| {
+                let activations = activations.clone();
+                cx.observe_window_activation(window, move |_, _, _| {
+                    activations.set(activations.get() + 1)
+                })
+            })
+            .unwrap();
+        // Hosts drive activation through an untyped handle: a typed
+        // `WindowHandle::update` leases the root view, which the activation
+        // observers registered on it would then try to update.
+        let child_handle: AnyWindowHandle = child.into();
+        child_handle
+            .update(cx, |_, window, cx| {
+                assert!(!window.is_window_active());
+                window.set_texture_active(true, cx);
+                assert!(window.is_window_active());
+            })
+            .unwrap();
+        assert_eq!(activations.get(), 1);
+
+        // Closing the child detaches it from the host.
+        child_handle
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        host.update(cx, |_, window, _| {
+            assert!(window.texture_children.is_empty())
+        })
+        .unwrap();
     }
 
     struct OpensWindowOnPaint {

@@ -2,9 +2,9 @@ use crate::{
     AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
     DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TextInputConfiguration,
-    TextInputStateChange, TileId, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowParams,
+    PromptButton, RenderImage, RequestFrameOptions, Scene, Size, TestPlatform,
+    TextInputConfiguration, TextInputStateChange, TileId, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
 };
 use collections::HashMap;
 use gpui_util::ResultExt as _;
@@ -30,6 +30,9 @@ pub(crate) struct TestWindowState {
     // TODO: Replace with `Rc`
     sprite_atlas: Arc<dyn PlatformAtlas>,
     renderer: Option<Box<dyn PlatformHeadlessRenderer>>,
+    /// Present for windows opened with `open_texture_window`: the most
+    /// recently drawn frame, read back so hosts can composite it.
+    pub(crate) texture_frame: Option<Option<RgbaImage>>,
     pub(crate) should_close_handler: Option<Box<dyn FnMut() -> bool>>,
     hit_test_window_control_callback: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
     input_callback: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
@@ -46,7 +49,7 @@ pub(crate) struct TestWindowState {
     text_input_configurations: Vec<TextInputConfiguration>,
     text_input_state_changes: Vec<TextInputStateChange>,
     is_fullscreen: bool,
-    scale_factor: f32,
+    pub(crate) scale_factor: f32,
     appearance: WindowAppearance,
     external_drag_files: Vec<(PathBuf, bool)>,
     start_external_drag_result: bool,
@@ -92,6 +95,7 @@ impl TestWindow {
             handle,
             sprite_atlas,
             renderer,
+            texture_frame: None,
             title: Default::default(),
             edited: false,
             document_path: None,
@@ -433,9 +437,48 @@ impl PlatformWindow for TestWindow {
         state.frame_callback_pending = true;
         state.frame_scheduled = true;
         let device_size: Size<DevicePixels> = state.bounds.size.to_device_pixels(scale_factor);
+        let state = &mut *state;
         if let Some(renderer) = &mut state.renderer {
-            renderer.render_scene(scene, device_size).warn_on_err();
+            match &mut state.texture_frame {
+                Some(texture_frame) => {
+                    if let Some(image) = renderer
+                        .render_scene_to_image(scene, device_size)
+                        .warn_on_err()
+                    {
+                        *texture_frame = Some(image);
+                    }
+                }
+                None => {
+                    renderer.render_scene(scene, device_size).warn_on_err();
+                }
+            }
         }
+    }
+
+    fn texture_frame(&self) -> anyhow::Result<Arc<RenderImage>> {
+        let state = self.0.lock();
+        let Some(texture_frame) = &state.texture_frame else {
+            anyhow::bail!("this window does not render into a texture");
+        };
+        let mut image = match texture_frame {
+            Some(image) => image.clone(),
+            // Without a renderer there are no pixels, but hosts can still
+            // exercise attachment and frame driving against a placeholder.
+            None if state.renderer.is_none() => RgbaImage::from_pixel(1, 1, image::Rgba([0; 4])),
+            None => anyhow::bail!("no frame has been drawn yet"),
+        };
+        // Headless renderers read back premultiplied RGBA; the atlas expects
+        // straight-alpha BGRA.
+        for pixel in image.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+            let alpha = u32::from(pixel[3]);
+            if alpha != 0 && alpha != 255 {
+                for channel in &mut pixel[..3] {
+                    *channel = ((u32::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
+                }
+            }
+        }
+        Ok(Arc::new(RenderImage::new([image::Frame::new(image)])))
     }
 
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {

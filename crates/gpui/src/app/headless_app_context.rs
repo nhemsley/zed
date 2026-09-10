@@ -170,6 +170,28 @@ impl HeadlessAppContext {
         app.update_window(window, |_, window, _| window.render_to_image())?
     }
 
+    /// Delivers a frame request to `window`, as the platform's frame source
+    /// would: texture windows it paints are drawn first, then the window
+    /// itself if it is dirty.
+    pub fn simulate_frame(&mut self, window: AnyWindowHandle) -> Result<()> {
+        use anyhow::Context as _;
+
+        // The frame callback borrows the app itself, so the borrow used to
+        // find the platform window must end first.
+        let test_window = self
+            .app
+            .borrow_mut()
+            .update_window(window, |_, window, _| {
+                window
+                    .platform_window
+                    .as_test()
+                    .map(|window| window.clone())
+            })?
+            .context("window is not a test window")?;
+        test_window.simulate_frame_request(crate::RequestFrameOptions::default());
+        Ok(())
+    }
+
     /// Returns the text system.
     pub fn text_system(&self) -> &Arc<TextSystem> {
         &self.text_system
