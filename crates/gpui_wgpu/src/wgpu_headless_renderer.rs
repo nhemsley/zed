@@ -67,23 +67,30 @@ impl WgpuHeadlessRenderer {
             width: DevicePixels(size.width.0.clamp(1, max)),
             height: DevicePixels(size.height.0.clamp(1, max)),
         };
-        if self.target.as_ref().is_none_or(|target| target.size != size) {
-            let texture = self.renderer.device().create_texture(&wgpu::TextureDescriptor {
-                label: Some("offscreen_target"),
-                size: wgpu::Extent3d {
-                    width: size.width.0 as u32,
-                    height: size.height.0 as u32,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: self.renderer.color_format(),
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
+        if self
+            .target
+            .as_ref()
+            .is_none_or(|target| target.size != size)
+        {
+            let texture = self
+                .renderer
+                .device()
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("offscreen_target"),
+                    size: wgpu::Extent3d {
+                        width: size.width.0 as u32,
+                        height: size.height.0 as u32,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.renderer.color_format(),
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             self.target = Some(OffscreenTarget {
                 texture,
@@ -91,10 +98,9 @@ impl WgpuHeadlessRenderer {
                 size,
             });
         }
-        Ok(self
-            .target
+        self.target
             .as_ref()
-            .context("offscreen target was not created")?)
+            .context("offscreen target was not created")
     }
 
     /// Copies the current target back to the CPU as straight RGBA rows.
@@ -258,7 +264,10 @@ mod tests {
         assert_eq!(image.dimensions(), (8, 8));
 
         let inside = image.get_pixel(1, 1).0;
-        assert!(inside[0] > 200 && inside[1] < 40 && inside[2] < 40 && inside[3] > 200, "{inside:?}");
+        assert!(
+            inside[0] > 200 && inside[1] < 40 && inside[2] < 40 && inside[3] > 200,
+            "{inside:?}"
+        );
         let outside = image.get_pixel(6, 6).0;
         assert_eq!(outside[3], 0, "{outside:?}");
 

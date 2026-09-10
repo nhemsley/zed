@@ -95,11 +95,7 @@ pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRende
         gpui_linux::current_headless_renderer()
     }
 
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "linux",
-        target_os = "freebsd"
-    )))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
     {
         None
     }
@@ -112,7 +108,10 @@ pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRende
 ))]
 mod linux_tests {
     use super::*;
-    use gpui::{AppContext as _, Context, HeadlessAppContext, IntoElement, Render, Window, div, px, rgb, size};
+    use gpui::{
+        AppContext as _, Context, HeadlessAppContext, IntoElement, Render, Styled as _, Window,
+        div, px, rgb, size,
+    };
     use std::sync::Arc;
 
     struct RedBox;
@@ -131,11 +130,8 @@ mod linux_tests {
         }
 
         let text_system = current_platform(true).text_system();
-        let mut cx = HeadlessAppContext::with_platform(
-            text_system,
-            Arc::new(()),
-            current_headless_renderer,
-        );
+        let mut cx =
+            HeadlessAppContext::with_platform(text_system, Arc::new(()), current_headless_renderer);
         let window = cx
             .open_window(size(px(16.), px(16.)), |_, cx| cx.new(|_| RedBox))
             .expect("headless window should open");

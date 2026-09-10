@@ -376,9 +376,7 @@ impl WgpuRenderer {
     ) -> anyhow::Result<Self> {
         let (surface_format, transparent_alpha_mode, opaque_alpha_mode, present_mode) =
             match &surface {
-                Some(surface) => {
-                    Self::select_surface_parameters(surface, context, &config)?
-                }
+                Some(surface) => Self::select_surface_parameters(surface, context, &config)?,
                 // Offscreen targets have no compositor to negotiate with: use
                 // the atlas color format so sprites and targets always match,
                 // and premultiplied alpha, which is what the shaders emit.

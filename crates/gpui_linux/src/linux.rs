@@ -34,12 +34,14 @@ pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRende
     use anyhow::Context as _;
     use gpui_util::ResultExt as _;
 
+    // Never dropped: by the time this thread-local's destructor runs, wgpu's
+    // own thread-locals may already be gone, and dropping a Queue then aborts.
     thread_local! {
-        static HEADLESS_GPU_CONTEXT: gpui_wgpu::GpuContext =
-            Rc::new(std::cell::RefCell::new(None));
+        static HEADLESS_GPU_CONTEXT: std::mem::ManuallyDrop<gpui_wgpu::GpuContext> =
+            std::mem::ManuallyDrop::new(Rc::new(std::cell::RefCell::new(None)));
     }
 
-    let gpu_context = HEADLESS_GPU_CONTEXT.with(|context| context.clone());
+    let gpu_context = HEADLESS_GPU_CONTEXT.with(|context| Rc::clone(context));
     let renderer = gpui_wgpu::WgpuHeadlessRenderer::new(gpu_context)
         .context("Failed to create headless wgpu renderer")
         .log_err()?;

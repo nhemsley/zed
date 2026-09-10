@@ -87,11 +87,9 @@ impl WgpuContext {
     #[cfg(not(target_family = "wasm"))]
     pub fn new_headless(instance: wgpu::Instance) -> anyhow::Result<Self> {
         let device_id_filter = Self::device_id_filter_from_env();
-        let (adapter, device, queue, dual_source_blending, color_texture_format) =
-            gpui::block_on(Self::select_adapter_and_device_headless(
-                &instance,
-                device_id_filter,
-            ))?;
+        let (adapter, device, queue, dual_source_blending, color_texture_format) = gpui::block_on(
+            Self::select_adapter_and_device_headless(&instance, device_id_filter),
+        )?;
         Ok(Self::from_parts(
             instance,
             adapter,
@@ -450,7 +448,8 @@ impl WgpuContext {
         bool,
         TextureFormat,
     )> {
-        let adapters = Self::enumerate_adapters_by_priority(instance, device_id_filter, None).await?;
+        let adapters =
+            Self::enumerate_adapters_by_priority(instance, device_id_filter, None).await?;
 
         for adapter in adapters {
             let info = adapter.get_info();
