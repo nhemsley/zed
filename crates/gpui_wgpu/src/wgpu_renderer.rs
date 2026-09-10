@@ -318,18 +318,25 @@ impl WgpuRenderer {
     /// Creates a renderer with no presentation surface. Frames are drawn with
     /// [`Self::render_offscreen`] into a caller-provided texture view.
     ///
-    /// If `gpu_context` is empty, a headless context (no display connection)
-    /// is created and stored in it, so later windows and offscreen renderers
-    /// share the device, queue and atlas format.
+    /// If `gpu_context` is empty, a headless context is created from
+    /// `instance` (or a display-less instance when `None`) and stored in it,
+    /// so later windows and offscreen renderers share the device, queue and
+    /// atlas format. Surfaces for real windows are created through the shared
+    /// context's instance, so pass an instance bound to the display server if
+    /// real windows may share this context later.
     #[cfg(not(target_family = "wasm"))]
     pub fn new_offscreen(
         gpu_context: GpuContext,
+        instance: Option<wgpu::Instance>,
         config: WgpuSurfaceConfig,
     ) -> anyhow::Result<Self> {
         let mut ctx_ref = gpu_context.borrow_mut();
         let context = match ctx_ref.as_mut() {
             Some(context) => context,
-            None => ctx_ref.insert(WgpuContext::new_headless(WgpuContext::headless_instance())?),
+            None => {
+                let instance = instance.unwrap_or_else(WgpuContext::headless_instance);
+                ctx_ref.insert(WgpuContext::new_headless(instance)?)
+            }
         };
         let atlas = Arc::new(WgpuAtlas::from_context(context));
         Self::new_internal(

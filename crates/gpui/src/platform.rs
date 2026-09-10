@@ -184,6 +184,17 @@ pub trait Platform: 'static {
         options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>>;
 
+    /// Opens a window that renders into an offscreen texture instead of a
+    /// compositor surface. The platform never delivers input or frame requests
+    /// to it; a host window drives both.
+    fn open_texture_window(
+        &self,
+        _handle: AnyWindowHandle,
+        _options: WindowParams,
+    ) -> anyhow::Result<Box<dyn PlatformWindow>> {
+        anyhow::bail!("texture windows are not supported on this platform")
+    }
+
     /// Returns the appearance of the application's windows.
     fn window_appearance(&self) -> WindowAppearance;
 

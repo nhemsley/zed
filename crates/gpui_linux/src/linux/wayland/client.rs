@@ -310,6 +310,25 @@ pub struct Output {
     pub subpixel: Option<wl_output::Subpixel>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RawDisplay(*mut std::ffi::c_void);
+
+// Safety: points at the wl_display, which outlives every window; wgpu needs
+// Send + Sync to bind an instance to it.
+unsafe impl Send for RawDisplay {}
+unsafe impl Sync for RawDisplay {}
+
+impl raw_window_handle::HasDisplayHandle for RawDisplay {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        let display =
+            std::ptr::NonNull::new(self.0).ok_or(raw_window_handle::HandleError::Unavailable)?;
+        let handle = raw_window_handle::WaylandDisplayHandle::new(display);
+        Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(handle.into()) })
+    }
+}
+
 pub(crate) struct WaylandClientState {
     serial_tracker: SerialTracker,
     globals: Globals,
@@ -1097,6 +1116,41 @@ impl LinuxClient for WaylandClient {
         }
         state.windows.insert(surface_id, window.0.clone());
 
+        Ok(Box::new(window))
+    }
+
+    fn open_texture_window(
+        &self,
+        _handle: AnyWindowHandle,
+        params: WindowParams,
+    ) -> anyhow::Result<Box<dyn PlatformWindow>> {
+        use anyhow::Context as _;
+
+        let state = self.0.borrow();
+        // Real windows create their surfaces through the shared context's
+        // instance, so a context first initialized here must be bound to the
+        // display.
+        let instance = if state.gpu_context.borrow().is_none() {
+            let display = state
+                .globals
+                .compositor
+                .backend()
+                .upgrade()
+                .context("Wayland connection is closed")?
+                .display_ptr()
+                .cast::<std::ffi::c_void>();
+            Some(gpui_wgpu::WgpuContext::instance(Box::new(RawDisplay(
+                display,
+            ))))
+        } else {
+            None
+        };
+        let window = crate::linux::TextureWindow::new(
+            state.gpu_context.clone(),
+            instance,
+            params,
+            state.common.appearance,
+        )?;
         Ok(Box::new(window))
     }
 

@@ -5,6 +5,8 @@ mod platform;
 mod system_notifications;
 #[cfg(any(feature = "wayland", feature = "x11"))]
 mod text_system;
+#[cfg(any(feature = "wayland", feature = "x11"))]
+mod texture_window;
 #[cfg(feature = "wayland")]
 mod wayland;
 #[cfg(feature = "x11")]
@@ -19,6 +21,8 @@ pub(crate) use keyboard::*;
 pub(crate) use platform::*;
 #[cfg(any(feature = "wayland", feature = "x11"))]
 pub(crate) use text_system::*;
+#[cfg(any(feature = "wayland", feature = "x11"))]
+pub(crate) use texture_window::*;
 #[cfg(feature = "wayland")]
 pub(crate) use wayland::*;
 #[cfg(feature = "x11")]

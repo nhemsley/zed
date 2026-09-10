@@ -88,6 +88,16 @@ pub(crate) trait LinuxClient {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>>;
+    fn open_texture_window(
+        &self,
+        _handle: AnyWindowHandle,
+        _options: WindowParams,
+    ) -> anyhow::Result<Box<dyn PlatformWindow>> {
+        anyhow::bail!(
+            "texture windows are not supported by the {} client",
+            self.compositor_name()
+        )
+    }
     fn set_cursor_style(&self, style: CursorStyle);
     fn hide_cursor_until_mouse_moves(&self) {}
     fn is_cursor_visible(&self) -> bool {
@@ -422,6 +432,14 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
         self.inner.open_window(handle, options)
+    }
+
+    fn open_texture_window(
+        &self,
+        handle: AnyWindowHandle,
+        options: WindowParams,
+    ) -> anyhow::Result<Box<dyn PlatformWindow>> {
+        self.inner.open_texture_window(handle, options)
     }
 
     fn open_url(&self, url: &str) {

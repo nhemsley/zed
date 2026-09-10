@@ -21,8 +21,20 @@ impl WgpuHeadlessRenderer {
     /// initialized headlessly (no display connection).
     #[cfg(not(target_family = "wasm"))]
     pub fn new(gpu_context: GpuContext) -> Result<Self> {
+        Self::new_with_instance(gpu_context, None)
+    }
+
+    /// Like [`Self::new`], but an empty context is initialized from `instance`,
+    /// which should be bound to the display server if real windows will share
+    /// the context later.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn new_with_instance(
+        gpu_context: GpuContext,
+        instance: Option<wgpu::Instance>,
+    ) -> Result<Self> {
         let renderer = WgpuRenderer::new_offscreen(
             gpu_context,
+            instance,
             WgpuSurfaceConfig {
                 size: Size {
                     width: DevicePixels(1),
@@ -59,6 +71,14 @@ impl WgpuHeadlessRenderer {
 
     pub fn device_lost(&self) -> bool {
         self.renderer.device_lost()
+    }
+
+    pub fn gpu_specs(&self) -> gpui::GpuSpecs {
+        self.renderer.gpu_specs()
+    }
+
+    pub fn supports_dual_source_blending(&self) -> bool {
+        self.renderer.supports_dual_source_blending()
     }
 
     fn ensure_target(&mut self, size: Size<DevicePixels>) -> Result<&OffscreenTarget> {
@@ -103,8 +123,9 @@ impl WgpuHeadlessRenderer {
             .context("offscreen target was not created")
     }
 
-    /// Copies the current target back to the CPU as straight RGBA rows.
-    fn read_target(&self) -> Result<image::RgbaImage> {
+    /// Copies the most recently rendered frame back to the CPU as straight
+    /// RGBA rows, without rendering again.
+    pub fn read_frame(&self) -> Result<image::RgbaImage> {
         let target = self
             .target
             .as_ref()
@@ -193,7 +214,7 @@ impl PlatformHeadlessRenderer for WgpuHeadlessRenderer {
         size: Size<DevicePixels>,
     ) -> Result<image::RgbaImage> {
         self.render_scene(scene, size)?;
-        self.read_target()
+        self.read_frame()
     }
 
     fn render_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> Result<()> {
