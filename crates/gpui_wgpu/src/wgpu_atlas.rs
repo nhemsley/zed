@@ -3,7 +3,7 @@ use collections::FxHashMap;
 use etagere::{BucketedAtlasAllocator, size2};
 use gpui::{
     AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels,
-    PlatformAtlas, Point, Size,
+    ExternalTexture, ExternalTextureId, PlatformAtlas, Point, Size, TileId,
 };
 use parking_lot::Mutex;
 use std::{borrow::Cow, ops, sync::Arc};
@@ -37,6 +37,83 @@ struct WgpuAtlasState {
     storage: WgpuAtlasStorage,
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
     pending_uploads: Vec<PendingUpload>,
+    external: ExternalTextures,
+}
+
+/// Texture ids with this bit set index [`ExternalTextures`] instead of the
+/// atlas's own polychrome textures.
+const EXTERNAL_TEXTURE_BIT: u32 = 1 << 31;
+
+/// Textures owned elsewhere (texture window targets) exposed as whole-texture
+/// polychrome tiles. Entries hold a view, which keeps the texture alive for
+/// as long as it is registered.
+#[derive(Default)]
+struct ExternalTextures {
+    slots: Vec<Option<ExternalAtlasTexture>>,
+    free_slots: Vec<usize>,
+    slot_by_id: FxHashMap<ExternalTextureId, usize>,
+}
+
+struct ExternalAtlasTexture {
+    view: wgpu::TextureView,
+    tile: AtlasTile,
+}
+
+impl ExternalTextures {
+    fn register(&mut self, texture: &ExternalTexture) -> Result<AtlasTile> {
+        if let Some(&slot) = self.slot_by_id.get(&texture.id) {
+            return self
+                .slots
+                .get(slot)
+                .and_then(|entry| entry.as_ref())
+                .map(|entry| entry.tile)
+                .context("external texture slot is empty");
+        }
+        let view = texture
+            .handle
+            .downcast_ref::<wgpu::TextureView>()
+            .context("external texture handle is not a wgpu texture view")?
+            .clone();
+        let slot = self.free_slots.pop().unwrap_or(self.slots.len());
+        anyhow::ensure!(
+            (slot as u32) & EXTERNAL_TEXTURE_BIT == 0,
+            "too many external textures"
+        );
+        let tile = AtlasTile {
+            texture_id: AtlasTextureId {
+                index: slot as u32 | EXTERNAL_TEXTURE_BIT,
+                kind: AtlasTextureKind::Polychrome,
+            },
+            tile_id: TileId(0),
+            padding: 0,
+            bounds: Bounds {
+                origin: Point::default(),
+                size: texture.size,
+            },
+        };
+        let entry = Some(ExternalAtlasTexture { view, tile });
+        if slot == self.slots.len() {
+            self.slots.push(entry);
+        } else {
+            self.slots[slot] = entry;
+        }
+        self.slot_by_id.insert(texture.id, slot);
+        Ok(tile)
+    }
+
+    fn remove(&mut self, id: ExternalTextureId) {
+        if let Some(slot) = self.slot_by_id.remove(&id)
+            && let Some(entry) = self.slots.get_mut(slot)
+        {
+            *entry = None;
+            self.free_slots.push(slot);
+        }
+    }
+
+    fn view(&self, id: AtlasTextureId) -> Option<&wgpu::TextureView> {
+        let slot = (id.index & !EXTERNAL_TEXTURE_BIT) as usize;
+        self.slots.get(slot)?.as_ref().map(|entry| &entry.view)
+    }
 }
 
 pub struct WgpuTextureInfo {
@@ -58,6 +135,7 @@ impl WgpuAtlas {
             storage: WgpuAtlasStorage::default(),
             tiles_by_key: Default::default(),
             pending_uploads: Vec::new(),
+            external: ExternalTextures::default(),
         }))
     }
 
@@ -76,6 +154,14 @@ impl WgpuAtlas {
 
     pub fn get_texture_info(&self, id: AtlasTextureId) -> WgpuTextureInfo {
         let lock = self.0.lock();
+        if id.index & EXTERNAL_TEXTURE_BIT != 0 {
+            let view = lock
+                .external
+                .view(id)
+                .expect("external texture must be registered")
+                .clone();
+            return WgpuTextureInfo { view };
+        }
         let texture = &lock.storage[id];
         WgpuTextureInfo {
             view: texture.view.clone(),
@@ -89,6 +175,8 @@ impl WgpuAtlas {
         lock.storage = WgpuAtlasStorage::default();
         lock.tiles_by_key.clear();
         lock.pending_uploads.clear();
+        // Owners re-register on their next paint, like images re-upload.
+        lock.external = ExternalTextures::default();
     }
 
     /// Handles device lost by clearing all textures and cached tiles.
@@ -101,6 +189,7 @@ impl WgpuAtlas {
         lock.storage = WgpuAtlasStorage::default();
         lock.tiles_by_key.clear();
         lock.pending_uploads.clear();
+        lock.external = ExternalTextures::default();
     }
 }
 
@@ -125,6 +214,14 @@ impl PlatformAtlas for WgpuAtlas {
             lock.tiles_by_key.insert(key.clone(), tile);
             Ok(Some(tile))
         }
+    }
+
+    fn register_external_texture(&self, texture: &ExternalTexture) -> Result<AtlasTile> {
+        self.0.lock().external.register(texture)
+    }
+
+    fn remove_external_texture(&self, id: ExternalTextureId) {
+        self.0.lock().external.remove(id);
     }
 
     fn remove(&self, key: &AtlasKey) {
@@ -505,6 +602,86 @@ mod tests {
         let tile_b = insert(&big_key_b, big);
         assert_eq!(tile_b.texture_id, keeper_tile.texture_id);
         Ok(())
+    }
+
+    #[test]
+    fn external_textures_register_as_whole_texture_tiles() {
+        let Ok((device, queue)) = test_device_and_queue() else {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        };
+        let atlas = WgpuAtlas::new(device.clone(), queue, wgpu::TextureFormat::Bgra8Unorm);
+        let size = Size {
+            width: DevicePixels(12),
+            height: DevicePixels(7),
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("external"),
+            size: wgpu::Extent3d {
+                width: 12,
+                height: 7,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let external = ExternalTexture {
+            id: ExternalTextureId::next(),
+            size,
+            premultiplied_alpha: true,
+            handle: Arc::new(texture.create_view(&wgpu::TextureViewDescriptor::default())),
+        };
+
+        let tile = atlas
+            .register_external_texture(&external)
+            .expect("registration should succeed");
+        assert_eq!(tile.texture_id.kind, AtlasTextureKind::Polychrome);
+        assert_ne!(tile.texture_id.index & EXTERNAL_TEXTURE_BIT, 0);
+        assert_eq!(tile.bounds.origin, Point::default());
+        assert_eq!(tile.bounds.size, size);
+        assert_eq!(
+            atlas
+                .register_external_texture(&external)
+                .expect("re-registration")
+                .texture_id,
+            tile.texture_id,
+            "registering the same id again returns the existing tile"
+        );
+        // Resolves without touching the atlas's own texture storage.
+        let _view = atlas.get_texture_info(tile.texture_id);
+
+        let other = ExternalTexture {
+            id: ExternalTextureId::next(),
+            ..external.clone()
+        };
+        let other_tile = atlas
+            .register_external_texture(&other)
+            .expect("second registration");
+        assert_ne!(other_tile.texture_id, tile.texture_id);
+
+        atlas.remove_external_texture(external.id);
+        assert!(atlas.0.lock().external.view(tile.texture_id).is_none());
+        let reused = atlas
+            .register_external_texture(&ExternalTexture {
+                id: ExternalTextureId::next(),
+                ..external.clone()
+            })
+            .expect("registration after removal");
+        assert_eq!(
+            reused.texture_id, tile.texture_id,
+            "a removed slot is reused"
+        );
+
+        let wrong_backend = ExternalTexture {
+            id: ExternalTextureId::next(),
+            handle: Arc::new(()),
+            ..external
+        };
+        assert!(atlas.register_external_texture(&wrong_backend).is_err());
     }
 
     #[test]

@@ -9,13 +9,13 @@ use crate::{
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    EntityId, EventEmitter, ExternalTextureId, FileDropEvent, FontId, Global, GlobalElementId,
+    GlyphId, GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
@@ -1160,17 +1160,21 @@ struct TextureWindowState {
     /// Shared with the invalidator's waker: a dirty texture window wakes
     /// every host that composites it instead of a platform frame source.
     hosts: Rc<RefCell<Vec<TextureHost>>>,
-    /// Readback of the most recent frame, cached until the next draw.
-    frame: Option<Arc<RenderImage>>,
     /// Set by [`Window::resize`]; consumed before the next draw so bounds
     /// observers run with an `App` in hand.
     bounds_changed_pending: bool,
+    /// The render target hosts last saw; a different id after a draw means
+    /// the target was recreated and hosts must re-register it.
+    presented_texture: Option<ExternalTextureId>,
 }
 
 /// Outcome of one frame-loop step for a texture window.
 #[derive(Default, Clone, Copy)]
 struct TextureFrameStep {
     redrawn: bool,
+    /// The render target was recreated, so tiles registered for the old
+    /// texture are stale and painters must run again.
+    texture_recreated: bool,
     /// The window is dirty again or has next-frame callbacks, so its hosts
     /// must request another frame on its behalf.
     need_frame: bool,
@@ -1180,11 +1184,11 @@ struct TextureFrameStep {
 /// [`Window::paint_texture_window`].
 struct TextureChild {
     handle: AnyWindowHandle,
-    /// Views that painted the texture; marked dirty when the texture changes
-    /// so their cached paint is not replayed with a stale image.
+    /// Views that painted the texture; marked dirty when the texture is
+    /// recreated so their cached paint is not replayed with a stale tile.
     painters: SmallVec<[EntityId; 1]>,
-    /// The frame most recently uploaded to this window's atlas for the child.
-    painted_frame: Option<Arc<RenderImage>>,
+    /// The child texture registered with this window's atlas.
+    registered_texture: Option<ExternalTextureId>,
 }
 
 /// Holds the state for a specific window.
@@ -1918,8 +1922,8 @@ impl Window {
             })));
             Some(TextureWindowState {
                 hosts,
-                frame: None,
                 bounds_changed_pending: false,
+                presented_texture: None,
             })
         } else {
             invalidator.set_platform_waker(platform_window.frame_waker());
@@ -2822,10 +2826,11 @@ impl Window {
     }
 
     /// Composites the most recent frame of a texture window into `bounds`,
-    /// scaling it to fit. Painting attaches the child to this window: this
-    /// window's frame loop draws the child when it is dirty, and the child's
-    /// invalidations wake this window. Input is not forwarded; hosts remap
-    /// events into the child's space and call [`Window::dispatch_event`].
+    /// scaling it to fit, by sampling the child's render target directly.
+    /// Painting attaches the child to this window: this window's frame loop
+    /// draws the child when it is dirty, and the child's invalidations wake
+    /// this window. Input is not forwarded; hosts remap events into the
+    /// child's space and call [`Window::dispatch_event`].
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_texture_window(
@@ -2844,7 +2849,7 @@ impl Window {
             handle: self.handle,
             invalidator: self.invalidator.clone(),
         };
-        let frame = child.update(cx, |_, child_window, _| {
+        let texture = child.update(cx, |_, child_window, _| {
             let Some(texture) = &mut child_window.texture else {
                 anyhow::bail!("window is not a texture window");
             };
@@ -2856,15 +2861,22 @@ impl Window {
             {
                 texture.hosts.borrow_mut().push(host);
             }
-            if texture.frame.is_none() {
-                texture.frame = Some(child_window.platform_window.texture_frame()?);
-            }
-            Ok(texture.frame.clone().expect("frame was just populated"))
+            child_window
+                .platform_window
+                .external_texture()
+                .context("texture window has not rendered a frame yet")
         });
-        let frame = match frame {
-            Ok(Ok(frame)) => frame,
+        let texture = match texture {
+            Ok(Ok(texture)) => texture,
             Ok(Err(error)) | Err(error) => {
-                log::error!("failed to read texture window frame: {error:#}");
+                log::error!("failed to composite texture window: {error:#}");
+                return;
+            }
+        };
+        let tile = match self.sprite_atlas.register_external_texture(&texture) {
+            Ok(tile) => tile,
+            Err(error) => {
+                log::error!("failed to register texture window with the atlas: {error:#}");
                 return;
             }
         };
@@ -2880,7 +2892,7 @@ impl Window {
                 self.texture_children.push(TextureChild {
                     handle: *child,
                     painters: SmallVec::new(),
-                    painted_frame: None,
+                    registered_texture: None,
                 });
                 self.texture_children
                     .last_mut()
@@ -2890,13 +2902,30 @@ impl Window {
         if !entry.painters.contains(&painter) {
             entry.painters.push(painter);
         }
-        let previous_frame = entry.painted_frame.replace(frame.clone());
-        if let Some(previous) = previous_frame.filter(|previous| !Arc::ptr_eq(previous, &frame)) {
-            self.drop_image(previous).log_err();
+        let previous = entry.registered_texture.replace(texture.id);
+        if let Some(previous) = previous.filter(|previous| *previous != texture.id) {
+            self.sprite_atlas.remove_external_texture(previous);
         }
 
-        self.paint_image(bounds, bounds, Corners::default(), frame, 0, false)
-            .log_err();
+        let scale_factor = self.scale_factor();
+        let bounds = bounds.scale(scale_factor);
+        let content_mask = self.content_mask().scale(scale_factor);
+        let opacity = self.element_opacity();
+        let flags = if texture.premultiplied_alpha {
+            crate::POLYCHROME_SPRITE_PREMULTIPLIED
+        } else {
+            0
+        };
+        self.next_frame.scene.insert_primitive(PolychromeSprite {
+            order: 0,
+            flags,
+            grayscale: false.into(),
+            opacity,
+            bounds,
+            content_mask,
+            corner_radii: Corners::default(),
+            tile,
+        });
     }
 
     /// Draws every texture window this window paints, deepest first, so each
@@ -2940,20 +2969,24 @@ impl Window {
             });
             match step {
                 Ok(step) => {
-                    if step.redrawn {
+                    if step.texture_recreated {
                         for painter in self.texture_children[index].painters.clone() {
                             self.mark_view_dirty(painter);
                         }
+                    }
+                    // The sampled texture already holds the new frame; the
+                    // host only has to draw again to show it.
+                    if step.redrawn {
                         self.invalidator.set_dirty(true);
                     }
                     need_frame |= step.need_frame;
                     index += 1;
                 }
-                // The child was closed; forget it and release its last frame.
+                // The child was closed; forget it and its tile.
                 Err(_) => {
                     let entry = self.texture_children.remove(index);
-                    if let Some(frame) = entry.painted_frame {
-                        self.drop_image(frame).log_err();
+                    if let Some(id) = entry.registered_texture {
+                        self.sprite_atlas.remove_external_texture(id);
                     }
                 }
             }
@@ -2961,8 +2994,7 @@ impl Window {
         need_frame
     }
 
-    /// One frame-loop step for a texture window. If the texture was redrawn
-    /// the cached readback is discarded.
+    /// One frame-loop step for a texture window.
     fn draw_as_texture(&mut self, force_render: bool, cx: &mut App) -> TextureFrameStep {
         let Some(texture) = &mut self.texture else {
             log::error!("draw_as_texture called on a window with a compositor surface");
@@ -3002,11 +3034,17 @@ impl Window {
             self.present();
             redrawn = true;
         }
+        let mut texture_recreated = false;
         if redrawn && let Some(texture) = &mut self.texture {
-            texture.frame = None;
+            let current = self.platform_window.external_texture().map(|t| t.id);
+            texture_recreated = texture
+                .presented_texture
+                .is_some_and(|previous| current.is_some_and(|current| current != previous));
+            texture.presented_texture = current;
         }
         TextureFrameStep {
             redrawn,
+            texture_recreated,
             need_frame: self.invalidator.is_dirty()
                 || !self.next_frame_callbacks.borrow().is_empty(),
         }
@@ -4956,7 +4994,7 @@ impl Window {
 
             self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
-                pad: 0,
+                flags: 0,
                 grayscale: false.into(),
                 bounds,
                 corner_radii: Default::default(),
@@ -5128,7 +5166,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
-            pad: 0,
+            flags: 0,
             grayscale: grayscale.into(),
             bounds: visible_bounds_snapped,
             content_mask,
@@ -7887,19 +7925,19 @@ mod tests {
         let test_window = cx.test_window(host.into());
         // Serve the demand created by opening the host.
         test_window.simulate_frame_request(RequestFrameOptions::default());
-        let composited_frame = |cx: &mut TestAppContext| {
+        let registered_texture = |cx: &mut TestAppContext| {
             host.update(cx, |_, window, _| {
                 let child = window
                     .texture_children
                     .iter()
                     .find(|entry| entry.handle == child.into())
                     .expect("painting attaches the child to the host");
-                child.painted_frame.as_ref().map(|frame| frame.id)
+                child.registered_texture
             })
             .unwrap()
         };
         let (child_baseline, host_baseline) = (child_renders.get(), host_renders.get());
-        let frame_baseline = composited_frame(cx).expect("host composited the child");
+        let texture_baseline = registered_texture(cx).expect("host registered the child");
 
         // An idle host does not redraw an idle child.
         test_window.simulate_frame_request(RequestFrameOptions::default());
@@ -7907,11 +7945,11 @@ mod tests {
             (child_renders.get(), host_renders.get()),
             (child_baseline, host_baseline)
         );
-        assert_eq!(composited_frame(cx), Some(frame_baseline));
+        assert_eq!(registered_texture(cx), Some(texture_baseline));
 
         // Notifying a view inside the child wakes the host. On the host's
-        // next frame the child is drawn once, and the host redraws to
-        // composite the child's new frame.
+        // next frame the child is drawn once into the same texture, and the
+        // host redraws to present it.
         let wake_baseline = test_window.frame_wake_count();
         child.update(cx, |_, _, cx| cx.notify()).unwrap();
         assert!(
@@ -7921,12 +7959,12 @@ mod tests {
         test_window.simulate_frame_request(RequestFrameOptions::default());
         assert_eq!(child_renders.get(), child_baseline + 1);
         assert!(host_renders.get() > host_baseline);
-        let frame_after_notify = composited_frame(cx).expect("host composited the child");
-        assert_ne!(frame_after_notify, frame_baseline);
+        assert_eq!(registered_texture(cx), Some(texture_baseline));
         let (child_baseline, host_baseline) = (child_renders.get(), host_renders.get());
 
         // Resizing takes effect synchronously, notifies bounds observers on
-        // the next frame, and redraws the child exactly once.
+        // the next frame, redraws the child exactly once into a new texture,
+        // and makes the host register that texture.
         let bounds_changes = Rc::new(Cell::new(0));
         let _bounds_subscription = child
             .update(cx, |_, window, cx| {
@@ -7946,7 +7984,8 @@ mod tests {
         assert_eq!(child_renders.get(), child_baseline + 1);
         assert!(host_renders.get() > host_baseline);
         assert_eq!(bounds_changes.get(), 1);
-        assert_ne!(composited_frame(cx), Some(frame_after_notify));
+        let resized_texture = registered_texture(cx).expect("host registered the child");
+        assert_ne!(resized_texture, texture_baseline);
 
         // Activation is explicit, since no compositor will ever report it.
         let activations = Rc::new(Cell::new(0));

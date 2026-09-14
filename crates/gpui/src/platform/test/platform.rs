@@ -540,7 +540,7 @@ impl Platform for TestPlatform {
         {
             let mut state = window.0.lock();
             state.scale_factor = options.scale_factor;
-            state.texture_frame = Some(None);
+            state.texture_id = Some(crate::ExternalTextureId::next());
         }
         Ok(Box::new(window))
     }

@@ -1028,12 +1028,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
 
-    /// For texture windows: the most recently drawn frame, ready to be painted
-    /// into another window with [`Window::paint_image`]. Each call reads the
-    /// frame back from the GPU, so callers should cache the result until the
-    /// window is drawn again.
-    fn texture_frame(&self) -> Result<Arc<RenderImage>> {
-        anyhow::bail!("this window does not render into a texture")
+    /// For texture windows: the GPU texture holding the most recently drawn
+    /// frame, for a host to register with its atlas and sample directly. The
+    /// id changes whenever the texture is recreated (for example on resize).
+    fn external_texture(&self) -> Option<ExternalTexture> {
+        None
     }
 }
 
@@ -1057,6 +1056,12 @@ pub trait PlatformHeadlessRenderer {
 
     /// Returns the sprite atlas used by this renderer.
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
+
+    /// The offscreen target as a texture another renderer on the same device
+    /// can sample. See [`PlatformWindow::external_texture`].
+    fn external_texture(&self) -> Option<ExternalTexture> {
+        None
+    }
 }
 
 /// Type alias for runnables with metadata.
@@ -1385,9 +1390,59 @@ pub trait PlatformAtlas {
     ) -> Result<Option<AtlasTile>>;
     fn remove(&self, key: &AtlasKey);
 
+    /// Makes a texture owned outside the atlas addressable as a tile covering
+    /// the whole texture, so sprites can sample it without any copy. Calling
+    /// this again with the same id returns the existing tile.
+    fn register_external_texture(&self, _texture: &ExternalTexture) -> Result<AtlasTile> {
+        anyhow::bail!("external textures are not supported by this atlas")
+    }
+
+    /// Forgets an external texture; sprites referencing its tile must not be
+    /// drawn afterwards.
+    fn remove_external_texture(&self, _id: ExternalTextureId) {}
+
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {
         false
+    }
+}
+
+/// Identifies an [`ExternalTexture`]. Ids are unique for the life of the
+/// process, so a recreated texture never aliases a stale registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExternalTextureId(u64);
+
+impl ExternalTextureId {
+    /// Allocates a fresh id.
+    pub fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// A GPU texture owned by something other than an atlas (a texture window's
+/// render target) that an atlas on the same device can expose as a tile.
+#[derive(Clone)]
+pub struct ExternalTexture {
+    /// Identity of this texture; see [`ExternalTextureId`].
+    pub id: ExternalTextureId,
+    /// Size of the texture in device pixels; the tile covers all of it.
+    pub size: Size<DevicePixels>,
+    /// Whether the color channels are premultiplied by alpha. Atlas images
+    /// are straight alpha, so sprites sampling this texture must be told.
+    pub premultiplied_alpha: bool,
+    /// Backend handle, e.g. a `wgpu::TextureView`; the atlas downcasts it and
+    /// rejects handles from another backend.
+    pub handle: Arc<dyn std::any::Any>,
+}
+
+impl std::fmt::Debug for ExternalTexture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalTexture")
+            .field("id", &self.id)
+            .field("size", &self.size)
+            .field("premultiplied_alpha", &self.premultiplied_alpha)
+            .finish_non_exhaustive()
     }
 }
 

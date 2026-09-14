@@ -111,7 +111,7 @@ mod linux_tests {
     use gpui::{
         AnyWindowHandle, AppContext as _, Bounds, Context, HeadlessAppContext, IntoElement,
         ParentElement as _, Render, Styled as _, TextureWindowOptions, Window, canvas, div, point,
-        px, rgb, size,
+        px, rgb, rgba, size,
     };
     use std::sync::Arc;
 
@@ -157,6 +157,61 @@ mod linux_tests {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div().size_full().bg(rgb(self.color))
         }
+    }
+
+    struct TranslucentColor {
+        color: u32,
+    }
+
+    impl Render for TranslucentColor {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().bg(rgba(self.color))
+        }
+    }
+
+    /// A translucent texture window must blend over the host exactly once:
+    /// its target is premultiplied, and the sprite shader is told so.
+    #[test]
+    fn translucent_texture_window_blends_once_over_its_host() {
+        if current_headless_renderer().is_none() {
+            eprintln!("skipping: no usable GPU adapter");
+            return;
+        }
+
+        let text_system = current_platform(true).text_system();
+        let mut cx =
+            HeadlessAppContext::with_platform(text_system, Arc::new(()), current_headless_renderer);
+        let child = cx
+            .update(|cx| {
+                cx.open_texture_window(
+                    TextureWindowOptions {
+                        size: size(px(16.), px(16.)),
+                        scale_factor: 2.0,
+                        ..TextureWindowOptions::default()
+                    },
+                    |_, cx| cx.new(|_| TranslucentColor { color: 0xff000080 }),
+                )
+            })
+            .expect("texture window should open on the test platform");
+        let host = cx
+            .open_window(size(px(32.), px(32.)), |_, cx| {
+                cx.new(|_| CompositesTextureWindow {
+                    child: child.into(),
+                })
+            })
+            .expect("host window should open");
+        cx.run_until_parked();
+
+        let image = cx
+            .capture_screenshot(host.into())
+            .expect("host screenshot should render");
+        // Half red over opaque blue: (128, 0, 127). Double premultiplication
+        // would give roughly (64, 0, 191) instead.
+        assert_pixel(
+            image.get_pixel(32, 32).0,
+            [128, 0, 127],
+            "translucent texture over host",
+        );
     }
 
     struct CompositesTextureWindow {

@@ -748,7 +748,8 @@ impl From<SubpixelSprite> for Primitive {
 #[expect(missing_docs)]
 pub struct PolychromeSprite {
     pub order: DrawOrder,
-    pub pad: u32,
+    /// Bit set of [`POLYCHROME_SPRITE_PREMULTIPLIED`] and friends.
+    pub flags: u32,
     pub grayscale: PaddedBool32,
     pub opacity: f32,
     pub bounds: Bounds<ScaledPixels>,
@@ -756,6 +757,11 @@ pub struct PolychromeSprite {
     pub corner_radii: Corners<ScaledPixels>,
     pub tile: AtlasTile,
 }
+
+/// The sprite's tile holds premultiplied color, so the shader must not
+/// multiply by alpha again. Atlas images are straight alpha; external
+/// textures rendered by GPUI are premultiplied.
+pub const POLYCHROME_SPRITE_PREMULTIPLIED: u32 = 1;
 
 impl From<PolychromeSprite> for Primitive {
     fn from(sprite: PolychromeSprite) -> Self {

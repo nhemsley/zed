@@ -1259,9 +1259,11 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
 
 // --- polychrome sprites --- //
 
+const POLY_SPRITE_PREMULTIPLIED: u32 = 1u;
+
 struct PolychromeSprite {
     order: u32,
-    pad: u32,
+    flags: u32,
     grayscale: u32,
     opacity: f32,
     bounds: Bounds,
@@ -1303,9 +1305,14 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
     var color = sample;
+    // A premultiplied tile is brought back to straight alpha so blend_color
+    // applies exactly one multiplication, whichever mode the target uses.
+    if ((sprite.flags & POLY_SPRITE_PREMULTIPLIED) != 0u && sample.a > 0.0) {
+        color = vec4<f32>(sample.rgb / sample.a, sample.a);
+    }
     if (sprite.grayscale != 0u) {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
-        color = vec4<f32>(vec3<f32>(grayscale), sample.a);
+        color = vec4<f32>(vec3<f32>(grayscale), color.a);
     }
     return blend_color(color, sprite.opacity * saturate(0.5 - distance));
 }

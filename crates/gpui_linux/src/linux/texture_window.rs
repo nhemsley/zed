@@ -15,10 +15,10 @@ use gpui_util::ResultExt as _;
 use gpui_wgpu::{GpuContext, WgpuHeadlessRenderer};
 
 use gpui::{
-    Bounds, Capslock, DispatchEventResult, GpuSpecs, Modifiers, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformHeadlessRenderer as _, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PromptButton, PromptLevel, RenderImage, RequestFrameOptions, Scene,
-    Size, TextureWindowOptions, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    Bounds, Capslock, DispatchEventResult, ExternalTexture, GpuSpecs, Modifiers, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformHeadlessRenderer as _, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    Scene, Size, TextureWindowOptions, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
     WindowControlArea,
 };
 
@@ -258,10 +258,8 @@ impl PlatformWindow for TextureWindow {
         self.read_frame()
     }
 
-    fn texture_frame(&self) -> Result<Arc<RenderImage>> {
-        let state = self.state.borrow();
-        let image = state.renderer.read_frame_for_atlas()?;
-        Ok(Arc::new(RenderImage::new([image::Frame::new(image)])))
+    fn external_texture(&self) -> Option<ExternalTexture> {
+        self.state.borrow().renderer.external_texture()
     }
 }
 

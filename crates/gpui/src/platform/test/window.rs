@@ -1,10 +1,10 @@
 use crate::{
     AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
-    DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, RenderImage, RequestFrameOptions, Scene, Size, TestPlatform,
-    TextInputConfiguration, TextInputStateChange, TileId, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    DispatchEventResult, ExternalTexture, ExternalTextureId, GpuSpecs, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow,
+    Point, PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TextInputConfiguration,
+    TextInputStateChange, TileId, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowParams,
 };
 use collections::HashMap;
 use gpui_util::ResultExt as _;
@@ -30,9 +30,10 @@ pub(crate) struct TestWindowState {
     // TODO: Replace with `Rc`
     sprite_atlas: Arc<dyn PlatformAtlas>,
     renderer: Option<Box<dyn PlatformHeadlessRenderer>>,
-    /// Present for windows opened with `open_texture_window`: the most
-    /// recently drawn frame, read back so hosts can composite it.
-    pub(crate) texture_frame: Option<Option<RgbaImage>>,
+    /// Present for windows opened with `open_texture_window`. Without a
+    /// renderer there are no pixels, so this stands in for the render
+    /// target's identity: a new id per size, like a real target.
+    pub(crate) texture_id: Option<ExternalTextureId>,
     pub(crate) should_close_handler: Option<Box<dyn FnMut() -> bool>>,
     hit_test_window_control_callback: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
     input_callback: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
@@ -95,7 +96,7 @@ impl TestWindow {
             handle,
             sprite_atlas,
             renderer,
-            texture_frame: None,
+            texture_id: None,
             title: Default::default(),
             edited: false,
             document_path: None,
@@ -254,6 +255,9 @@ impl PlatformWindow for TestWindow {
 
     fn resize(&mut self, size: Size<Pixels>) {
         let mut lock = self.0.lock();
+        if lock.bounds.size != size && lock.texture_id.is_some() {
+            lock.texture_id = Some(ExternalTextureId::next());
+        }
         lock.bounds.size = size;
     }
 
@@ -437,48 +441,25 @@ impl PlatformWindow for TestWindow {
         state.frame_callback_pending = true;
         state.frame_scheduled = true;
         let device_size: Size<DevicePixels> = state.bounds.size.to_device_pixels(scale_factor);
-        let state = &mut *state;
         if let Some(renderer) = &mut state.renderer {
-            match &mut state.texture_frame {
-                Some(texture_frame) => {
-                    if let Some(image) = renderer
-                        .render_scene_to_image(scene, device_size)
-                        .warn_on_err()
-                    {
-                        *texture_frame = Some(image);
-                    }
-                }
-                None => {
-                    renderer.render_scene(scene, device_size).warn_on_err();
-                }
-            }
+            renderer.render_scene(scene, device_size).warn_on_err();
         }
     }
 
-    fn texture_frame(&self) -> anyhow::Result<Arc<RenderImage>> {
+    fn external_texture(&self) -> Option<ExternalTexture> {
         let state = self.0.lock();
-        let Some(texture_frame) = &state.texture_frame else {
-            anyhow::bail!("this window does not render into a texture");
-        };
-        let mut image = match texture_frame {
-            Some(image) => image.clone(),
-            // Without a renderer there are no pixels, but hosts can still
-            // exercise attachment and frame driving against a placeholder.
-            None if state.renderer.is_none() => RgbaImage::from_pixel(1, 1, image::Rgba([0; 4])),
-            None => anyhow::bail!("no frame has been drawn yet"),
-        };
-        // Headless renderers read back premultiplied RGBA; the atlas expects
-        // straight-alpha BGRA.
-        for pixel in image.chunks_exact_mut(4) {
-            pixel.swap(0, 2);
-            let alpha = u32::from(pixel[3]);
-            if alpha != 0 && alpha != 255 {
-                for channel in &mut pixel[..3] {
-                    *channel = ((u32::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
-                }
-            }
+        let id = state.texture_id?;
+        if let Some(renderer) = &state.renderer {
+            return renderer.external_texture();
         }
-        Ok(Arc::new(RenderImage::new([image::Frame::new(image)])))
+        // No pixels without a renderer, but hosts can still exercise
+        // attachment, frame driving, and re-registration on resize.
+        Some(ExternalTexture {
+            id,
+            size: state.bounds.size.to_device_pixels(state.scale_factor),
+            premultiplied_alpha: true,
+            handle: Arc::new(()),
+        })
     }
 
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {
@@ -553,6 +534,23 @@ impl TestAtlas {
 }
 
 impl PlatformAtlas for TestAtlas {
+    fn register_external_texture(&self, texture: &ExternalTexture) -> anyhow::Result<AtlasTile> {
+        let mut state = self.0.lock();
+        state.next_id += 1;
+        Ok(AtlasTile {
+            texture_id: AtlasTextureId {
+                index: state.next_id,
+                kind: crate::AtlasTextureKind::Polychrome,
+            },
+            tile_id: TileId(state.next_id),
+            padding: 0,
+            bounds: Bounds {
+                origin: Point::default(),
+                size: texture.size,
+            },
+        })
+    }
+
     fn get_or_insert_with<'a>(
         &self,
         key: &crate::AtlasKey,

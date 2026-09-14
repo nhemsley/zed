@@ -365,9 +365,30 @@ host frame.
      `HeadlessAppContext::simulate_frame` drives a host's frame loop, so the
      mechanics are tested without a GPU (`gpui`) and the pixels with one
      (`gpui_platform` Linux tests).
-4. **`gpui` core, milestone B**: atlas external textures; swap readback for
-   the zero-copy `PolychromeSprite` path. IME proxy and cursor-style relay
-   helpers for hosts that want them.
+4. **`gpui` core, milestone B** — *done.* Hosts sample a texture window's
+   render target directly; the CPU readback is gone. Deviations from the
+   design above:
+   - *No shared atlas.* Each renderer keeps its own `WgpuAtlas`, so per-window
+     clear and device-recovery semantics are unchanged. Instead the child
+     exposes `PlatformWindow::external_texture()` (an `ExternalTexture`: id,
+     size, premultiplied flag, backend handle) and the host registers it with
+     *its own* atlas via `PlatformAtlas::register_external_texture`, which
+     returns a whole-texture polychrome tile from a separate index range
+     (`EXTERNAL_TEXTURE_BIT`). Registration is idempotent per id and happens
+     on every paint, like image tiles, so an atlas clear heals itself.
+   - *Alpha.* The child target stays premultiplied. `PolychromeSprite.pad`
+     became `flags`; `POLYCHROME_SPRITE_PREMULTIPLIED` makes the wgpu sprite
+     shader divide the sample back to straight alpha before `blend_color`,
+     so it blends exactly once in either compositor mode. Layout unchanged,
+     Metal ignores the word. Covered by a translucent pixel test.
+   - *Frame loop.* A redrawn child only dirties the host (cheap cached
+     redraw + present); painters are re-run only when the child's texture id
+     changed (resize), since the old tile is stale then.
+   - *Test platform.* `TestWindow` fabricates a stable external id per size
+     and `TestAtlas` fabricates tiles, so the mechanics test runs without a
+     GPU; with a GPU the headless renderer's real target is registered.
+   - Not done: IME proxy and cursor-style relay helpers (deferred until a
+     host needs them).
 5. Cleanup: `render_to_image` gating, docs, `Application::headless()` parity,
    X11 `open_texture_window` if trivial. Known gap: headless adapter selection
    does not validate pipeline creation, so a GL adapter without vertex storage
