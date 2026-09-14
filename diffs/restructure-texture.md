@@ -1,3 +1,5 @@
+Note on this machine: LIBGL_ALWAYS_SOFTWARE=1 needs to bet set as env var, as our vulkan opengl diver is not up to par
+
 # Texture Windows — Implementation Plan
 
 > Status: milestones 1–3 landed on branch `textured` (see "Steps / milestones"
@@ -370,6 +372,25 @@ host frame.
    X11 `open_texture_window` if trivial. Known gap: headless adapter selection
    does not validate pipeline creation, so a GL adapter without vertex storage
    buffers panics at first draw (`LIBGL_ALWAYS_SOFTWARE=1` works around it).
+6. **Infinite canvas example** — *done*, ahead of 4 and 5. A grid of 40
+   fake-diff cards (standing in for the git history viewer in the Blade-era
+   `research/infinite_canvas_textured_api.md`), each card a texture window,
+   with pan, zoom around the cursor, click-to-focus, and `r` to regenerate the
+   focused card. Landed as `crates/gpui/examples/infinite_canvas.rs`,
+   reusing the routing from `texture_windows.rs`. What it needed beyond 3:
+   - *Content-measured height.* `Window::measure_root(available_space, cx)`
+     lays the root out without painting and returns its size; the canvas
+     measures at `Definite(width) × MinContent`, calls `resize`, and the
+     next frame draws at the right size. Replaces the old measure, sleep,
+     resize, sleep, render flow. Measuring forces a full re-render on the
+     window's next draw, since it disturbs cached element state.
+   - *Culling.* Cards outside the viewport plus a margin are closed and
+     reopened (and re-measured) when they scroll back; cards in view but off
+     the painted region are parked. Open/close happens in the canvas's
+     `render`, which nests a texture window's initial draw inside the host's
+     draw; the element arena scope handles that.
+   Static cards make the CPU readback a one-time cost per card, so this does
+   not depend on milestone 4.
 
 ## Alternatives considered
 
