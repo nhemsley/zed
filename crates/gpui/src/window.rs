@@ -2761,6 +2761,40 @@ impl Window {
         }
     }
 
+    /// Lays out the root view in `available_space` without painting, and
+    /// returns the size it settles on. Nothing about the window changes
+    /// except that its next draw re-renders every view, since measuring
+    /// disturbs cached element state.
+    ///
+    /// The main use is sizing a texture window to its content: measure at
+    /// `Definite(width) × MinContent`, then [`Window::resize`] to the result.
+    pub fn measure_root(
+        &mut self,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) -> Size<Pixels> {
+        let Some(root) = self.root.clone() else {
+            return Size::default();
+        };
+        let arena_scope = ElementArenaScope::enter(&cx.element_arena);
+        self.invalidator.set_phase(DrawPhase::Prepaint);
+        // Bypass the view cache so a cached layout at another size is not
+        // returned as the measurement.
+        let refreshing = mem::replace(&mut self.refreshing, true);
+        let mut root = root.into_any_element();
+        let size = root.layout_as_root(available_space, self, cx);
+        drop(root);
+        self.refreshing = refreshing;
+        if let Some(layout_engine) = self.layout_engine.as_mut() {
+            layout_engine.clear();
+        }
+        self.next_frame.clear();
+        self.invalidator.set_phase(DrawPhase::None);
+        self.refresh();
+        arena_scope.exit(&cx.element_arena).clear(cx);
+        size
+    }
+
     /// Whether this window renders into a texture instead of a compositor
     /// surface. See [`App::open_texture_window`].
     pub fn is_texture_window(&self) -> bool {
@@ -7733,13 +7767,13 @@ mod tests {
     };
 
     use crate::{
-        AnyWindowHandle, AppContext as _, Bounds, Context, DispatchPhase, DragMoveEvent, Empty,
-        ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
-        InputEvent as _, InteractiveElement as _, IntoElement, LongPressEvent, MouseButton,
-        MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render, RequestFrameOptions,
-        StatefulInteractiveElement as _, Styled, TestAppContext, TextureWindowOptions,
-        TouchDragEvent, TouchEvent, TouchId, TouchPhase, Window, WindowAppearance, WindowOptions,
-        canvas, div, point, px, size,
+        AnyWindowHandle, AppContext as _, AvailableSpace, Bounds, Context, DispatchPhase,
+        DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent,
+        FocusHandle, InputEvent as _, InteractiveElement as _, IntoElement, LongPressEvent,
+        MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render,
+        RequestFrameOptions, StatefulInteractiveElement as _, Styled, TestAppContext,
+        TextureWindowOptions, TouchDragEvent, TouchEvent, TouchId, TouchPhase, Window,
+        WindowAppearance, WindowOptions, canvas, div, point, px, size,
     };
 
     struct EmptyView;
@@ -7778,6 +7812,44 @@ mod tests {
                 .size_full(),
             )
         }
+    }
+
+    struct FixedHeightContent;
+
+    impl Render for FixedHeightContent {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().w_full().h(px(37.))
+        }
+    }
+
+    #[gpui::test]
+    fn test_measure_root_sizes_a_texture_window_to_its_content(cx: &mut TestAppContext) {
+        let child = cx
+            .update(|cx| {
+                cx.open_texture_window(
+                    TextureWindowOptions {
+                        size: size(px(100.), px(100.)),
+                        ..TextureWindowOptions::default()
+                    },
+                    |_, cx| cx.new(|_| FixedHeightContent),
+                )
+            })
+            .unwrap();
+        let child: AnyWindowHandle = child.into();
+        child
+            .update(cx, |_, window, cx| {
+                let measured = window.measure_root(
+                    size(
+                        AvailableSpace::Definite(px(80.)),
+                        AvailableSpace::MinContent,
+                    ),
+                    cx,
+                );
+                assert_eq!(measured, size(px(80.), px(37.)));
+                window.resize(measured);
+                assert_eq!(window.viewport_size(), measured);
+            })
+            .unwrap();
     }
 
     #[gpui::test]
